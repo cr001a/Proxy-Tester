@@ -173,15 +173,23 @@ def tag_tree(tree):
 
 def enable_drag_select(tree):
     """Let the user click-and-drag to highlight a range of rows in a Treeview
-    (not supported natively). Shift/Ctrl-click still work as usual."""
+    (not supported natively). Ctrl/Shift-click keep their native behavior."""
+    SHIFT, CTRL = 0x0001, 0x0004
+
     def on_press(event):
-        row = tree.identify_row(event.y)
-        tree._drag_anchor = row or None
+        # Only engage drag-select for a plain click; let Ctrl/Shift-click be
+        # handled natively (toggle / extend) without interference.
+        if event.state & (SHIFT | CTRL):
+            tree._drag_anchor = None
+            return
+        tree._drag_anchor = tree.identify_row(event.y) or None
 
     def on_drag(event):
         anchor = getattr(tree, "_drag_anchor", None)
+        if not anchor or (event.state & (SHIFT | CTRL)):
+            return None
         current = tree.identify_row(event.y)
-        if not anchor or not current:
+        if not current:
             return None
         items = list(tree.get_children())
         try:
