@@ -1,6 +1,8 @@
 """
 ProxyTester - a proxy testing GUI.
 
+Made by codyrandolph.
+
 Two tabs:
   1. ASN Tester (Oxylabs mobile) - tests carrier/ASN targeting.
   2. Proxy Tester (general)      - plain reachability/latency testing.
@@ -1388,6 +1390,9 @@ class ProfileBar(ttk.Frame):
 
         ttk.Label(self, text="◆ ProxyTester", style="Header.TLabel").pack(
             side="left")
+        ttk.Label(self, text="made by codyrandolph",
+                  style="Muted.TLabel").pack(side="left", padx=(10, 0),
+                                             anchor="s", pady=(0, 4))
 
         ttk.Button(self, text="Delete", command=self.on_delete).pack(
             side="right", padx=(8, 0))

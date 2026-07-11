@@ -1,5 +1,7 @@
 # ProxyTester
 
+*Made by codyrandolph.*
+
 A barebones Windows GUI tool for testing proxies. Written in Python with the
 **standard library only** (tkinter) so the packaged `.exe` has zero external
 runtime dependencies and never shells out to `curl`.
