@@ -95,6 +95,12 @@ def apply_theme(root):
               background=[("active", BASE)],
               indicatorcolor=[("selected", MAUVE)],
               foreground=[("active", MAUVE)])
+    style.configure("TCheckbutton", background=BASE, foreground=TEXT,
+                    indicatorcolor=SURFACE, focuscolor=BASE, padding=2)
+    style.map("TCheckbutton",
+              background=[("active", BASE)],
+              indicatorcolor=[("selected", MAUVE)],
+              foreground=[("active", MAUVE)])
 
     style.configure("TCombobox", fieldbackground=SURFACE, background=SURFACE,
                     foreground=TEXT, arrowcolor=TEXT, bordercolor=SURFACE2,
@@ -362,28 +368,66 @@ def provider_hostport(provider):
     return "", ""
 
 
-# Hardcoded ASN catalog, ranked most -> least ban-resistant for anti-bot
-# systems. Mobile MNO ASNs first (structurally hard to block via CGNAT), then
-# rarer/less-saturated mobile, then residential ISPs (need a residential pool;
-# on a mobile product they'll return empty pool). (asn, label).
+# Hardcoded ASN catalog, classified by network type (researched via
+# ipinfo/PeeringDB/CAIDA). Fields: (asn, name, category, strict).
+#   category : "mobile" | "residential" | "business" | "datacenter"
+#   strict   : True  = pure consumer eyeball network (no business/transit mix)
+#              False = dual-use / business / datacenter (excluded by "Strict only")
+CATEGORIES = ("mobile", "residential", "business", "datacenter")
+
 ASN_CATALOG = [
-    ("21928", "T-Mobile US  [mobile]"),
-    ("6167", "Verizon Wireless  [mobile]"),
-    ("20057", "AT&T Mobility  [mobile]"),
-    ("22394", "Verizon Wireless 2nd  [mobile]"),
-    ("22140", "T-Mobile 2nd  [mobile]"),
-    ("6614", "US Cellular -> T-Mobile  [mobile]"),
-    ("10507", "Sprint PCS -> T-Mobile  [mobile]"),
-    ("398378", "Dish / Boost  [mobile]"),
-    ("7922", "Comcast Xfinity  [residential]"),
-    ("20115", "Charter Spectrum  [residential]"),
-    ("22773", "Cox  [residential]"),
-    ("7018", "AT&T Internet  [residential]"),
-    ("701", "Verizon Fios  [residential]"),
-    ("209", "Lumen / CenturyLink  [residential]"),
-    ("5650", "Frontier  [residential]"),
+    # --- Mobile (cellular CGNAT) ---
+    ("21928", "T-Mobile US", "mobile", True),
+    ("22140", "T-Mobile 2nd", "mobile", True),
+    ("6167", "Verizon Wireless", "mobile", True),
+    ("22394", "Verizon Wireless 2nd", "mobile", True),
+    ("20057", "AT&T Mobility", "mobile", True),
+    ("6614", "US Cellular -> T-Mobile", "mobile", True),
+    ("10507", "Sprint PCS -> T-Mobile", "mobile", True),
+    ("398378", "Dish / Boost Mobile", "mobile", True),
+    # --- Residential (pure consumer eyeball) ---
+    ("7922", "Comcast Xfinity", "residential", True),
+    ("7015", "Comcast (legacy)", "residential", True),
+    ("7016", "Comcast", "residential", True),
+    ("33667", "Comcast regional", "residential", True),
+    ("33651", "Comcast regional", "residential", True),
+    ("33491", "Comcast regional", "residential", True),
+    ("33490", "Comcast regional", "residential", True),
+    ("33489", "Comcast regional", "residential", True),
+    ("33287", "Comcast regional", "residential", True),
+    ("20214", "Comcast regional", "residential", True),
+    ("20115", "Charter Spectrum", "residential", True),
+    ("11426", "Charter/TWC Carolinas", "residential", True),
+    ("12271", "Charter/TWC NYC", "residential", True),
+    ("20001", "Charter/TWC West", "residential", True),
+    ("11351", "Charter/TWC Northeast", "residential", True),
+    ("11427", "Charter/TWC Texas", "residential", True),
+    ("10796", "Charter/TWC Midwest", "residential", True),
+    ("33363", "Charter/Bright House", "residential", True),
+    ("6128", "Optimum (Cablevision)", "residential", True),
+    ("19108", "Optimum (Suddenlink)", "residential", True),
+    ("22773", "Cox", "residential", True),
+    ("5650", "Frontier", "residential", True),
+    ("16591", "Google Fiber", "residential", True),
+    # --- Residential but dual-use (also carries business) ---
+    ("7018", "AT&T Internet", "residential", False),
+    ("209", "CenturyLink / Lumen", "residential", False),
+    ("7843", "Charter/TWC backbone", "residential", False),
+    ("30036", "Mediacom", "residential", False),
+    ("14593", "SpaceX Starlink", "residential", False),
+    # --- Business / transit / enterprise ---
+    ("701", "Verizon Business (UUNET)", "business", False),
+    ("702", "Verizon Business (UUNET)", "business", False),
+    ("2828", "XO (Verizon Business)", "business", False),
+    ("3356", "Lumen / Level3 (transit)", "business", False),
+    ("23504", "GTT (ex-Speakeasy)", "business", False),
+    ("11486", "Verizon Business", "business", False),
+    ("22561", "CenturyLink / Lumen", "business", False),
+    # --- Datacenter / hosting ---
+    ("27524", "haoxiangyun (hosting)", "datacenter", False),
+    ("397143", "Neptune Networks (hosting)", "datacenter", False),
+    ("40052", "Equinix", "datacenter", False),
 ]
-MOBILE_ASN_COUNT = 8  # first N entries are the mobile tier (default selection)
 
 
 # --------------------------------------------------------------------------- #
@@ -618,27 +662,49 @@ class AsnTab(ttk.Frame):
         asn_frame.grid(row=0, column=2, rowspan=7, sticky="nw", padx=(4, 0))
         ttk.Label(
             asn_frame,
-            text="ASNs - Shift-click a range, Ctrl-click to toggle").pack(
+            text="ASNs - filter, then Shift/Ctrl-click to select").pack(
             anchor="w")
+
+        # Category filter toggles (Mobile/Residential on by default).
+        self.filter_vars = {}
+        frow = ttk.Frame(asn_frame)
+        frow.pack(fill="x", pady=(2, 0))
+        for cat, default in (("mobile", True), ("residential", True),
+                             ("business", False), ("datacenter", False)):
+            var = tk.BooleanVar(value=default)
+            self.filter_vars[cat] = var
+            ttk.Checkbutton(frow, text=cat.capitalize(), variable=var,
+                            command=self._refilter_asns).pack(
+                side="left", padx=(0, 8))
+
+        frow2 = ttk.Frame(asn_frame)
+        frow2.pack(fill="x", pady=(2, 4))
+        self.strict_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frow2, text="Strict only", variable=self.strict_var,
+                        command=self._refilter_asns).pack(side="left")
+        ttk.Label(frow2, text="search").pack(side="left", padx=(12, 4))
+        self.search_var = tk.StringVar()
+        ttk.Entry(frow2, textvariable=self.search_var, width=14).pack(
+            side="left")
+        self.search_var.trace_add("write", lambda *a: self._refilter_asns())
 
         lb_row = ttk.Frame(asn_frame)
         lb_row.pack(fill="both")
         self.asn_list = tk.Listbox(
-            lb_row, selectmode="extended", height=11, width=34,
+            lb_row, selectmode="extended", height=9, width=36,
             exportselection=False, activestyle="none")
         self.asn_list.configure(
             bg=MANTLE, fg=TEXT, selectbackground=MAUVE, selectforeground=BASE,
             highlightthickness=1, highlightbackground=SURFACE2,
             highlightcolor=MAUVE, relief="flat", borderwidth=0,
             font=(UI_FONT, 10))
-        for asn, label in ASN_CATALOG:
-            self.asn_list.insert("end", f"{asn}  -  {label}")
-        # Start with nothing selected (fresh every launch).
         lb_sb = ttk.Scrollbar(lb_row, orient="vertical",
                               command=self.asn_list.yview)
         self.asn_list.configure(yscrollcommand=lb_sb.set)
         self.asn_list.pack(side="left", fill="both")
         lb_sb.pack(side="left", fill="y")
+        self._visible_asns = []
+        self._refilter_asns()  # populate
 
         self.asn_list.bind("<Control-c>", self._copy_selected_asns)
         self.asn_list.bind("<Control-C>", self._copy_selected_asns)
@@ -689,9 +755,29 @@ class AsnTab(ttk.Frame):
         self.tree.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
 
+    def _refilter_asns(self):
+        """Rebuild the ASN list from the active category/strict/search filters."""
+        cats = {c for c, v in self.filter_vars.items() if v.get()}
+        strict_only = self.strict_var.get()
+        q = self.search_var.get().strip().lower()
+        self.asn_list.delete(0, "end")
+        self._visible_asns = []
+        for asn, name, cat, strict in ASN_CATALOG:
+            if cat not in cats:
+                continue
+            if strict_only and not strict:
+                continue
+            if q and q not in asn and q not in name.lower():
+                continue
+            label = f"{asn}  -  {name}  [{cat}]"
+            if cat == "residential" and not strict:
+                label += " +biz"
+            self.asn_list.insert("end", label)
+            self._visible_asns.append(asn)
+
     def _copy_selected_asns(self, _event=None):
         """Copy just the ASN numbers (not the labels), one per line."""
-        asns = [ASN_CATALOG[i][0] for i in self.asn_list.curselection()]
+        asns = [self._visible_asns[i] for i in self.asn_list.curselection()]
         if asns:
             self.clipboard_clear()
             self.clipboard_append("\n".join(asns))
@@ -700,8 +786,8 @@ class AsnTab(ttk.Frame):
         return "break"
 
     def _selected_asns(self):
-        """Selected catalog ASNs + any pasted ones, de-duplicated in order."""
-        picked = [ASN_CATALOG[i][0] for i in self.asn_list.curselection()]
+        """Selected (visible) ASNs + any pasted ones, de-duplicated in order."""
+        picked = [self._visible_asns[i] for i in self.asn_list.curselection()]
         pasted = [a.strip() for a in self.asn_text.get("1.0", "end").splitlines()
                   if a.strip()]
         seen, out = set(), []

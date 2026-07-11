@@ -13,11 +13,21 @@ Three tabs:
 3. **Converter** — paste any provider proxy format (full URLs, Python snippets,
    `user:pass@host:port`) and get copy-ready `host:port:user:pass` lines.
 
-Features: **Provider** dropdown (starts with Oxylabs) that applies the
-provider's username rules for you, a **Generate proxies** button that emits one
-rotating US proxy per ASN, a **Stop** button, dark purple theme, saved
-credential **profiles** (Oxylabs, IPRoyal, etc.) that persist between launches,
-password reveal on focus, per-tab CSV export, and colour-coded result statuses.
+Features: a classified **ASN catalog** you filter by type
+(Mobile / Residential / Business / Datacenter, plus a "Strict only" toggle that
+hides dual-use ISPs) and search; a **Provider** dropdown (starts with Oxylabs)
+that applies the provider's username rules for you; **Generate** proxies from
+your run results (static or rotating, N per ASN, with shuffle); a **Stop**
+button; dark purple theme; saved credential **profiles**; password reveal on
+focus; per-tab CSV export; and colour-coded result statuses.
+
+### ASN types
+
+Each catalog ASN is tagged mobile / residential / business / datacenter
+(researched via ipinfo / PeeringDB / CAIDA). **Strict only** (on by default)
+shows just pure consumer-eyeball networks and hides dual-use ISPs that also
+carry business/transit (e.g. AT&T 7018, Lumen 209, Starlink 14593). Business
+and datacenter ASNs are off by default since mobile pools won't contain them.
 
 ### Generate rotating proxies
 
