@@ -1,0 +1,11 @@
+# PyInstaller build output
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+
+# scratch
+scratchpad/
