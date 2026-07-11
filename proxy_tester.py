@@ -773,7 +773,7 @@ class AsnTab(ttk.Frame):
                 lines.append(f"{host}:{port}:{user}:{password}")
         title = (f"{mode.capitalize()} proxies - {provider} "
                  f"({len(asns)} ASN x {count} = {len(lines)})")
-        show_output_popup(self, title, "\n".join(lines))
+        show_output_popup(self, title, "\n".join(lines), shuffle=True)
 
     def on_run(self):
         if self.running:
@@ -1130,7 +1130,7 @@ def ask_generate_options(parent, asn_count):
     return None
 
 
-def show_output_popup(parent, title, text):
+def show_output_popup(parent, title, text, shuffle=False):
     """Modal-ish popup with a scrollable, copyable text box."""
     top = tk.Toplevel(parent)
     top.title(title)
@@ -1157,6 +1157,17 @@ def show_output_popup(parent, title, text):
     copy_btn = ttk.Button(btns, text="Copy all", style="Accent.TButton",
                           command=copy)
     copy_btn.pack(side="left")
+
+    if shuffle:
+        def do_shuffle():
+            lines = [ln for ln in box.get("1.0", "end").splitlines() if ln.strip()]
+            random.shuffle(lines)
+            box.delete("1.0", "end")
+            box.insert("1.0", "\n".join(lines))
+            copy_btn.config(text="Copy all")
+        ttk.Button(btns, text="Shuffle", command=do_shuffle).pack(
+            side="left", padx=8)
+
     ttk.Button(btns, text="Close", command=top.destroy).pack(side="left", padx=8)
     box.focus_set()
 
