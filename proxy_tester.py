@@ -529,8 +529,8 @@ def apply_asn_to_username(user, asn):
     at the end). Preserves sessid/sesstime."""
     if not user or not asn:
         return user
-    if re.search(r"-cc-[a-z]{2}\b", user):
-        return re.sub(r"-cc-[a-z]{2}\b", f"-ASN-{asn}", user, count=1)
+    if re.search(r"-cc-[a-z]{2}\b", user, re.I):
+        return re.sub(r"-cc-[a-z]{2}\b", f"-ASN-{asn}", user, count=1, flags=re.I)
     if re.search(r"-ASN-\d+", user):
         return re.sub(r"-ASN-\d+", f"-ASN-{asn}", user, count=1)
     if "-sessid-" in user:
