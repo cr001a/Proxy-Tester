@@ -1,21 +1,19 @@
 name: Build Windows EXE
 
-# Produces a standalone ProxyTester.exe that runs on Windows with NO Python installed.
-# Runs on every push to main and can be triggered manually.
-# A manual run (or a v* tag) also publishes the .exe to a GitHub Release.
+# Builds a standalone ProxyTester.exe (no Python needed) and publishes it as a
+# GitHub Release. On a push to main the release version is read from the VERSION
+# file (tag v<VERSION>); a v* tag or manual run can override it.
 
 on:
   push:
-    branches:
-      - "main"
-    tags:
-      - "v*"
+    branches: [main]
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Tag/version to publish the .exe under (e.g. v1.0)"
+        description: "Release tag (e.g. v1.7); blank = use VERSION file"
         required: false
-        default: "v1.0"
+        default: ""
 
 permissions:
   contents: write
@@ -36,22 +34,27 @@ jobs:
       - name: Build standalone EXE
         run: pyinstaller --onefile --windowed --name ProxyTester proxy_tester.py
 
+      - name: Determine release tag
+        id: ver
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.release_tag }}" ]; then
+            echo "tag=${{ github.event.inputs.release_tag }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=v$(cat VERSION)" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
         with:
           name: ProxyTester-windows
           path: dist/ProxyTester.exe
 
-      - name: Publish EXE to release (tag push)
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Publish EXE to release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/ProxyTester.exe
-
-      - name: Publish EXE to release (manual run)
-        if: github.event_name == 'workflow_dispatch'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.event.inputs.release_tag }}
-          name: ProxyTester ${{ github.event.inputs.release_tag }}
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ProxyTester ${{ steps.ver.outputs.tag }}
           files: dist/ProxyTester.exe
