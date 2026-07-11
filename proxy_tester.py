@@ -349,14 +349,17 @@ class ProfileStore:
 # To add a provider later: write a build_username(user, asn, sessid) function
 # and add one entry to PROVIDERS. That's the only change needed.
 
-def _oxylabs_username(user, asn, sessid=None):
+def _oxylabs_username(user, asn, sessid=None, sesstime=None):
     # Oxylabs mobile. The account username needs a "customer-" prefix. The ASN
     # itself pins the (US) carrier, and Oxylabs ignores ASN if a country param
-    # is also set, so we deliberately do NOT add cc-us. No sessid => rotating.
+    # is also set, so we deliberately do NOT add cc-us. No sessid => rotating;
+    # sessid (+ optional sesstime minutes) => sticky session.
     base = user if user.startswith("customer-") else f"customer-{user}"
     name = f"{base}-ASN-{asn}"
     if sessid:
         name += f"-sessid-{sessid}"
+        if sesstime:
+            name += f"-sesstime-{sesstime}"
     return name
 
 
@@ -366,9 +369,9 @@ PROVIDERS = {
 }
 
 
-def build_username(provider, user, asn, sessid=None):
+def build_username(provider, user, asn, sessid=None, sesstime=None):
     spec = PROVIDERS.get(provider) or next(iter(PROVIDERS.values()))
-    return spec["build"](user, asn, sessid)
+    return spec["build"](user, asn, sessid, sesstime)
 
 
 def provider_hostport(provider):
@@ -519,7 +522,23 @@ def parse_proxy_line(line):
 _URL_RE = re.compile(r"https?://[^\s'\"<>]+", re.I)
 
 
-def convert_proxy_line(line):
+def apply_asn_to_username(user, asn):
+    """Rewrite an Oxylabs-style username to target an ASN. Country and ASN are
+    mutually exclusive on Oxylabs, so swap -cc-<country> for -ASN-<asn>; replace
+    an existing -ASN-<n>; otherwise insert -ASN-<asn> before the session id (or
+    at the end). Preserves sessid/sesstime."""
+    if not user or not asn:
+        return user
+    if re.search(r"-cc-[a-z]{2}\b", user):
+        return re.sub(r"-cc-[a-z]{2}\b", f"-ASN-{asn}", user, count=1)
+    if re.search(r"-ASN-\d+", user):
+        return re.sub(r"-ASN-\d+", f"-ASN-{asn}", user, count=1)
+    if "-sessid-" in user:
+        return user.replace("-sessid-", f"-ASN-{asn}-sessid-", 1)
+    return f"{user}-ASN-{asn}"
+
+
+def convert_proxy_line(line, force_asn=None):
     """
     Normalize any provider proxy format into 'host:port:user:pass'.
 
@@ -528,7 +547,9 @@ def convert_proxy_line(line):
       - python snippets: entry = 'http://user:pass@host:port'
       - user:pass@host:port (no scheme)
       - already host:port:user:pass (passthrough)
-    Credentials are percent-decoded (so %7E -> ~). Returns None if unparseable.
+    Credentials are percent-decoded (so %7E -> ~). If force_asn is given, the
+    username is rewritten to target that ASN (cc-<country> -> ASN-<n>). Returns
+    None if unparseable.
     """
     line = line.strip().strip("'\",;")
     if not line:
@@ -549,6 +570,8 @@ def convert_proxy_line(line):
             return None
         user = unquote(parts.username) if parts.username else None
         pw = unquote(parts.password) if parts.password is not None else None
+        if user and force_asn:
+            user = apply_asn_to_username(user, force_asn)
         if user and pw is not None:
             return f"{host}:{port}:{user}:{pw}"
         if user:
@@ -557,8 +580,11 @@ def convert_proxy_line(line):
 
     parsed = parse_proxy_line(target)
     if parsed:
-        if parsed["user"] and parsed["pw"] is not None:
-            return f"{parsed['host']}:{parsed['port']}:{parsed['user']}:{parsed['pw']}"
+        user = parsed["user"]
+        if user and force_asn:
+            user = apply_asn_to_username(user, force_asn)
+        if user and parsed["pw"] is not None:
+            return f"{parsed['host']}:{parsed['port']}:{user}:{parsed['pw']}"
         return f"{parsed['host']}:{parsed['port']}"
     return None
 
@@ -859,13 +885,16 @@ class AsnTab(ttk.Frame):
         opts = ask_generate_options(self, len(asns))
         if not opts:
             return
-        mode, count = opts  # mode: "static" | "rotating"
+        mode, count, sesstime = opts  # mode: "static" | "rotating"
 
         lines = []
         for asn in asns:
             for _ in range(count):
-                sessid = _random_sessid() if mode == "static" else None
-                user = build_username(provider, username, asn, sessid)
+                if mode == "static":
+                    user = build_username(provider, username, asn,
+                                          _random_sessid(), sesstime)
+                else:
+                    user = build_username(provider, username, asn)
                 lines.append(f"{host}:{port}:{user}:{password}")
         title = (f"{mode.capitalize()} proxies - {provider} "
                  f"({len(asns)} ASN x {count} = {len(lines)})")
@@ -1190,8 +1219,9 @@ def center_over_parent(top, parent, w=None, h=None):
 
 
 def ask_generate_options(parent, asn_count):
-    """Modal dialog: choose static/rotating and proxies-per-ASN. Returns
-    (mode, count) or None if cancelled."""
+    """Modal dialog: choose static/rotating, proxies-per-ASN, and (for static)
+    sticky minutes. Returns (mode, count, sesstime) or None if cancelled.
+    sesstime is an int or None."""
     top = tk.Toplevel(parent)
     top.title("Generate proxies")
     top.configure(bg=BASE)
@@ -1200,6 +1230,7 @@ def ask_generate_options(parent, asn_count):
 
     mode = tk.StringVar(value="rotating")
     count = tk.StringVar(value="1")
+    sesstime = tk.StringVar(value="")
     result = {}
 
     ttk.Label(top, text=f"Generating for {asn_count} selected ASN(s)",
@@ -1212,9 +1243,15 @@ def ask_generate_options(parent, asn_count):
                     variable=mode, value="static").pack(anchor="w", padx=24)
 
     row = ttk.Frame(top)
-    row.pack(anchor="w", padx=16, pady=(10, 4))
+    row.pack(anchor="w", padx=16, pady=(10, 2))
     ttk.Label(row, text="Proxies per ASN").pack(side="left")
     ttk.Entry(row, textvariable=count, width=6).pack(side="left", padx=8)
+
+    row2 = ttk.Frame(top)
+    row2.pack(anchor="w", padx=16, pady=(2, 4))
+    ttk.Label(row2, text="Sticky minutes (static only, blank = none)").pack(
+        side="left")
+    ttk.Entry(row2, textvariable=sesstime, width=6).pack(side="left", padx=8)
 
     def ok():
         try:
@@ -1223,8 +1260,19 @@ def ask_generate_options(parent, asn_count):
             messagebox.showerror("Generate proxies",
                                  "Proxies per ASN must be a number.")
             return
+        st = sesstime.get().strip()
+        if st:
+            try:
+                st = max(1, int(st))
+            except ValueError:
+                messagebox.showerror("Generate proxies",
+                                     "Sticky minutes must be a number.")
+                return
+        else:
+            st = None
         result["mode"] = mode.get()
         result["count"] = n
+        result["sesstime"] = st
         top.destroy()
 
     btns = ttk.Frame(top)
@@ -1237,7 +1285,7 @@ def ask_generate_options(parent, asn_count):
     top.grab_set()
     top.wait_window()
     if result:
-        return result["mode"], result["count"]
+        return result["mode"], result["count"], result["sesstime"]
     return None
 
 
@@ -1332,6 +1380,10 @@ class ConverterTab(ttk.Frame):
                    command=self.on_convert).pack(pady=(40, 8))
         ttk.Button(mid, text="Copy", command=self.on_copy).pack(pady=8)
         ttk.Button(mid, text="Clear", command=self.on_clear).pack(pady=8)
+        ttk.Label(mid, text="Force ASN", style="Muted.TLabel").pack(pady=(20, 0))
+        self.asn_var = tk.StringVar()
+        ttk.Entry(mid, textvariable=self.asn_var, width=10).pack(pady=(2, 0))
+        ttk.Label(mid, text="(swaps cc-> ASN)", style="Muted.TLabel").pack()
 
         self.out = tk.Text(self, width=52, height=18)
         style_text(self.out)
@@ -1347,11 +1399,12 @@ class ConverterTab(ttk.Frame):
 
     def on_convert(self):
         lines = self.src.get("1.0", "end").splitlines()
+        force_asn = self.asn_var.get().strip() or None
         out, ok, bad = [], 0, 0
         for line in lines:
             if not line.strip():
                 continue
-            result = convert_proxy_line(line)
+            result = convert_proxy_line(line, force_asn=force_asn)
             if result:
                 out.append(result)
                 ok += 1
@@ -1360,6 +1413,8 @@ class ConverterTab(ttk.Frame):
         self.out.delete("1.0", "end")
         self.out.insert("1.0", "\n".join(out))
         msg = f"Converted {ok} proxy(ies)."
+        if force_asn:
+            msg += f" ASN set to {force_asn}."
         if bad:
             msg += f" Skipped {bad} unparseable line(s)."
         self.status_lbl.config(text=msg)
