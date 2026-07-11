@@ -89,6 +89,13 @@ def apply_theme(root):
                     bordercolor=SURFACE2, insertcolor=TEXT, padding=4)
     style.map("TEntry", bordercolor=[("focus", MAUVE)])
 
+    style.configure("TRadiobutton", background=BASE, foreground=TEXT,
+                    indicatorcolor=SURFACE, padding=4)
+    style.map("TRadiobutton",
+              background=[("active", BASE)],
+              indicatorcolor=[("selected", MAUVE)],
+              foreground=[("active", MAUVE)])
+
     style.configure("TCombobox", fieldbackground=SURFACE, background=SURFACE,
                     foreground=TEXT, arrowcolor=TEXT, bordercolor=SURFACE2,
                     padding=4)
@@ -602,12 +609,15 @@ class AsnTab(ttk.Frame):
             font=(UI_FONT, 10))
         for asn, label in ASN_CATALOG:
             self.asn_list.insert("end", f"{asn}  -  {label}")
-        self.asn_list.selection_set(0, MOBILE_ASN_COUNT - 1)  # mobile by default
+        # Start with nothing selected (fresh every launch).
         lb_sb = ttk.Scrollbar(lb_row, orient="vertical",
                               command=self.asn_list.yview)
         self.asn_list.configure(yscrollcommand=lb_sb.set)
         self.asn_list.pack(side="left", fill="both")
         lb_sb.pack(side="left", fill="y")
+
+        self.asn_list.bind("<Control-c>", self._copy_selected_asns)
+        self.asn_list.bind("<Control-C>", self._copy_selected_asns)
 
         lb_btns = ttk.Frame(asn_frame)
         lb_btns.pack(fill="x", pady=(4, 0))
@@ -617,6 +627,8 @@ class AsnTab(ttk.Frame):
         ttk.Button(lb_btns, text="Clear",
                    command=lambda: self.asn_list.selection_clear(0, "end")).pack(
             side="left", padx=6)
+        ttk.Button(lb_btns, text="Copy",
+                   command=self._copy_selected_asns).pack(side="left")
 
         ttk.Label(asn_frame, text="+ paste custom ASNs (one per line)").pack(
             anchor="w", pady=(8, 0))
@@ -629,7 +641,7 @@ class AsnTab(ttk.Frame):
         self.run_btn = ttk.Button(btns, text="Run", style="Accent.TButton",
                                   command=self.on_run)
         self.run_btn.pack(side="left")
-        self.gen_btn = ttk.Button(btns, text="Generate proxies",
+        self.gen_btn = ttk.Button(btns, text="Generate from selected results",
                                   command=self.on_generate)
         self.gen_btn.pack(side="left", padx=8)
         self.export_btn = ttk.Button(btns, text="Export CSV",
@@ -652,6 +664,16 @@ class AsnTab(ttk.Frame):
         self.tree.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
 
+    def _copy_selected_asns(self, _event=None):
+        """Copy just the ASN numbers (not the labels), one per line."""
+        asns = [ASN_CATALOG[i][0] for i in self.asn_list.curselection()]
+        if asns:
+            self.clipboard_clear()
+            self.clipboard_append("\n".join(asns))
+            self.update_idletasks()
+            self.status_lbl.config(text=f"Copied {len(asns)} ASN(s)")
+        return "break"
+
     def _selected_asns(self):
         """Selected catalog ASNs + any pasted ones, de-duplicated in order."""
         picked = [ASN_CATALOG[i][0] for i in self.asn_list.curselection()]
@@ -666,14 +688,13 @@ class AsnTab(ttk.Frame):
 
     # --- profile state ---
     def get_state(self):
+        # Profiles store credentials/settings only - never the transient ASN
+        # selection or the pasted box (those start empty each session).
         return {
             "host": self.host.get(), "port": self.port.get(),
             "username": self.username.get(), "password": self.password.get(),
             "url": self.url.get(), "runs": self.runs.get(),
             "provider": self.provider.get(),
-            "asns": self.asn_text.get("1.0", "end").rstrip("\n"),
-            "asn_selected": [ASN_CATALOG[i][0]
-                             for i in self.asn_list.curselection()],
         }
 
     def set_state(self, d):
@@ -684,14 +705,6 @@ class AsnTab(ttk.Frame):
         self.url.set(d.get("url", "https://ipinfo.io/json"))
         self.runs.set(d.get("runs", "5"))
         self.provider.set(d.get("provider", "Oxylabs"))
-        self.asn_text.delete("1.0", "end")
-        self.asn_text.insert("1.0", d.get("asns", ""))
-        selected = d.get("asn_selected")
-        if selected is not None:
-            self.asn_list.selection_clear(0, "end")
-            for i, (asn, _label) in enumerate(ASN_CATALOG):
-                if asn in selected:
-                    self.asn_list.selection_set(i)
 
     def on_provider(self, _event=None):
         host, port = provider_hostport(self.provider.get())
@@ -701,26 +714,41 @@ class AsnTab(ttk.Frame):
             self.port.set(port)
 
     def on_generate(self):
+        # Build proxies from the ASNs selected in the RESULTS table.
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showinfo(
+                "Generate proxies",
+                "Select one or more rows in the results table first.\n\n"
+                "Run a test, then highlight the ASNs you want proxies for "
+                "(Shift-click a range, Ctrl-click to toggle).")
+            return
+        asns = [self.tree.item(iid, "values")[0] for iid in selection]
+
         host = self.host.get().strip()
         port = self.port.get().strip()
         username = self.username.get().strip()
         password = self.password.get()
         provider = self.provider.get()
-        asns = self._selected_asns()
-        if not host or not port:
-            messagebox.showerror("Generate", "Host and Port are required.")
+        if not host or not port or not username:
+            messagebox.showerror(
+                "Generate proxies", "Host, Port and Username are required.")
             return
-        if not username:
-            messagebox.showerror("Generate", "Username is required.")
+
+        opts = ask_generate_options(self, len(asns))
+        if not opts:
             return
-        if not asns:
-            messagebox.showerror("Generate", "Select or paste at least one ASN.")
-            return
-        # One rotating proxy per ASN (no sessid => new IP each request).
-        lines = [f"{host}:{port}:{build_username(provider, username, asn)}:{password}"
-                 for asn in asns]
-        show_output_popup(self, f"Rotating proxies - {provider} ({len(lines)})",
-                          "\n".join(lines))
+        mode, count = opts  # mode: "static" | "rotating"
+
+        lines = []
+        for asn in asns:
+            for _ in range(count):
+                sessid = _random_sessid() if mode == "static" else None
+                user = build_username(provider, username, asn, sessid)
+                lines.append(f"{host}:{port}:{user}:{password}")
+        title = (f"{mode.capitalize()} proxies - {provider} "
+                 f"({len(asns)} ASN x {count} = {len(lines)})")
+        show_output_popup(self, title, "\n".join(lines))
 
     def on_run(self):
         if self.running:
@@ -1025,6 +1053,57 @@ class ProxyTab(ttk.Frame):
                         [self.HEADINGS[c] for c in self.COLUMNS])
 
 
+def ask_generate_options(parent, asn_count):
+    """Modal dialog: choose static/rotating and proxies-per-ASN. Returns
+    (mode, count) or None if cancelled."""
+    top = tk.Toplevel(parent)
+    top.title("Generate proxies")
+    top.configure(bg=BASE)
+    top.transient(parent.winfo_toplevel())
+    top.resizable(False, False)
+
+    mode = tk.StringVar(value="rotating")
+    count = tk.StringVar(value="1")
+    result = {}
+
+    ttk.Label(top, text=f"Generating for {asn_count} selected ASN(s)",
+              style="Muted.TLabel").pack(anchor="w", padx=16, pady=(14, 8))
+
+    ttk.Label(top, text="Session type").pack(anchor="w", padx=16)
+    ttk.Radiobutton(top, text="Rotating  -  new IP every request",
+                    variable=mode, value="rotating").pack(anchor="w", padx=24)
+    ttk.Radiobutton(top, text="Static  -  sticky IP per proxy",
+                    variable=mode, value="static").pack(anchor="w", padx=24)
+
+    row = ttk.Frame(top)
+    row.pack(anchor="w", padx=16, pady=(10, 4))
+    ttk.Label(row, text="Proxies per ASN").pack(side="left")
+    ttk.Entry(row, textvariable=count, width=6).pack(side="left", padx=8)
+
+    def ok():
+        try:
+            n = max(1, int(count.get().strip()))
+        except ValueError:
+            messagebox.showerror("Generate proxies",
+                                 "Proxies per ASN must be a number.")
+            return
+        result["mode"] = mode.get()
+        result["count"] = n
+        top.destroy()
+
+    btns = ttk.Frame(top)
+    btns.pack(fill="x", padx=16, pady=14)
+    ttk.Button(btns, text="Generate", style="Accent.TButton",
+               command=ok).pack(side="left")
+    ttk.Button(btns, text="Cancel", command=top.destroy).pack(side="left", padx=8)
+
+    top.grab_set()
+    top.wait_window()
+    if result:
+        return result["mode"], result["count"]
+    return None
+
+
 def show_output_popup(parent, title, text):
     """Modal-ish popup with a scrollable, copyable text box."""
     top = tk.Toplevel(parent)
@@ -1097,9 +1176,6 @@ class ConverterTab(ttk.Frame):
         self.src = tk.Text(self, width=52, height=18)
         style_text(self.src)
         self.src.grid(row=1, column=0, sticky="nsew")
-        self.src.insert(
-            "1.0",
-            "http://customer-USERNAME-cc-us:PASSWORD@pr.oxylabs.io:7777")
 
         mid = ttk.Frame(self)
         mid.grid(row=1, column=1, sticky="ns", padx=14)
