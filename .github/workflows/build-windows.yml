@@ -32,7 +32,7 @@ jobs:
         run: pip install pyinstaller
 
       - name: Build standalone EXE
-        run: pyinstaller --onefile --windowed --name ProxyTester proxy_tester.py
+        run: pyinstaller --onefile --windowed --name ProxyTester --icon logo.ico proxy_tester.py
 
       - name: Determine release tag
         id: ver
