@@ -1304,7 +1304,7 @@ def ask_generate_options(parent, asn_count):
 
     row2 = ttk.Frame(top)
     row2.pack(anchor="w", padx=16, pady=(2, 4))
-    ttk.Label(row2, text="Sticky minutes (static only, max 30, blank = none)").pack(
+    ttk.Label(row2, text="Sticky minutes (static only, max 1440, blank = none)").pack(
         side="left")
     ttk.Entry(row2, textvariable=sesstime, width=6).pack(side="left", padx=8)
 
