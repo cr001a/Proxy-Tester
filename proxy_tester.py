@@ -165,6 +165,30 @@ def tag_tree(tree):
     tree.tag_configure("muted", foreground=SUBTEXT)
 
 
+def enable_drag_select(tree):
+    """Let the user click-and-drag to highlight a range of rows in a Treeview
+    (not supported natively). Shift/Ctrl-click still work as usual."""
+    def on_press(event):
+        row = tree.identify_row(event.y)
+        tree._drag_anchor = row or None
+
+    def on_drag(event):
+        anchor = getattr(tree, "_drag_anchor", None)
+        current = tree.identify_row(event.y)
+        if not anchor or not current:
+            return None
+        items = list(tree.get_children())
+        try:
+            lo, hi = sorted((items.index(anchor), items.index(current)))
+        except ValueError:
+            return None
+        tree.selection_set(items[lo:hi + 1])
+        return "break"
+
+    tree.bind("<Button-1>", on_press, add="+")
+    tree.bind("<B1-Motion>", on_drag)
+
+
 # --------------------------------------------------------------------------- #
 # Networking helpers (stdlib only, no shelling out)
 # --------------------------------------------------------------------------- #
@@ -657,6 +681,7 @@ class AsnTab(ttk.Frame):
             self.tree.column(col, width=110, anchor="center")
         self.tree.column("org", width=200, anchor="w")
         tag_tree(self.tree)
+        enable_drag_select(self.tree)
         self.tree.pack(fill="both", expand=True, pady=(8, 0))
 
         vsb = ttk.Scrollbar(self.tree, orient="vertical",
@@ -934,6 +959,7 @@ class ProxyTab(ttk.Frame):
             self.tree.column(col, width=120, anchor="center")
         self.tree.column("proxy", width=260, anchor="w")
         tag_tree(self.tree)
+        enable_drag_select(self.tree)
         self.tree.pack(fill="both", expand=True, pady=(8, 0))
 
         vsb = ttk.Scrollbar(self.tree, orient="vertical",
