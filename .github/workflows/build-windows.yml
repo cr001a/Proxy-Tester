@@ -29,10 +29,10 @@ jobs:
           python-version: "3.12"
 
       - name: Install PyInstaller
-        run: pip install pyinstaller
+        run: pip install pyinstaller certifi
 
       - name: Build standalone EXE
-        run: pyinstaller --onefile --windowed --name ProxyTester --icon logo.ico proxy_tester.py
+        run: pyinstaller --onefile --windowed --name ProxyTester --icon logo.ico --collect-all certifi proxy_tester.py
 
       - name: Determine release tag
         id: ver
