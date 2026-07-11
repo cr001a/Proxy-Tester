@@ -26,6 +26,7 @@ import random
 import re
 import shutil
 import socket
+import ssl
 import statistics
 import string
 import subprocess
@@ -51,8 +52,25 @@ DEFAULT_TIMEOUT = 15  # seconds, per request
 MAX_WORKERS = 6       # thread pool size for parallel targets
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.2"                     # single source of truth (CI tags v<this>)
+APP_VERSION = "3.3"                     # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
+
+
+def _make_ssl_context():
+    """A verifying TLS context that works in a frozen .exe. PyInstaller apps
+    can't rely on the OS trust store, so use certifi's CA bundle when present,
+    falling back to the system default otherwise."""
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        try:
+            return ssl.create_default_context()
+        except Exception:
+            return None
+
+
+SSL_CTX = _make_ssl_context()
 
 # --------------------------------------------------------------------------- #
 # Theme - a dark, slightly-purple palette (inspired by Catppuccin Mocha /
@@ -276,7 +294,9 @@ def do_request(proxy_url, url, timeout=DEFAULT_TIMEOUT):
         reason  : str   - human readable reason (for conn errors)
     """
     handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
-    opener = urllib.request.build_opener(handler)
+    https = urllib.request.HTTPSHandler(context=SSL_CTX) if SSL_CTX else None
+    opener = (urllib.request.build_opener(handler, https) if https
+              else urllib.request.build_opener(handler))
     req = urllib.request.Request(normalize_url(url), headers={"User-Agent": USER_AGENT})
 
     def _xerr(headers):
@@ -1637,7 +1657,7 @@ def _fetch_latest_release():
     url = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
     req = urllib.request.Request(url, headers={
         "User-Agent": "ProxyTester", "Accept": "application/vnd.github+json"})
-    with urllib.request.urlopen(req, timeout=15) as r:
+    with urllib.request.urlopen(req, timeout=15, context=SSL_CTX) as r:
         data = json.loads(r.read().decode("utf-8", "replace"))
     tag = data.get("tag_name", "")
     asset = next((a for a in data.get("assets", [])
@@ -1676,7 +1696,8 @@ def _download_and_apply(parent, url, tag):
     try:
         tmp = os.path.join(tempfile.gettempdir(), f"ProxyTester-{tag}.exe")
         req = urllib.request.Request(url, headers={"User-Agent": "ProxyTester"})
-        with urllib.request.urlopen(req, timeout=180) as r, open(tmp, "wb") as f:
+        with urllib.request.urlopen(req, timeout=180, context=SSL_CTX) as r, \
+                open(tmp, "wb") as f:
             shutil.copyfileobj(r, f)
     except Exception as e:
         messagebox.showerror("Update", f"Download failed:\n{e}")
