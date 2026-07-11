@@ -25,6 +25,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote, unquote, urlsplit
 
@@ -161,7 +162,9 @@ def status_tag(status):
         return "muted"
     if s == "stopped":
         return "muted"
-    if "restricted" in s or "empty pool" in s or s.startswith("http"):
+    # Access-denied / restricted / auth-limit -> yellow; other errors -> red.
+    if (s.startswith(("403", "407")) or "access denied" in s
+            or "forbidden" in s or "restricted" in s):
         return "warn"
     return "bad"
 
@@ -249,29 +252,81 @@ def do_request(proxy_url, url, timeout=DEFAULT_TIMEOUT):
     opener = urllib.request.build_opener(handler)
     req = urllib.request.Request(normalize_url(url), headers={"User-Agent": USER_AGENT})
 
+    def _xerr(headers):
+        # X-Error-Description is an Oxylabs-specific header; absent for other
+        # providers, in which case this is just "".
+        try:
+            return (headers.get("x-error-description") or "").strip()
+        except Exception:
+            return ""
+
     start = time.perf_counter()
     try:
         resp = opener.open(req, timeout=timeout)
         body = resp.read()
         elapsed = (time.perf_counter() - start) * 1000.0
-        return {"ok": True, "code": resp.getcode(), "ms": elapsed,
-                "body": body, "error": None, "reason": ""}
+        return {"ok": True, "code": resp.getcode(), "ms": elapsed, "body": body,
+                "error": None, "reason": "", "xerr": _xerr(resp.headers),
+                "http_reason": ""}
     except urllib.error.HTTPError as e:
         elapsed = (time.perf_counter() - start) * 1000.0
         return {"ok": False, "code": e.code, "ms": elapsed, "body": None,
-                "error": "http", "reason": f"HTTP {e.code}"}
+                "error": "http", "reason": "", "xerr": _xerr(e.headers),
+                "http_reason": str(getattr(e, "reason", "") or "")}
     except urllib.error.URLError as e:
         elapsed = (time.perf_counter() - start) * 1000.0
         return {"ok": False, "code": None, "ms": elapsed, "body": None,
-                "error": "conn", "reason": str(getattr(e, "reason", e))}
+                "error": "conn", "reason": str(getattr(e, "reason", e)),
+                "xerr": "", "http_reason": ""}
     except (socket.timeout, ConnectionResetError, OSError) as e:
         elapsed = (time.perf_counter() - start) * 1000.0
         return {"ok": False, "code": None, "ms": elapsed, "body": None,
-                "error": "conn", "reason": str(e)}
+                "error": "conn", "reason": str(e), "xerr": "", "http_reason": ""}
     except Exception as e:  # never let a worker crash the app
         elapsed = (time.perf_counter() - start) * 1000.0
         return {"ok": False, "code": None, "ms": elapsed, "body": None,
-                "error": "conn", "reason": str(e)}
+                "error": "conn", "reason": str(e), "xerr": "", "http_reason": ""}
+
+
+# Proxy CONNECT failures for HTTPS targets surface as
+# "Tunnel connection failed: <code> <phrase>" - parse the real status out.
+_TUNNEL_RE = re.compile(r"tunnel connection failed:\s*(\d{3})\s*(.*)", re.I)
+
+
+def response_code(r):
+    """The HTTP status code, incl. codes hidden inside a tunnel-failure reason."""
+    if r.get("code") is not None:
+        return r["code"]
+    m = _TUNNEL_RE.search(r.get("reason") or "")
+    return int(m.group(1)) if m else None
+
+
+def response_label(r):
+    """Exact response for the status column. Universal (HTTP code / connection
+    reason); the Oxylabs X-Error-Description is appended only when present."""
+    if r.get("ok"):
+        return "OK"
+    xerr = (r.get("xerr") or "").strip()
+    code = r.get("code")
+    if code is not None:
+        detail = xerr or (r.get("http_reason") or "").strip()
+        return f"{code} {detail}".strip()[:60]
+    reason = (r.get("reason") or "").strip()
+    m = _TUNNEL_RE.search(reason)
+    if m:
+        detail = xerr or m.group(2).strip()
+        return f"{m.group(1)} {detail}".strip()[:60]
+    low = reason.lower()
+    if "timed out" in low or "timeout" in low:
+        return "timeout"
+    if "refused" in low:
+        return "refused"
+    if "reset" in low:
+        return "conn reset"
+    if any(k in low for k in ("getaddrinfo", "name or service",
+                              "resolve", "nodename")):
+        return "DNS error"
+    return (reason or "error")[:60]
 
 
 def _parse_json_field(body, field):
@@ -451,7 +506,7 @@ def test_asn(host, port, username, password, asn, url, runs, timeout,
     """Run `runs` requests for a single ASN. Returns an aggregate result dict."""
     latencies = []
     successes = 0
-    codes_seen = set()
+    labels = []       # exact response label per failed run
     org = ""
 
     for _ in range(runs):
@@ -468,20 +523,19 @@ def test_asn(host, port, username, password, asn, url, runs, timeout,
             found_org = _parse_json_field(r["body"], "org")
             if found_org:
                 org = found_org
-        elif r["code"] is not None:
-            codes_seen.add(r["code"])
+        else:
+            labels.append(response_label(r))
 
     interrupted = stop_event is not None and stop_event.is_set()
     if successes > 0:
         status = "OK"
-    elif 403 in codes_seen:
-        status = "restricted (KYC)"
-    elif 502 in codes_seen:
-        status = "empty pool"
-    elif interrupted:
+    elif interrupted and not labels:
         status = "stopped"
+    elif labels:
+        # Show the most common exact response across the runs.
+        status = Counter(labels).most_common(1)[0][0]
     else:
-        status = "unavailable"
+        status = "no response"
 
     return {
         "asn": str(asn),
@@ -603,14 +657,15 @@ def test_proxy(proxy, url, runs, timeout, stop_event=None):
     successes = 0
     last_code = None
     exit_ip = ""
-    last_reason = ""
+    labels = []
 
     for _ in range(runs):
         if stop_event is not None and stop_event.is_set():
             break
         r = do_request(proxy_url, url, timeout)
-        if r["code"] is not None:
-            last_code = r["code"]
+        code = response_code(r)
+        if code is not None:
+            last_code = code
         if r["ok"]:
             successes += 1
             latencies.append(r["ms"])
@@ -618,17 +673,17 @@ def test_proxy(proxy, url, runs, timeout, stop_event=None):
             if found_ip:
                 exit_ip = found_ip
         else:
-            last_reason = r["reason"]
+            labels.append(response_label(r))
 
     interrupted = stop_event is not None and stop_event.is_set()
     if successes > 0:
         status = "OK"
-    elif last_code is not None:
-        status = f"HTTP {last_code}"
-    elif interrupted:
+    elif interrupted and not labels:
         status = "stopped"
+    elif labels:
+        status = Counter(labels).most_common(1)[0][0]
     else:
-        status = "unreachable"
+        status = "no response"
 
     return {
         "proxy": display,
@@ -638,7 +693,7 @@ def test_proxy(proxy, url, runs, timeout, stop_event=None):
         "success": successes,
         "runs": runs,
         "exit_ip": exit_ip,
-        "reason": last_reason,
+        "reason": "",
     }
 
 
@@ -1249,7 +1304,7 @@ def ask_generate_options(parent, asn_count):
 
     row2 = ttk.Frame(top)
     row2.pack(anchor="w", padx=16, pady=(2, 4))
-    ttk.Label(row2, text="Sticky minutes (static only, blank = none)").pack(
+    ttk.Label(row2, text="Sticky minutes (static only, max 30, blank = none)").pack(
         side="left")
     ttk.Entry(row2, textvariable=sesstime, width=6).pack(side="left", padx=8)
 
