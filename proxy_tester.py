@@ -3,6 +3,12 @@ ProxyTester - a proxy testing GUI.
 
 Made by codyrandolph.
 
+Copyright 2026 Cody Randolph. Licensed under the PolyForm Noncommercial
+License 1.0.0 (see LICENSE). Noncommercial use only - no commercial use or
+resale without the author's written permission.
+
+Required Notice: Copyright 2026 Cody Randolph
+
 Two tabs:
   1. ASN Tester (Oxylabs mobile) - tests carrier/ASN targeting.
   2. Proxy Tester (general)      - plain reachability/latency testing.
@@ -45,7 +51,7 @@ DEFAULT_TIMEOUT = 15  # seconds, per request
 MAX_WORKERS = 6       # thread pool size for parallel targets
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.1"                     # single source of truth (CI tags v<this>)
+APP_VERSION = "3.2"                     # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 # --------------------------------------------------------------------------- #
