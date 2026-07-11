@@ -36,11 +36,16 @@ from urllib.parse import quote, unquote, urlsplit
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+try:
+    from logo_assets import LOGO_HEADER_B64, LOGO_ICON_B64
+except ImportError:  # logo is optional
+    LOGO_HEADER_B64 = LOGO_ICON_B64 = None
+
 DEFAULT_TIMEOUT = 15  # seconds, per request
 MAX_WORKERS = 6       # thread pool size for parallel targets
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "2.8"                     # single source of truth (CI tags v<this>)
+APP_VERSION = "2.9"                     # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 # --------------------------------------------------------------------------- #
@@ -1526,8 +1531,18 @@ class ProfileBar(ttk.Frame):
         self.store = store
         self.tabs = tabs  # dict: key -> tab with get_state/set_state
 
-        ttk.Label(self, text="◆ ProxyTester", style="Header.TLabel").pack(
-            side="left")
+        if LOGO_HEADER_B64:
+            try:
+                self._logo_img = tk.PhotoImage(data=LOGO_HEADER_B64)
+                ttk.Label(self, image=self._logo_img).pack(side="left")
+                ttk.Label(self, text=" ProxyTester", style="Header.TLabel").pack(
+                    side="left")
+            except Exception:
+                ttk.Label(self, text="◆ ProxyTester",
+                          style="Header.TLabel").pack(side="left")
+        else:
+            ttk.Label(self, text="◆ ProxyTester", style="Header.TLabel").pack(
+                side="left")
         ttk.Label(self, text=f"made by codyrandolph  ·  v{APP_VERSION}",
                   style="Muted.TLabel").pack(side="left", padx=(10, 0),
                                              anchor="s", pady=(0, 4))
@@ -1677,6 +1692,13 @@ def main():
     root.geometry("1000x880")  # roomy enough for ~10 result rows
     root.minsize(820, 640)
     apply_theme(root)
+
+    if LOGO_ICON_B64:
+        try:
+            root._icon_img = tk.PhotoImage(data=LOGO_ICON_B64)
+            root.iconphoto(True, root._icon_img)
+        except Exception:
+            pass
 
     store = ProfileStore()
 
