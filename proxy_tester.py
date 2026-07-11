@@ -18,9 +18,13 @@ import os
 import queue
 import random
 import re
+import shutil
 import socket
 import statistics
 import string
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -35,6 +39,9 @@ from tkinter import filedialog, messagebox, ttk
 DEFAULT_TIMEOUT = 15  # seconds, per request
 MAX_WORKERS = 6       # thread pool size for parallel targets
 USER_AGENT = "ProxyTester/1.0"
+
+APP_VERSION = "2.8"                     # single source of truth (CI tags v<this>)
+UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 # --------------------------------------------------------------------------- #
 # Theme - a dark, slightly-purple palette (inspired by Catppuccin Mocha /
@@ -182,9 +189,13 @@ def enable_drag_select(tree):
     SHIFT, CTRL = 0x0001, 0x0004
 
     def on_press(event):
-        # Only engage drag-select for a plain click; let Ctrl/Shift-click be
-        # handled natively (toggle / extend) without interference.
+        # Only engage drag-select for a plain click on a body cell. Presses on a
+        # heading/separator must be left to the native column-resize handler,
+        # and Ctrl/Shift-clicks to the native toggle/extend.
         if event.state & (SHIFT | CTRL):
+            tree._drag_anchor = None
+            return
+        if tree.identify_region(event.x, event.y) != "cell":
             tree._drag_anchor = None
             return
         tree._drag_anchor = tree.identify_row(event.y) or None
@@ -943,11 +954,16 @@ class AsnTab(ttk.Frame):
         mode, count, sesstime = opts  # mode: "static" | "rotating"
 
         lines = []
+        # Sequential sessids (like the Oxylabs endpoint generator): a random
+        # base, then +1 per proxy, so each static proxy is a distinct session.
+        base = random.randint(1, 8_999_999_999)
+        seq = 0
         for asn in asns:
             for _ in range(count):
                 if mode == "static":
                     user = build_username(provider, username, asn,
-                                          _random_sessid(), sesstime)
+                                          f"{base + seq:010d}", sesstime)
+                    seq += 1
                 else:
                     user = build_username(provider, username, asn)
                 lines.append(f"{host}:{port}:{user}:{password}")
@@ -1293,20 +1309,32 @@ def ask_generate_options(parent, asn_count):
 
     ttk.Label(top, text="Session type").pack(anchor="w", padx=16)
     ttk.Radiobutton(top, text="Rotating  -  new IP every request",
-                    variable=mode, value="rotating").pack(anchor="w", padx=24)
+                    variable=mode, value="rotating",
+                    command=lambda: _sync_sticky()).pack(anchor="w", padx=24)
     ttk.Radiobutton(top, text="Static  -  sticky IP per proxy",
-                    variable=mode, value="static").pack(anchor="w", padx=24)
+                    variable=mode, value="static",
+                    command=lambda: _sync_sticky()).pack(anchor="w", padx=24)
 
     row = ttk.Frame(top)
     row.pack(anchor="w", padx=16, pady=(10, 2))
     ttk.Label(row, text="Proxies per ASN").pack(side="left")
     ttk.Entry(row, textvariable=count, width=6).pack(side="left", padx=8)
 
+    # Sticky-minutes row: shown only when Static is selected.
     row2 = ttk.Frame(top)
-    row2.pack(anchor="w", padx=16, pady=(2, 4))
-    ttk.Label(row2, text="Sticky minutes (static only, max 1440, blank = none)").pack(
+    ttk.Label(row2, text="Sticky minutes (max 1440, blank = none)").pack(
         side="left")
     ttk.Entry(row2, textvariable=sesstime, width=6).pack(side="left", padx=8)
+
+    def _sync_sticky():
+        if mode.get() == "static":
+            row2.pack(anchor="w", padx=16, pady=(2, 4))
+        else:
+            row2.pack_forget()
+        top.update_idletasks()
+        center_over_parent(top, parent)
+
+    _sync_sticky()
 
     def ok():
         try:
@@ -1500,9 +1528,12 @@ class ProfileBar(ttk.Frame):
 
         ttk.Label(self, text="◆ ProxyTester", style="Header.TLabel").pack(
             side="left")
-        ttk.Label(self, text="made by codyrandolph",
+        ttk.Label(self, text=f"made by codyrandolph  ·  v{APP_VERSION}",
                   style="Muted.TLabel").pack(side="left", padx=(10, 0),
                                              anchor="s", pady=(0, 4))
+        ttk.Button(self, text="Check for updates",
+                   command=lambda: check_for_updates(self)).pack(
+            side="left", padx=(16, 0))
 
         ttk.Button(self, text="Delete", command=self.on_delete).pack(
             side="right", padx=(8, 0))
@@ -1546,6 +1577,98 @@ class ProfileBar(ttk.Frame):
             self.store.delete(name)
             self.combo.set("")
             self.combo.config(values=self.store.names())
+
+
+# --------------------------------------------------------------------------- #
+# Self-update (pulls the latest release from the public GitHub repo)
+# --------------------------------------------------------------------------- #
+def _version_tuple(v):
+    nums = []
+    for part in str(v).lstrip("vV").split("."):
+        try:
+            nums.append(int(part))
+        except ValueError:
+            nums.append(0)
+    return tuple(nums)
+
+
+def _fetch_latest_release():
+    url = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "ProxyTester", "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        data = json.loads(r.read().decode("utf-8", "replace"))
+    tag = data.get("tag_name", "")
+    asset = next((a for a in data.get("assets", [])
+                  if a.get("name", "").lower().endswith(".exe")), None)
+    return tag, (asset or {}).get("browser_download_url")
+
+
+def check_for_updates(parent, silent=False):
+    """Check GitHub for a newer release; offer to download+install it."""
+    try:
+        tag, dl = _fetch_latest_release()
+    except Exception as e:
+        if not silent:
+            messagebox.showerror(
+                "Check for updates",
+                f"Couldn't reach the update server:\n{e}\n\n"
+                "The repo/releases must be public for updates to work.")
+        return
+    if not tag or not dl:
+        if not silent:
+            messagebox.showinfo("Check for updates", "No release found.")
+        return
+    if _version_tuple(tag) <= _version_tuple(APP_VERSION):
+        if not silent:
+            messagebox.showinfo("Check for updates",
+                                f"You're on the latest version (v{APP_VERSION}).")
+        return
+    if messagebox.askyesno(
+            "Update available",
+            f"{tag} is available - you have v{APP_VERSION}.\n\n"
+            "Download and install now?"):
+        _download_and_apply(parent, dl, tag)
+
+
+def _download_and_apply(parent, url, tag):
+    try:
+        tmp = os.path.join(tempfile.gettempdir(), f"ProxyTester-{tag}.exe")
+        req = urllib.request.Request(url, headers={"User-Agent": "ProxyTester"})
+        with urllib.request.urlopen(req, timeout=180) as r, open(tmp, "wb") as f:
+            shutil.copyfileobj(r, f)
+    except Exception as e:
+        messagebox.showerror("Update", f"Download failed:\n{e}")
+        return
+
+    # Only self-replace when running as the packaged .exe on Windows.
+    if getattr(sys, "frozen", False) and os.name == "nt":
+        current = sys.executable
+        bat = os.path.join(tempfile.gettempdir(), "proxytester_update.bat")
+        script = (
+            "@echo off\r\n"
+            "set n=0\r\n"
+            ":retry\r\n"
+            f'move /y "{tmp}" "{current}" >nul 2>&1\r\n'
+            "if errorlevel 1 if %n% lss 20 "
+            "(set /a n+=1 & timeout /t 1 /nobreak >nul & goto retry)\r\n"
+            f'start "" "{current}"\r\n'
+            'del "%~f0"\r\n'
+        )
+        try:
+            with open(bat, "w") as f:
+                f.write(script)
+            subprocess.Popen(["cmd", "/c", bat], creationflags=0x08000000)
+        except Exception as e:
+            messagebox.showerror(
+                "Update",
+                f"Could not launch the updater:\n{e}\n\nNew version saved at:\n{tmp}")
+            return
+        parent.winfo_toplevel().destroy()  # exit so the .exe can be replaced
+    else:
+        messagebox.showinfo(
+            "Update downloaded",
+            f"Saved {tag} to:\n{tmp}\n\nClose ProxyTester and run that file.")
 
 
 def main():

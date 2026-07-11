@@ -43,7 +43,8 @@ jobs:
           elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
           else
-            echo "tag=v$(cat VERSION)" >> "$GITHUB_OUTPUT"
+            v=$(python -c "import re;print(re.search(r'APP_VERSION\s*=\s*\"([^\"]+)\"', open('proxy_tester.py').read()).group(1))")
+            echo "tag=v$v" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Upload EXE artifact
