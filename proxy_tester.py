@@ -1079,6 +1079,20 @@ class ProxyTab(ttk.Frame):
                         [self.HEADINGS[c] for c in self.COLUMNS])
 
 
+def center_over_parent(top, parent, w=None, h=None):
+    """Position a popup centered over the main app window (not top-left of a
+    huge monitor). Sets size too when w/h are given."""
+    top.update_idletasks()
+    root = parent.winfo_toplevel()
+    w = w or top.winfo_reqwidth()
+    h = h or top.winfo_reqheight()
+    px, py = root.winfo_rootx(), root.winfo_rooty()
+    pw, ph = root.winfo_width(), root.winfo_height()
+    x = max(px, px + (pw - w) // 2)
+    y = max(py, py + (ph - h) // 2)
+    top.geometry(f"{w}x{h}+{x}+{y}")
+
+
 def ask_generate_options(parent, asn_count):
     """Modal dialog: choose static/rotating and proxies-per-ASN. Returns
     (mode, count) or None if cancelled."""
@@ -1123,6 +1137,7 @@ def ask_generate_options(parent, asn_count):
                command=ok).pack(side="left")
     ttk.Button(btns, text="Cancel", command=top.destroy).pack(side="left", padx=8)
 
+    center_over_parent(top, parent)
     top.grab_set()
     top.wait_window()
     if result:
@@ -1135,7 +1150,7 @@ def show_output_popup(parent, title, text, shuffle=False):
     top = tk.Toplevel(parent)
     top.title(title)
     top.configure(bg=BASE)
-    top.geometry("680x440")
+    top.transient(parent.winfo_toplevel())
 
     ttk.Label(top, text=title, style="Header.TLabel").pack(
         anchor="w", padx=14, pady=(12, 6))
@@ -1169,6 +1184,7 @@ def show_output_popup(parent, title, text, shuffle=False):
             side="left", padx=8)
 
     ttk.Button(btns, text="Close", command=top.destroy).pack(side="left", padx=8)
+    center_over_parent(top, parent, 680, 440)
     box.focus_set()
 
 
@@ -1326,8 +1342,8 @@ class ProfileBar(ttk.Frame):
 def main():
     root = tk.Tk()
     root.title("ProxyTester")
-    root.geometry("960x660")
-    root.minsize(760, 520)
+    root.geometry("1000x880")  # roomy enough for ~10 result rows
+    root.minsize(820, 640)
     apply_theme(root)
 
     store = ProfileStore()
