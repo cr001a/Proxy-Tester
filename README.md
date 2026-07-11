@@ -2,6 +2,11 @@
 
 *Made by codyrandolph.*
 
+© 2026 Cody Randolph. **Noncommercial use only** — licensed under the
+[PolyForm Noncommercial License 1.0.0](LICENSE). You may view, use, and modify
+this for personal/noncommercial purposes, but **commercial use or resale is not
+permitted** without the author's written permission.
+
 A barebones Windows GUI tool for testing proxies. Written in Python with the
 **standard library only** (tkinter) so the packaged `.exe` has zero external
 runtime dependencies and never shells out to `curl`.
