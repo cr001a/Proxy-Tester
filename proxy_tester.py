@@ -45,7 +45,7 @@ DEFAULT_TIMEOUT = 15  # seconds, per request
 MAX_WORKERS = 6       # thread pool size for parallel targets
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.0"                     # single source of truth (CI tags v<this>)
+APP_VERSION = "3.1"                     # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 # --------------------------------------------------------------------------- #
@@ -1287,15 +1287,18 @@ class ProxyTab(ttk.Frame):
 
 def center_over_parent(top, parent, w=None, h=None):
     """Position a popup centered over the main app window (not top-left of a
-    huge monitor). Sets size too when w/h are given."""
+    huge monitor), clamped to the screen so nothing (e.g. buttons) is cut off."""
     top.update_idletasks()
     root = parent.winfo_toplevel()
     w = w or top.winfo_reqwidth()
     h = h or top.winfo_reqheight()
+    sw, sh = top.winfo_screenwidth(), top.winfo_screenheight()
+    w = min(w, sw - 40)
+    h = min(h, sh - 80)
     px, py = root.winfo_rootx(), root.winfo_rooty()
     pw, ph = root.winfo_width(), root.winfo_height()
-    x = max(px, px + (pw - w) // 2)
-    y = max(py, py + (ph - h) // 2)
+    x = max(0, min(px + (pw - w) // 2, sw - w))
+    y = max(0, min(py + (ph - h) // 2, sh - h))
     top.geometry(f"{w}x{h}+{x}+{y}")
 
 
@@ -1392,13 +1395,15 @@ def show_output_popup(parent, title, text, shuffle=False):
     ttk.Label(top, text=title, style="Header.TLabel").pack(
         anchor="w", padx=14, pady=(12, 6))
 
-    box = tk.Text(top, wrap="none")
-    style_text(box)
-    box.pack(fill="both", expand=True, padx=14)
-    box.insert("1.0", text)
-
+    # Pin the buttons to the bottom FIRST so they can never be pushed off-screen
+    # by a long list; the text box then fills the space above them.
     btns = ttk.Frame(top)
-    btns.pack(fill="x", padx=14, pady=12)
+    btns.pack(side="bottom", fill="x", padx=14, pady=12)
+
+    box = tk.Text(top, wrap="none", height=16)
+    style_text(box)
+    box.pack(side="top", fill="both", expand=True, padx=14)
+    box.insert("1.0", text)
 
     def copy():
         top.clipboard_clear()
@@ -1421,7 +1426,8 @@ def show_output_popup(parent, title, text, shuffle=False):
             side="left", padx=8)
 
     ttk.Button(btns, text="Close", command=top.destroy).pack(side="left", padx=8)
-    center_over_parent(top, parent, 680, 440)
+    top.resizable(True, True)
+    center_over_parent(top, parent, 720, 520)
     box.focus_set()
 
 
