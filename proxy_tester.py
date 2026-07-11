@@ -45,7 +45,7 @@ DEFAULT_TIMEOUT = 15  # seconds, per request
 MAX_WORKERS = 6       # thread pool size for parallel targets
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "2.9"                     # single source of truth (CI tags v<this>)
+APP_VERSION = "3.0"                     # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 # --------------------------------------------------------------------------- #
@@ -103,6 +103,11 @@ def apply_theme(root):
     style.configure("TEntry", fieldbackground=SURFACE, foreground=TEXT,
                     bordercolor=SURFACE2, insertcolor=TEXT, padding=4)
     style.map("TEntry", bordercolor=[("focus", MAUVE)])
+
+    style.configure("TMenubutton", background=BASE, foreground=SUBTEXT,
+                    arrowcolor=SUBTEXT, relief="flat", padding=2)
+    style.map("TMenubutton", background=[("active", SURFACE)],
+              foreground=[("active", MAUVE)])
 
     style.configure("TRadiobutton", background=BASE, foreground=TEXT,
                     indicatorcolor=SURFACE, padding=4)
@@ -1543,12 +1548,21 @@ class ProfileBar(ttk.Frame):
         else:
             ttk.Label(self, text="◆ ProxyTester", style="Header.TLabel").pack(
                 side="left")
-        ttk.Label(self, text=f"made by codyrandolph  ·  v{APP_VERSION}",
+        ttk.Label(self, text="made by codyrandolph",
                   style="Muted.TLabel").pack(side="left", padx=(10, 0),
                                              anchor="s", pady=(0, 4))
-        ttk.Button(self, text="Check for updates",
-                   command=lambda: check_for_updates(self)).pack(
-            side="left", padx=(16, 0))
+
+        # Compact settings menu, snug in the top-right corner.
+        self._settings_mb = ttk.Menubutton(self, text="⚙")
+        menu = tk.Menu(self._settings_mb, tearoff=0, bg=SURFACE, fg=TEXT,
+                       activebackground=MAUVE, activeforeground=BASE,
+                       bd=0, relief="flat")
+        menu.add_command(label="Check for updates",
+                         command=lambda: check_for_updates(self))
+        menu.add_separator()
+        menu.add_command(label=f"ProxyTester v{APP_VERSION}", state="disabled")
+        self._settings_mb["menu"] = menu
+        self._settings_mb.pack(side="right")
 
         ttk.Button(self, text="Delete", command=self.on_delete).pack(
             side="right", padx=(8, 0))
