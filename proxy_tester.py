@@ -52,7 +52,7 @@ DEFAULT_TIMEOUT = 15  # seconds, per request
 MAX_WORKERS = 6       # thread pool size for parallel targets
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.3"                     # single source of truth (CI tags v<this>)
+APP_VERSION = "3.4"                     # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -132,6 +132,13 @@ def apply_theme(root):
                     arrowcolor=SUBTEXT, relief="flat", padding=2)
     style.map("TMenubutton", background=[("active", SURFACE)],
               foreground=[("active", MAUVE)])
+    # Settings gear: a filled button matching Save/Delete height, larger glyph.
+    style.configure("Gear.TButton", background=SURFACE2, foreground=TEXT,
+                    bordercolor=SURFACE2, relief="flat", anchor="center",
+                    font=(UI_FONT, 13), padding=(8, 6))
+    style.map("Gear.TButton",
+              background=[("active", MAUVE)],
+              foreground=[("active", BASE)])
 
     style.configure("TRadiobutton", background=BASE, foreground=TEXT,
                     indicatorcolor=SURFACE, padding=4)
@@ -829,7 +836,7 @@ class AsnTab(ttk.Frame):
         lb_row = ttk.Frame(asn_frame)
         lb_row.pack(fill="both")
         self.asn_list = tk.Listbox(
-            lb_row, selectmode="extended", height=9, width=36,
+            lb_row, selectmode="extended", height=9, width=50,
             exportselection=False, activestyle="none")
         self.asn_list.configure(
             bg=MANTLE, fg=TEXT, selectbackground=MAUVE, selectforeground=BASE,
@@ -1584,17 +1591,20 @@ class ProfileBar(ttk.Frame):
                   style="Muted.TLabel").pack(side="left", padx=(10, 0),
                                              anchor="s", pady=(0, 4))
 
-        # Compact settings menu, snug in the top-right corner.
-        self._settings_mb = ttk.Menubutton(self, text="⚙")
-        menu = tk.Menu(self._settings_mb, tearoff=0, bg=SURFACE, fg=TEXT,
-                       activebackground=MAUVE, activeforeground=BASE,
-                       bd=0, relief="flat")
-        menu.add_command(label="Check for updates",
-                         command=lambda: check_for_updates(self))
-        menu.add_separator()
-        menu.add_command(label=f"ProxyTester v{APP_VERSION}", state="disabled")
-        self._settings_mb["menu"] = menu
-        self._settings_mb.pack(side="right")
+        # Settings: a filled button (matching Save/Delete height) that drops a
+        # small menu. Coloured so it's obviously a button, cog centred.
+        self._settings_menu = tk.Menu(self, tearoff=0, bg=SURFACE, fg=TEXT,
+                                      activebackground=MAUVE, activeforeground=BASE,
+                                      bd=0, relief="flat")
+        self._settings_menu.add_command(label="Check for updates",
+                                        command=lambda: check_for_updates(self))
+        self._settings_menu.add_separator()
+        self._settings_menu.add_command(
+            label=f"ProxyTester v{APP_VERSION}", state="disabled")
+        self._settings_btn = ttk.Button(self, text="⚙", width=3,
+                                        style="Gear.TButton",
+                                        command=self._open_settings)
+        self._settings_btn.pack(side="right", padx=(8, 0))
 
         ttk.Button(self, text="Delete", command=self.on_delete).pack(
             side="right", padx=(8, 0))
@@ -1604,6 +1614,11 @@ class ProfileBar(ttk.Frame):
         self.combo.pack(side="right")
         self.combo.bind("<<ComboboxSelected>>", self.on_select)
         ttk.Label(self, text="Profile:").pack(side="right", padx=(0, 8))
+
+    def _open_settings(self):
+        btn = self._settings_btn
+        self._settings_menu.tk_popup(btn.winfo_rootx(),
+                                     btn.winfo_rooty() + btn.winfo_height())
 
     def _collect(self):
         return {key: tab.get_state() for key, tab in self.tabs.items()}
@@ -1736,7 +1751,7 @@ def _download_and_apply(parent, url, tag):
 def main():
     root = tk.Tk()
     root.title("ProxyTester")
-    root.geometry("1000x880")  # roomy enough for ~10 result rows
+    root.geometry("1100x880")  # roomy enough for the wide ASN selector
     root.minsize(820, 640)
     apply_theme(root)
 
