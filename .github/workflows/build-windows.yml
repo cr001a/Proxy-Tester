@@ -1,8 +1,10 @@
 name: Build Windows EXE
 
-# Builds a standalone ProxyTester.exe (no Python needed) and publishes it as a
-# GitHub Release. On a push to main the release version is read from the VERSION
-# file (tag v<VERSION>); a v* tag or manual run can override it.
+# Builds a standalone ProxyTester app (no Python needed) as a PyInstaller
+# **onedir** bundle, zips it, and publishes the zip as a GitHub Release.
+# onedir avoids runtime DLL unpacking, so self-updates never race antivirus.
+# On a push to main the release tag is read from APP_VERSION in the source; a
+# v* tag or manual run can override it.
 
 on:
   push:
@@ -31,8 +33,12 @@ jobs:
       - name: Install PyInstaller
         run: pip install pyinstaller certifi
 
-      - name: Build standalone EXE
-        run: pyinstaller --onefile --windowed --name ProxyTester --icon logo.ico --collect-all certifi proxy_tester.py
+      - name: Build standalone app (onedir)
+        run: pyinstaller --onedir --windowed --name ProxyTester --icon logo.ico --collect-all certifi proxy_tester.py
+
+      - name: Zip the app folder
+        shell: pwsh
+        run: Compress-Archive -Path dist/ProxyTester -DestinationPath dist/ProxyTester-windows.zip -Force
 
       - name: Determine release tag
         id: ver
@@ -47,15 +53,15 @@ jobs:
             echo "tag=v$v" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Upload EXE artifact
+      - name: Upload app artifact
         uses: actions/upload-artifact@v4
         with:
           name: ProxyTester-windows
-          path: dist/ProxyTester.exe
+          path: dist/ProxyTester-windows.zip
 
-      - name: Publish EXE to release
+      - name: Publish app to release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
           name: ProxyTester ${{ steps.ver.outputs.tag }}
-          files: dist/ProxyTester.exe
+          files: dist/ProxyTester-windows.zip
