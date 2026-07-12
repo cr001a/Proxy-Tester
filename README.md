@@ -74,31 +74,49 @@ No `pip install` needed to run — everything is standard library.
 
 ---
 
-## Building the standalone Windows .exe
+## Building the standalone Windows app
 
 PyInstaller is the only third-party package required, and only for building.
+The app is built as a **onedir** bundle — a folder containing `ProxyTester.exe`
+plus an `_internal/` folder with the bundled Python runtime. This is
+deliberately *not* a single `.exe`: onedir doesn't unpack DLLs to a temp folder
+at every launch, which is what made in-app self-updates unreliable (a
+freshly-swapped one-file exe races antivirus while it unpacks and can fail with
+*"Failed to load Python DLL"*). onedir has none of that.
 
 ```
 pip install pyinstaller
-pyinstaller --onefile --windowed --name ProxyTester proxy_tester.py
+pyinstaller --onedir --windowed --name ProxyTester proxy_tester.py
 ```
 
-The result is `dist/ProxyTester.exe`. It is fully self-contained: copy it to a
-Windows machine **with no Python installed** and double-click it.
+The result is the `dist/ProxyTester/` folder. It is fully self-contained: copy
+the whole folder to a Windows machine **with no Python installed** and
+double-click `ProxyTester.exe` inside it.
 
-> PyInstaller does not cross-compile. A Windows `.exe` must be built on Windows.
+> PyInstaller does not cross-compile. A Windows build must be made on Windows.
 > This repo includes a GitHub Actions workflow
-> (`.github/workflows/build-windows.yml`) that builds the `.exe` on a
-> `windows-latest` runner and uploads it as a downloadable artifact — so you can
-> get a working `.exe` without owning a Windows machine.
+> (`.github/workflows/build-windows.yml`) that builds the app on a
+> `windows-latest` runner, zips the folder, and uploads
+> `ProxyTester-windows.zip` — so you can get a working build without owning a
+> Windows machine.
 
-### Getting the .exe from GitHub Actions
+### Getting the app from GitHub Actions / Releases
 
-1. Push this branch (already done) or open the **Actions** tab.
-2. Open the latest **Build Windows EXE** run.
-3. Download the **ProxyTester-windows** artifact — it contains `ProxyTester.exe`.
+1. Open the latest **Build Windows EXE** run in the **Actions** tab, or the
+   latest **Release**.
+2. Download **ProxyTester-windows.zip**.
+3. Extract it anywhere and run **ProxyTester.exe** from inside the extracted
+   `ProxyTester` folder.
 
-Tag a commit `v1.0` (etc.) to also publish the `.exe` on a GitHub Release.
+Pushing to `main` publishes a Release automatically, tagged `v<APP_VERSION>`.
+
+### Updating
+
+Use **⚙ → Check for updates** inside the app. It downloads the latest
+`ProxyTester-windows.zip`, unpacks it, swaps the files in your install folder,
+and relaunches — no manual steps. (Updating from an old single-`.exe` build to a
+onedir build is a one-time manual download of the zip; every update after that
+is in-app.)
 
 ---
 

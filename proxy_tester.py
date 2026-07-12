@@ -36,6 +36,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import zipfile
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote, unquote, urlsplit
@@ -52,7 +53,7 @@ DEFAULT_TIMEOUT = 15  # seconds, per request
 MAX_WORKERS = 6       # thread pool size for parallel targets
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.4"                     # single source of truth (CI tags v<this>)
+APP_VERSION = "3.5"                     # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1675,8 +1676,14 @@ def _fetch_latest_release():
     with urllib.request.urlopen(req, timeout=15, context=SSL_CTX) as r:
         data = json.loads(r.read().decode("utf-8", "replace"))
     tag = data.get("tag_name", "")
-    asset = next((a for a in data.get("assets", [])
-                  if a.get("name", "").lower().endswith(".exe")), None)
+    assets = data.get("assets", [])
+    # Prefer the onedir .zip (reliable, no runtime unpacking); fall back to a
+    # legacy .exe if that's all a release carries.
+    asset = next((a for a in assets
+                  if a.get("name", "").lower().endswith(".zip")), None)
+    if asset is None:
+        asset = next((a for a in assets
+                      if a.get("name", "").lower().endswith(".exe")), None)
     return tag, (asset or {}).get("browser_download_url")
 
 
@@ -1707,45 +1714,97 @@ def check_for_updates(parent, silent=False):
         _download_and_apply(parent, dl, tag)
 
 
+def _app_root_in(base):
+    """Find the folder holding ProxyTester.exe inside an extracted update."""
+    if os.path.isfile(os.path.join(base, "ProxyTester.exe")):
+        return base
+    for name in os.listdir(base):
+        path = os.path.join(base, name)
+        if os.path.isdir(path) and \
+                os.path.isfile(os.path.join(path, "ProxyTester.exe")):
+            return path
+    return base
+
+
 def _download_and_apply(parent, url, tag):
+    is_zip = url.lower().split("?", 1)[0].endswith(".zip")
+    tmpdir = tempfile.gettempdir()
+    dl = os.path.join(tmpdir, f"ProxyTester-{tag}." + ("zip" if is_zip else "exe"))
     try:
-        tmp = os.path.join(tempfile.gettempdir(), f"ProxyTester-{tag}.exe")
         req = urllib.request.Request(url, headers={"User-Agent": "ProxyTester"})
-        with urllib.request.urlopen(req, timeout=180, context=SSL_CTX) as r, \
-                open(tmp, "wb") as f:
+        with urllib.request.urlopen(req, timeout=300, context=SSL_CTX) as r, \
+                open(dl, "wb") as f:
             shutil.copyfileobj(r, f)
     except Exception as e:
         messagebox.showerror("Update", f"Download failed:\n{e}")
         return
 
-    # Only self-replace when running as the packaged .exe on Windows.
-    if getattr(sys, "frozen", False) and os.name == "nt":
+    frozen_win = getattr(sys, "frozen", False) and os.name == "nt"
+    bat = os.path.join(tmpdir, "proxytester_update.bat")
+
+    if is_zip:
+        # onedir update: unpack the app folder and mirror it over the install
+        # directory. No runtime DLL unpacking, so nothing races antivirus.
+        staging = os.path.join(tmpdir, f"ProxyTester-{tag}-new")
+        try:
+            if os.path.isdir(staging):
+                shutil.rmtree(staging, ignore_errors=True)
+            with zipfile.ZipFile(dl) as z:
+                z.extractall(staging)
+        except Exception as e:
+            messagebox.showerror("Update", f"Could not unpack the update:\n{e}")
+            return
+        if not frozen_win:
+            messagebox.showinfo(
+                "Update downloaded",
+                f"Unpacked {tag} to:\n{staging}\n\n"
+                "Close ProxyTester and replace your install folder with it.")
+            return
+        src = _app_root_in(staging)
+        install_dir = os.path.dirname(sys.executable)
+        script = (
+            "@echo off\r\n"
+            "timeout /t 2 /nobreak >nul\r\n"
+            "set n=0\r\n"
+            ":retry\r\n"
+            f'robocopy "{src}" "{install_dir}" /MIR /R:15 /W:1 '
+            "/NFL /NDL /NJH /NJS /NC /NS /NP >nul\r\n"
+            "if errorlevel 8 if %n% lss 20 "
+            "(set /a n+=1 & timeout /t 1 /nobreak >nul & goto retry)\r\n"
+            f'start "" "{os.path.join(install_dir, "ProxyTester.exe")}"\r\n'
+            f'rmdir /s /q "{staging}" >nul 2>&1\r\n'
+            f'del "{dl}" >nul 2>&1\r\n'
+            'del "%~f0"\r\n'
+        )
+    else:
+        # Legacy single-file swap (older releases that ship a bare .exe).
+        if not frozen_win:
+            messagebox.showinfo(
+                "Update downloaded",
+                f"Saved {tag} to:\n{dl}\n\nClose ProxyTester and run that file.")
+            return
         current = sys.executable
-        bat = os.path.join(tempfile.gettempdir(), "proxytester_update.bat")
         script = (
             "@echo off\r\n"
             "set n=0\r\n"
             ":retry\r\n"
-            f'move /y "{tmp}" "{current}" >nul 2>&1\r\n'
+            f'move /y "{dl}" "{current}" >nul 2>&1\r\n'
             "if errorlevel 1 if %n% lss 20 "
             "(set /a n+=1 & timeout /t 1 /nobreak >nul & goto retry)\r\n"
             f'start "" "{current}"\r\n'
             'del "%~f0"\r\n'
         )
-        try:
-            with open(bat, "w") as f:
-                f.write(script)
-            subprocess.Popen(["cmd", "/c", bat], creationflags=0x08000000)
-        except Exception as e:
-            messagebox.showerror(
-                "Update",
-                f"Could not launch the updater:\n{e}\n\nNew version saved at:\n{tmp}")
-            return
-        parent.winfo_toplevel().destroy()  # exit so the .exe can be replaced
-    else:
-        messagebox.showinfo(
-            "Update downloaded",
-            f"Saved {tag} to:\n{tmp}\n\nClose ProxyTester and run that file.")
+
+    try:
+        with open(bat, "w") as f:
+            f.write(script)
+        subprocess.Popen(["cmd", "/c", bat], creationflags=0x08000000)
+    except Exception as e:
+        messagebox.showerror(
+            "Update",
+            f"Could not launch the updater:\n{e}\n\nUpdate saved at:\n{dl}")
+        return
+    parent.winfo_toplevel().destroy()  # exit so the files can be replaced
 
 
 def main():
