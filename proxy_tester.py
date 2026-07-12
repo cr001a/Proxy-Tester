@@ -53,7 +53,7 @@ DEFAULT_TIMEOUT = 15  # seconds, per request
 MAX_WORKERS = 6       # thread pool size for parallel targets
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.6"                     # single source of truth (CI tags v<this>)
+APP_VERSION = "3.7"                     # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -609,16 +609,25 @@ def test_asn(host, port, username, password, asn, url, runs, timeout,
 # --------------------------------------------------------------------------- #
 def parse_proxy_line(line):
     """
-    Parse 'host:port:user:pass' (or 'host:port') into a dict.
+    Parse 'host:port:user:pass' (or 'host:port') into a dict. Also accepts the
+    comma-delimited 'host,port,user,pass' variant that some dashboards emit.
     Returns None if the line is not usable.
     """
-    parts = line.strip().split(":")
+    line = line.strip()
+    if not line:
+        return None
+    # Pick the delimiter: comma only when the line is clearly comma-separated
+    # (has commas and no colons), otherwise the usual colon format.
+    if "," in line and ":" not in line:
+        parts = line.split(",", 3)  # cap at 4 so ',' inside a password survives
+    else:
+        parts = line.split(":")
     if len(parts) == 2:
         host, port = parts
         user = pw = None
     elif len(parts) >= 4:
         host, port, user = parts[0], parts[1], parts[2]
-        pw = ":".join(parts[3:])  # allow ':' inside password
+        pw = parts[3] if len(parts) == 4 else ":".join(parts[3:])  # ':' in pass
     else:
         return None
     host = host.strip()
