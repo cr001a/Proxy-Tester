@@ -64,4 +64,10 @@ jobs:
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
           name: ProxyTester ${{ steps.ver.outputs.tag }}
+          body: |
+            ProxyTester ${{ steps.ver.outputs.tag }}
+
+            Download **ProxyTester-windows.zip**, extract it, and run
+            ProxyTester.exe. Existing installs can update from inside the
+            app via the settings menu (Check for updates).
           files: dist/ProxyTester-windows.zip
