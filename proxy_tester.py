@@ -53,7 +53,7 @@ DEFAULT_TIMEOUT = 15  # seconds, per request
 MAX_WORKERS = 6       # thread pool size for parallel targets
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.8"                     # single source of truth (CI tags v<this>)
+APP_VERSION = "3.9"                     # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1824,7 +1824,85 @@ def _download_and_apply(parent, url, tag):
     parent.winfo_toplevel().destroy()  # exit so the files can be replaced
 
 
+# --------------------------------------------------------------------------- #
+# Single-instance guard: a later launch pings the running copy and exits, and
+# the running copy brings its window to the front (handy with multi-monitor
+# taskbars). Uses a fixed localhost port as the lock - standard library only.
+# --------------------------------------------------------------------------- #
+_SINGLE_INSTANCE_PORT = 50573
+_SINGLE_INSTANCE_TOKEN = b"ProxyTester-show"
+
+
+def _signal_existing_instance():
+    """If another instance is already running, ask it to come to the front and
+    return True. Returns False if we are the first instance (or the port is held
+    by something that isn't us, so we should just start normally)."""
+    try:
+        with socket.create_connection(
+                ("127.0.0.1", _SINGLE_INSTANCE_PORT), timeout=0.6) as s:
+            s.sendall(_SINGLE_INSTANCE_TOKEN)
+            s.settimeout(0.6)
+            ack = s.recv(8)
+        return ack.strip() == b"OK"   # only true when the peer is really us
+    except OSError:
+        return False
+
+
+def _bring_to_front(root):
+    """Restore, raise, and focus the window (called on the GUI thread)."""
+    try:
+        root.deiconify()
+        root.lift()
+        root.attributes("-topmost", True)
+        root.after(300, lambda: root.attributes("-topmost", False))
+        root.focus_force()
+    except Exception:
+        pass
+
+
+def _listen_for_second_instance(root):
+    """Hold the single-instance port; when a later launch pings it, raise this
+    window. Returns the server socket (keep a reference so it isn't GC'd) or
+    None if we couldn't bind - in which case the guard is simply skipped."""
+    try:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # No SO_REUSEADDR on purpose: on Windows that would let a 2nd instance
+        # bind the same port and defeat the lock.
+        srv.bind(("127.0.0.1", _SINGLE_INSTANCE_PORT))
+        srv.listen(5)
+    except OSError:
+        return None
+
+    def serve():
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return          # socket closed on exit
+            try:
+                data = conn.recv(64)
+                if _SINGLE_INSTANCE_TOKEN in data:
+                    try:
+                        conn.sendall(b"OK")
+                    except OSError:
+                        pass
+                    root.after(0, lambda: _bring_to_front(root))
+            except OSError:
+                pass
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+    threading.Thread(target=serve, daemon=True).start()
+    return srv
+
+
 def main():
+    if _signal_existing_instance():
+        return  # another instance is already open - brought it to the front
+
     root = tk.Tk()
     root.title("ProxyTester")
     root.geometry("1100x880")  # roomy enough for the wide ASN selector
@@ -1851,6 +1929,9 @@ def main():
     bar = ProfileBar(root, store, {"asn": asn_tab, "proxy": proxy_tab})
     bar.pack(fill="x")
     notebook.pack(fill="both", expand=True, padx=12, pady=(4, 12))
+
+    # Keep a reference so the listening socket lives as long as the window.
+    root._instance_server = _listen_for_second_instance(root)
 
     root.mainloop()
 
