@@ -53,7 +53,7 @@ DEFAULT_TIMEOUT = 15  # seconds, per request
 MAX_WORKERS = 6       # thread pool size for parallel targets
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.7"                     # single source of truth (CI tags v<this>)
+APP_VERSION = "3.8"                     # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1195,9 +1195,9 @@ class ProxyTab(ttk.Frame):
         self.run_btn = ttk.Button(btns, text="Run", style="Accent.TButton",
                                   command=self.on_run)
         self.run_btn.pack(side="left")
-        self.export_btn = ttk.Button(btns, text="Export CSV",
-                                     command=self.on_export)
-        self.export_btn.pack(side="left", padx=8)
+        self.shuffle_btn = ttk.Button(btns, text="Shuffle list",
+                                      command=self.on_shuffle)
+        self.shuffle_btn.pack(side="left", padx=8)
         self.status_lbl = ttk.Label(btns, text="Idle", style="Muted.TLabel")
         self.status_lbl.pack(side="left", padx=12)
 
@@ -1323,9 +1323,17 @@ class ProxyTab(ttk.Frame):
                             command=self.on_run, state="normal")
         self.status_lbl.config(text="Stopped" if stopped else "Done")
 
-    def on_export(self):
-        export_tree_csv(self.tree, self.COLUMNS,
-                        [self.HEADINGS[c] for c in self.COLUMNS])
+    def on_shuffle(self):
+        """Randomly reorder the pasted proxy lines in place."""
+        lines = [ln for ln in self.proxy_text.get("1.0", "end").splitlines()
+                 if ln.strip()]
+        if len(lines) < 2:
+            self.status_lbl.config(text="Nothing to shuffle")
+            return
+        random.shuffle(lines)
+        self.proxy_text.delete("1.0", "end")
+        self.proxy_text.insert("1.0", "\n".join(lines))
+        self.status_lbl.config(text=f"Shuffled {len(lines)} proxy(ies)")
 
 
 def center_over_parent(top, parent, w=None, h=None):
