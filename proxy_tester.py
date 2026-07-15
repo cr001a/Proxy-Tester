@@ -53,7 +53,7 @@ DEFAULT_TIMEOUT = 15  # seconds, per request
 MAX_WORKERS = 6       # thread pool size for parallel targets
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.9"                     # single source of truth (CI tags v<this>)
+APP_VERSION = "3.10"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1386,7 +1386,7 @@ def ask_generate_options(parent, asn_count):
 
     # Sticky-minutes row: shown only when Static is selected.
     row2 = ttk.Frame(top)
-    ttk.Label(row2, text="Sticky minutes (max 1440, blank = none)").pack(
+    ttk.Label(row2, text="Sticky minutes (max 1440, blank = 60)").pack(
         side="left")
     ttk.Entry(row2, textvariable=sesstime, width=6).pack(side="left", padx=8)
 
@@ -1415,8 +1415,10 @@ def ask_generate_options(parent, asn_count):
                 messagebox.showerror("Generate proxies",
                                      "Sticky minutes must be a number.")
                 return
+        elif mode.get() == "static":
+            st = 60          # blank on Static defaults to a 60-minute session
         else:
-            st = None
+            st = None        # rotating ignores sesstime anyway
         result["mode"] = mode.get()
         result["count"] = n
         result["sesstime"] = st
