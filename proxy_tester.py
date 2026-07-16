@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.35"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.36"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1406,9 +1406,10 @@ def test_proxy(proxy, url, runs, timeout, stop_event=None):
 # GUI
 # --------------------------------------------------------------------------- #
 class AsnTab(ttk.Frame):
-    COLUMNS = ("asn", "status", "median", "min", "max", "success", "org")
+    COLUMNS = ("asn", "type", "status", "median", "min", "max", "success",
+               "org")
     HEADINGS = {
-        "asn": "ASN", "status": "Status", "median": "Median ms",
+        "asn": "ASN", "type": "Type", "status": "Status", "median": "Median ms",
         "min": "Min ms", "max": "Max ms", "success": "Success (n/N)",
         "org": "Landed on (org)",
     }
@@ -1554,8 +1555,9 @@ class AsnTab(ttk.Frame):
         # Status/org stretch, are left-aligned, and have a minwidth so the
         # exact response and carrier org stay readable (can't be squeezed).
         layout = {
-            "asn":     (90,  70,  False, "center"),
-            "status":  (200, 150, True,  "w"),
+            "asn":     (80,  60,  False, "center"),
+            "type":    (110, 80,  False, "center"),
+            "status":  (200, 150, True,  "center"),
             "median":  (90,  70,  False, "center"),
             "min":     (90,  70,  False, "center"),
             "max":     (90,  70,  False, "center"),
@@ -1578,6 +1580,8 @@ class AsnTab(ttk.Frame):
     def _refilter_asns(self):
         """Rebuild the ASN list from the active category/strict/search filters."""
         cats = {c for c, v in self.filter_vars.items() if v.get()}
+        if not cats:                       # nothing checked -> show everything
+            cats = set(CATEGORIES)
         strict_only = self.strict_var.get()
         # Search accepts several terms separated by commas or spaces; a row
         # matches if ANY term is found in its ASN number or provider name.
@@ -1796,9 +1800,13 @@ class AsnTab(ttk.Frame):
 
         self.tree.delete(*self.tree.get_children())
         self.row_ids.clear()
+        # Map each ASN to its network type for the Type column.
+        self._cat_map = {a: cat for a, name, cat, strict in all_asns()}
         for asn in asns:
+            cat = self._cat_map.get(asn, "-")
             iid = self.tree.insert(
-                "", "end", values=(asn, "testing...", "-", "-", "-", "-", ""),
+                "", "end",
+                values=(asn, cat, "testing...", "-", "-", "-", "-", ""),
                 tags=("muted",))
             self.row_ids[asn] = iid
 
@@ -1858,7 +1866,8 @@ class AsnTab(ttk.Frame):
 
     def _update_row(self, r):
         iid = self.row_ids.get(r["asn"])
-        values = (r["asn"], r["status"], _fmt_ms(r["median"]),
+        cat = getattr(self, "_cat_map", {}).get(r["asn"], "-")
+        values = (r["asn"], cat, r["status"], _fmt_ms(r["median"]),
                   _fmt_ms(r["min"]), _fmt_ms(r["max"]),
                   f"{r['success']}/{r['runs']}", r["org"])
         tag = status_tag(r["status"])
@@ -1875,8 +1884,9 @@ class AsnTab(ttk.Frame):
         # Any row still 'testing...' never got a result (interrupted).
         for iid in self.tree.get_children():
             vals = self.tree.item(iid, "values")
-            if vals[1] == "testing...":
-                self.tree.item(iid, values=(vals[0], "stopped") + vals[2:],
+            if vals[2] == "testing...":
+                self.tree.item(iid,
+                               values=vals[:2] + ("stopped",) + vals[3:],
                                tags=("muted",))
         self._sort_rows()
         self.status_lbl.config(text="Stopped" if stopped else "Done")
@@ -1887,10 +1897,10 @@ class AsnTab(ttk.Frame):
         for iid in self.tree.get_children():
             vals = self.tree.item(iid, "values")
             try:
-                median = float(vals[2])
+                median = float(vals[3])
             except (ValueError, TypeError):
                 median = float("inf")
-            ok_rank = 0 if vals[1] == "OK" else 1
+            ok_rank = 0 if vals[2] == "OK" else 1
             rows.append((ok_rank, median, iid))
         rows.sort(key=lambda t: (t[0], t[1]))
         for index, (_, _, iid) in enumerate(rows):
