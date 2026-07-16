@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.41"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.42"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -725,6 +725,20 @@ def discover_exit_ip(proxy, timeout=DEFAULT_TIMEOUT, stop_event=None):
     if not ip:
         return {**out, "status": "no exit ip"}
     return {**out, "exit_ip": ip, "ping": r["ms"], "status": "OK"}
+
+
+def proxy_target_latency(proxy, url, timeout=DEFAULT_TIMEOUT, stop_event=None):
+    """Latency (ms) of a request THROUGH the proxy to the real target (e.g.
+    Walmart) - the number that actually predicts queue speed, and which differs
+    from a generic ping. A 4xx/403 antibot challenge still counts as 'reached'
+    (the proxy connected). Returns ms, or None if it couldn't reach the target."""
+    if stop_event is not None and stop_event.is_set():
+        return None
+    r = do_request(build_proxy_url(proxy["host"], proxy["port"],
+                                   proxy["user"], proxy["pw"]), url, timeout)
+    if r.get("ok") or r.get("error") == "http":
+        return r.get("ms")
+    return None
 
 
 def score_ip(ip, provider, api_key, timeout=DEFAULT_TIMEOUT):
@@ -2704,6 +2718,31 @@ class QualityTab(ttk.Frame):
                  "+ latency only. Unique exit IPs are scored once (deduped).",
             style="Muted.TLabel").grid(row=2, column=1, columnspan=2, sticky="w")
 
+        # Speed gate (two-stage funnel): a FREE latency test through each proxy
+        # to the real target runs first; only proxies that reach it under the
+        # threshold get sent to the paid reputation API - saving your quota and
+        # ranking by the latency that actually matters (proxy -> Walmart).
+        self.gate_on = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            form, text="Speed gate first (only score proxies that reach the "
+                       "target fast)", variable=self.gate_on).grid(
+            row=3, column=1, columnspan=2, sticky="w", pady=(10, 0))
+        gate_row = ttk.Frame(form)
+        gate_row.grid(row=4, column=1, columnspan=2, sticky="w")
+        self.gate_target = tk.StringVar(value="Walmart")
+        ttk.Combobox(gate_row, textvariable=self.gate_target, state="readonly",
+                     width=15,
+                     values=[n for n, _ in RETAIL_SITES] + ["Custom URL"]).pack(
+            side="left")
+        self.gate_custom = tk.StringVar()
+        ttk.Entry(gate_row, textvariable=self.gate_custom, width=22).pack(
+            side="left", padx=6)
+        ttk.Label(gate_row, text="under").pack(side="left")
+        self.gate_ms = tk.StringVar(value="2500")
+        ttk.Entry(gate_row, textvariable=self.gate_ms, width=6).pack(
+            side="left", padx=4)
+        ttk.Label(gate_row, text="ms").pack(side="left")
+
         btns = ttk.Frame(self)
         btns.pack(fill="x", pady=(12, 4))
         self.run_btn = ttk.Button(btns, text="Score", style="Accent.TButton",
@@ -2809,6 +2848,25 @@ class QualityTab(ttk.Frame):
             messagebox.showerror("ProxyTester", "Enter at least one valid proxy.")
             return
 
+        gate_url, gate_ms = None, None
+        if self.gate_on.get():
+            choice = self.gate_target.get()
+            presets = dict(RETAIL_SITES)
+            if choice in presets:
+                gate_url = "https://" + presets[choice] + "/"
+            else:
+                gate_url = self.gate_custom.get().strip()
+                if not gate_url:
+                    messagebox.showerror(
+                        "ProxyTester",
+                        "Pick a target site or enter a Custom URL for the "
+                        "speed gate.")
+                    return
+            try:
+                gate_ms = max(1, int(self.gate_ms.get().strip()))
+            except (TypeError, ValueError):
+                gate_ms = 2500
+
         self.tree.delete(*self.tree.get_children())
         self._rows = []
         self.running = True
@@ -2816,10 +2874,13 @@ class QualityTab(ttk.Frame):
         self.run_btn.config(text="Stop", style="Stop.TButton",
                             command=self.on_stop)
         engine = provider if api_key else "no key (Spamhaus + latency)"
+        first = ("Speed gate: pinging target" if gate_url
+                 else "Resolving exit IPs")
         self.status_lbl.config(
-            text=f"Resolving exit IPs for {len(proxies)} proxy(ies) [{engine}]...")
-        worker = threading.Thread(target=self._run_pool,
-                                  args=(proxies, provider, api_key), daemon=True)
+            text=f"{first} for {len(proxies)} proxy(ies) [{engine}]...")
+        worker = threading.Thread(
+            target=self._run_pool,
+            args=(proxies, provider, api_key, gate_url, gate_ms), daemon=True)
         worker.start()
         self.after(100, self._drain_queue)
 
@@ -2830,31 +2891,86 @@ class QualityTab(ttk.Frame):
         self.run_btn.config(state="disabled")
         self.status_lbl.config(text="Stopping...")
 
-    def _run_pool(self, proxies, provider, api_key):
-        """Phase 1: resolve each proxy's exit IP (concurrent). Phase 2: score
-        each UNIQUE exit IP once (dedupe -> fewer paid lookups). Then map the
-        score back onto every proxy that shares that exit IP."""
+    def _gate_reject_row(self, p, ms, gate_ms):
+        """A row for a proxy that failed the speed gate (never sent to the paid
+        API). Shows the measured target latency (or 'unreachable')."""
+        u, pw = p["user"], p["pw"]
+        display = (f"{p['host']}:{p['port']}:{u}:****" if u and pw is not None
+                   else f"{p['host']}:{p['port']}")
+        full = (f"{p['host']}:{p['port']}:{u}:{pw}" if u and pw is not None
+                else (f"{p['host']}:{p['port']}:{u}" if u
+                      else f"{p['host']}:{p['port']}"))
+        status = ("unreachable" if ms is None
+                  else f"slow {ms:.0f}ms > {gate_ms}ms")
+        return {"proxy": display, "full": full, "exit_ip": "", "fraud": "",
+                "type": "", "flags": "", "blacklist": "-", "ping": ms,
+                "trust": None, "status": status}
+
+    def _run_pool(self, proxies, provider, api_key, gate_url=None, gate_ms=None):
+        """Two-stage funnel. Stage 0 (optional, FREE): time each proxy TO THE
+        TARGET and drop the slow ones - so the paid API never touches them.
+        Stage 1: resolve each survivor's exit IP. Stage 2: score each UNIQUE
+        exit IP once (dedupe). Map scores back onto every proxy."""
         workers = get_workers()
-        resolved = unique_n = 0
+        resolved = unique_n = gated_out = 0
         provider_err, err_ct = "", 0
         try:
+            # --- Stage 0: speed gate (free; culls before any paid lookup) ---
+            target_ms = {}                      # proxy index -> latency or None
+            survivors = list(enumerate(proxies))
+            if gate_url:
+                lat = {}
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futs = {pool.submit(proxy_target_latency, p, gate_url,
+                                        DEFAULT_TIMEOUT, self.stop_event): i
+                            for i, p in enumerate(proxies)}
+                    done = 0
+                    for fut in futs:
+                        i = futs[fut]
+                        try:
+                            lat[i] = fut.result()
+                        except Exception:
+                            lat[i] = None
+                        done += 1
+                        if done % 25 == 0:
+                            self.queue.put({"_status": f"Speed gate "
+                                            f"{done}/{len(proxies)}..."})
+                survivors = []
+                for i, p in enumerate(proxies):
+                    ms = lat.get(i)
+                    target_ms[i] = ms
+                    if ms is not None and ms <= gate_ms:
+                        survivors.append((i, p))
+                    else:
+                        gated_out += 1
+                        self.queue.put(self._gate_reject_row(p, ms, gate_ms))
+                self.queue.put({"_status": f"{len(survivors)} passed the speed "
+                                f"gate, {gated_out} filtered. Resolving exit "
+                                "IPs..."})
+
+            # --- Stage 1: resolve exit IPs (survivors only) ---
             discoveries = []
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 futs = {pool.submit(discover_exit_ip, p, DEFAULT_TIMEOUT,
-                                    self.stop_event): p for p in proxies}
+                                    self.stop_event): (i, p)
+                        for (i, p) in survivors}
                 done = 0
                 for fut in futs:
+                    i, p = futs[fut]
                     try:
                         d = fut.result()
                     except Exception as e:
-                        p = futs[fut]
                         d = {"proxy": f"{p['host']}:{p['port']}", "exit_ip": "",
-                             "ping": None, "status": str(e)[:60]}
+                             "ping": None, "status": str(e)[:60],
+                             "full": f"{p['host']}:{p['port']}"}
+                    # When gating, show the target latency (the meaningful one).
+                    if gate_url and target_ms.get(i) is not None:
+                        d["ping"] = target_ms[i]
                     discoveries.append(d)
                     done += 1
                     if done % 25 == 0:
                         self.queue.put({"_status":
-                                        f"Resolved {done}/{len(proxies)} "
+                                        f"Resolved {done}/{len(survivors)} "
                                         "exit IPs..."})
 
             unique = sorted({d["exit_ip"] for d in discoveries if d["exit_ip"]})
@@ -2886,7 +3002,7 @@ class QualityTab(ttk.Frame):
         finally:
             self.queue.put({"_done": True, "resolved": resolved,
                             "unique": unique_n, "provider_err": provider_err,
-                            "err_ct": err_ct})
+                            "err_ct": err_ct, "gated_out": gated_out})
 
     def _drain_queue(self):
         try:
@@ -2927,6 +3043,9 @@ class QualityTab(ttk.Frame):
             deduped = info["resolved"] - info.get("unique", info["resolved"])
             dedup = (f", {info.get('unique', 0)} unique exit IPs "
                      f"({deduped} deduped)")
+        gate_note = ""
+        if info.get("gated_out"):
+            gate_note = f", {info['gated_out']} slow-filtered (no paid lookup)"
         # Loud provider-error banner: if the reputation API rejected every
         # lookup (bad/expired key, rate limit), say so instead of leaving a
         # silent wall of Trust 50.
@@ -2941,7 +3060,8 @@ class QualityTab(ttk.Frame):
                         f"IP(s){hint}")
         # Persistent summary so filtering never wipes the scored/dedupe counts.
         self._summary = ("Stopped" if stopped
-                         else f"Done - {scored} scored{dedup}{err_note}")
+                         else f"Done - {scored} scored{dedup}{gate_note}"
+                              f"{err_note}")
         self._trust_buckets = set()       # a fresh run clears prior filters
         self._type_filter = set()
         self._render_rows()

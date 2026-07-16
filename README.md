@@ -26,9 +26,14 @@ Four tabs:
    connection type (residential · mobile · datacenter · residential-proxy) and
    abuse/bot/VPN/Tor flags, plus a free **Spamhaus** blocklist check (no key)
    and latency. Unique
-   exit IPs are **deduped** so you only spend one lookup per IP. Results sort
-   best-first; click any header to re-sort, filter by **min trust**, and
-   **copy selected** proxies straight to the clipboard (full
+   exit IPs are **deduped** so you only spend one lookup per IP. An optional
+   **Speed gate** runs a **two-stage funnel**: first a *free* latency test
+   through each proxy to the real target (Walmart/Target/custom URL), then the
+   *paid* reputation lookup runs **only on proxies that reach the target under
+   your threshold** — so a slow proxy never costs an API call, and the Ping
+   column reflects proxy→target latency (which differs from a generic ping).
+   Results sort best-first; click any header to re-sort, filter by **min
+   trust**, and **copy selected** proxies straight to the clipboard (full
    `host:port:user:pass`). API keys and worker concurrency live on the
    **Settings** tab.
 4. **Converter** — paste any provider proxy format (full URLs, Python snippets,
