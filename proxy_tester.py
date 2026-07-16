@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.18"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.19"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1035,6 +1035,7 @@ def test_proxy(proxy, url, runs, timeout, stop_event=None):
     successes = 0
     last_code = None
     exit_ip = ""
+    org = city = region = country = ""
     labels = []
 
     for _ in range(runs):
@@ -1047,11 +1048,19 @@ def test_proxy(proxy, url, runs, timeout, stop_event=None):
         if r["ok"]:
             successes += 1
             latencies.append(r["ms"])
+            # When the test URL returns ipinfo-style JSON (the default), pull
+            # the exit IP plus provider/ASN (org) and location for display.
             found_ip = _parse_json_field(r["body"], "ip")
             if found_ip:
                 exit_ip = found_ip
+            org = _parse_json_field(r["body"], "org") or org
+            city = _parse_json_field(r["body"], "city") or city
+            region = _parse_json_field(r["body"], "region") or region
+            country = _parse_json_field(r["body"], "country") or country
         else:
             labels.append(response_label(r))
+
+    location = ", ".join(p for p in (city, region, country) if p)
 
     interrupted = stop_event is not None and stop_event.is_set()
     if successes > 0:
@@ -1071,6 +1080,8 @@ def test_proxy(proxy, url, runs, timeout, stop_event=None):
         "success": successes,
         "runs": runs,
         "exit_ip": exit_ip,
+        "org": org,
+        "location": location,
         "reason": "",
     }
 
@@ -1482,10 +1493,12 @@ class AsnTab(ttk.Frame):
 
 
 class ProxyTab(ttk.Frame):
-    COLUMNS = ("proxy", "status", "code", "median", "success", "exit_ip")
+    COLUMNS = ("proxy", "status", "code", "median", "success", "exit_ip",
+               "org", "location")
     HEADINGS = {
         "proxy": "Proxy", "status": "Status", "code": "HTTP code",
         "median": "Median ms", "success": "Success (n/N)", "exit_ip": "Exit IP",
+        "org": "Provider / ASN", "location": "Location",
     }
 
     def __init__(self, master):
@@ -1532,12 +1545,14 @@ class ProxyTab(ttk.Frame):
         # and has a minwidth so the exact response (e.g. "502 exit node not
         # found") stays readable and can never be squeezed down to "5xx".
         layout = {
-            "proxy":   (280, 150, True,  "w"),
-            "status":  (200, 150, True,  "w"),
-            "code":    (80,  60,  False, "center"),
-            "median":  (90,  70,  False, "center"),
-            "success": (110, 90,  False, "center"),
-            "exit_ip": (140, 110, False, "center"),
+            "proxy":    (240, 140, True,  "w"),
+            "status":   (150, 110, False, "w"),
+            "code":     (75,  55,  False, "center"),
+            "median":   (85,  65,  False, "center"),
+            "success":  (95,  80,  False, "center"),
+            "exit_ip":  (130, 100, False, "w"),
+            "org":      (210, 130, True,  "w"),
+            "location": (160, 110, True,  "w"),
         }
         for col in self.COLUMNS:
             w, mw, st, anc = layout[col]
@@ -1650,6 +1665,7 @@ class ProxyTab(ttk.Frame):
         self.tree.insert("", "end", values=(
             r["proxy"], r["status"], r["code"], _fmt_ms(r["median"]),
             f"{r['success']}/{r['runs']}", r["exit_ip"],
+            r.get("org", ""), r.get("location", ""),
         ), tags=(status_tag(r["status"]),))
 
     def _finish(self):
