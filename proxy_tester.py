@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.15"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.16"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1923,6 +1923,9 @@ class QualityTab(ttk.Frame):
         self._rows = []
         self._item_full = {}      # tree item id -> full host:port:user:pass
         self._sort_dir = {}       # column -> current sort direction
+        self._summary = ""        # persistent run summary (survives filtering)
+        self._min_trust = None    # active min-trust filter
+        self._type_filter = set() # active Type filter (empty = all)
         self._build()
 
     def _build(self):
@@ -1983,12 +1986,20 @@ class QualityTab(ttk.Frame):
         }
         for col in self.COLUMNS:
             w, mw, st, anc = layout[col]
-            self.tree.heading(col, text=self.HEADINGS[col],
-                              command=lambda c=col: self._sort_by(c))
+            # Clicking the Type header opens a multi-select filter; other
+            # headers sort. (▾ hints the Type column is a filter dropdown.)
+            if col == "type":
+                self.tree.heading(col, text=self.HEADINGS[col] + " ▾",
+                                  command=self._open_type_filter)
+            else:
+                self.tree.heading(col, text=self.HEADINGS[col],
+                                  command=lambda c=col: self._sort_by(c))
             self.tree.column(col, width=w, minwidth=mw, stretch=st, anchor=anc)
         tag_tree(self.tree)
         enable_drag_select(self.tree)
         self.tree.bind("<<TreeviewSelect>>", self._update_sel_count)
+        self.tree.bind("<Control-c>", lambda e: (self.on_copy_selected(), "break"))
+        self.tree.bind("<Control-C>", lambda e: (self.on_copy_selected(), "break"))
         self.tree.pack(fill="both", expand=True, pady=(8, 0))
         vsb = ttk.Scrollbar(self.tree, orient="vertical",
                             command=self.tree.yview)
@@ -2129,18 +2140,18 @@ class QualityTab(ttk.Frame):
                     int(f) if f not in ("", None) else 999)
 
         self._rows.sort(key=sort_key)
-        self._item_full = {}
-        for r in self._rows:
-            self._insert_row(r)
         scored = sum(1 for r in self._rows if r.get("status") == "OK")
-        self._update_sel_count()
         dedup = ""
         if "resolved" in info:
             deduped = info["resolved"] - info.get("unique", info["resolved"])
             dedup = (f", {info.get('unique', 0)} unique exit IPs "
                      f"({deduped} deduped)")
-        self.status_lbl.config(
-            text="Stopped" if stopped else f"Done - {scored} scored{dedup}")
+        # Persistent summary so filtering never wipes the scored/dedupe counts.
+        self._summary = "Stopped" if stopped else f"Done - {scored} scored{dedup}"
+        self._min_trust = None            # a fresh run clears prior filters
+        self._type_filter = set()
+        self.min_trust.set("")
+        self._render_rows()
 
     def _trust_tag(self, r):
         if r.get("status") != "OK" or r.get("trust") is None:
@@ -2163,23 +2174,86 @@ class QualityTab(ttk.Frame):
         self.sel_lbl.config(text=f"{n} selected" if n else "")
 
     def _apply_filter(self):
-        """Show only rows with Trust >= the entered threshold (blank = all)."""
+        """Apply the Min-trust threshold (blank = no trust filter)."""
         raw = self.min_trust.get().strip()
         try:
-            threshold = int(raw) if raw else None
+            self._min_trust = int(raw) if raw else None
         except ValueError:
-            threshold = None
+            self._min_trust = None
+        self._render_rows()
+
+    def _render_rows(self):
+        """Re-render the table applying the active Trust + Type filters, while
+        keeping the run summary (scored / unique / deduped) in the status."""
         rows = self._rows
-        if threshold is not None:
+        if self._min_trust is not None:
             rows = [r for r in rows if isinstance(r.get("trust"), int)
-                    and r["trust"] >= threshold]
+                    and r["trust"] >= self._min_trust]
+        if self._type_filter:
+            rows = [r for r in rows if r.get("type") in self._type_filter]
         self.tree.delete(*self.tree.get_children())
         self._item_full = {}
         for r in rows:
             self._insert_row(r)
         self._update_sel_count()
-        extra = f" (min trust {threshold})" if threshold is not None else ""
-        self.status_lbl.config(text=f"Showing {len(rows)} row(s){extra}")
+        filt = []
+        if self._min_trust is not None:
+            filt.append(f"trust>={self._min_trust}")
+        if self._type_filter:
+            filt.append("type=" + "/".join(sorted(self._type_filter)))
+        status = self._summary or f"Showing {len(rows)}"
+        if filt:
+            status += f"  |  showing {len(rows)} [{', '.join(filt)}]"
+        self.status_lbl.config(text=status)
+
+    def _open_type_filter(self):
+        """Dropdown from the Type header: multi-select which connection types to
+        show. Options are pulled from the actual results."""
+        types = sorted({r.get("type", "") for r in self._rows
+                        if r.get("status") == "OK" and r.get("type")})
+        if not types:
+            self.status_lbl.config(text="No results to filter yet - Score first.")
+            return
+        top = tk.Toplevel(self)
+        top.title("Filter by Type")
+        top.configure(bg=BASE)
+        top.transient(self.winfo_toplevel())
+        top.resizable(False, False)
+        cur = self._type_filter
+        cbvars = {}
+        ttk.Label(top, text="Show types:", style="Muted.TLabel").grid(
+            row=0, column=0, sticky="w", padx=14, pady=(12, 4))
+        for i, t in enumerate(types):
+            v = tk.BooleanVar(value=(t in cur) if cur else True)
+            cbvars[t] = v
+            ttk.Checkbutton(top, text=t, variable=v).grid(
+                row=i + 1, column=0, sticky="w", padx=18, pady=1)
+        btns = ttk.Frame(top)
+        btns.grid(row=len(types) + 1, column=0, sticky="ew", padx=12,
+                  pady=(10, 12))
+
+        def apply_():
+            sel = {t for t, v in cbvars.items() if v.get()}
+            # all (or none) selected => no filter, show everything
+            self._type_filter = (set() if not sel or len(sel) == len(types)
+                                 else sel)
+            self._render_rows()
+            top.destroy()
+
+        ttk.Button(btns, text="Apply", style="Accent.TButton",
+                   command=apply_).pack(side="left")
+        ttk.Button(btns, text="All",
+                   command=lambda: [v.set(True) for v in cbvars.values()]).pack(
+            side="left", padx=6)
+        ttk.Button(btns, text="None",
+                   command=lambda: [v.set(False) for v in cbvars.values()]).pack(
+            side="left")
+        try:
+            top.geometry(f"+{self.tree.winfo_rootx() + 300}"
+                         f"+{self.tree.winfo_rooty()}")
+        except Exception:
+            pass
+        top.grab_set()
 
     def _sort_by(self, col):
         """Sort the visible rows by a column (numeric when possible),
