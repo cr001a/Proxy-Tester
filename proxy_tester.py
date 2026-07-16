@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.17"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.18"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1837,7 +1837,10 @@ def _reveal_in_folder(path):
             pass
 
 
-def export_tree_csv(tree, columns, headings):
+def export_tree_csv(tree, columns, headings, full_map=None, full_col=0):
+    """Write the tree to CSV. If full_map (item id -> full 'host:port:user:pass')
+    is given, its value replaces the masked proxy cell at full_col so exports
+    carry the real, usable credentials instead of '****'."""
     rows = tree.get_children()
     if not rows:
         messagebox.showinfo("Export CSV", "No results to export yet.")
@@ -1855,7 +1858,10 @@ def export_tree_csv(tree, columns, headings):
             writer = csv.writer(f)
             writer.writerow(headings)
             for iid in rows:
-                writer.writerow(tree.item(iid, "values"))
+                vals = list(tree.item(iid, "values"))
+                if full_map and full_map.get(iid) and 0 <= full_col < len(vals):
+                    vals[full_col] = full_map[iid]     # unmasked proxy
+                writer.writerow(vals)
     except OSError as e:
         messagebox.showerror("Export CSV", f"Could not write file:\n{e}")
         return
@@ -2327,7 +2333,8 @@ class QualityTab(ttk.Frame):
 
     def on_export(self):
         export_tree_csv(self.tree, self.COLUMNS,
-                        [self.HEADINGS[c] for c in self.COLUMNS])
+                        [self.HEADINGS[c] for c in self.COLUMNS],
+                        full_map=self._item_full, full_col=0)
 
 
 class SettingsTab(ttk.Frame):
