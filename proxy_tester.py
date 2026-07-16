@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.24"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.25"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -2776,14 +2776,11 @@ class SettingsTab(ttk.Frame):
         self.status_lbl.config(text="Saved.")
 
 
-class ProfileBar(ttk.Frame):
-    """Top bar: pick / save / delete named credential profiles."""
+class HeaderBar(ttk.Frame):
+    """Top bar: branding + the settings gear (Check for updates)."""
 
-    def __init__(self, master, store, tabs):
+    def __init__(self, master):
         super().__init__(master, padding=(14, 12, 14, 4))
-        self.store = store
-        self.tabs = tabs  # dict: key -> tab with get_state/set_state
-
         if LOGO_HEADER_B64:
             try:
                 self._logo_img = tk.PhotoImage(data=LOGO_HEADER_B64)
@@ -2800,8 +2797,6 @@ class ProfileBar(ttk.Frame):
                   style="Muted.TLabel").pack(side="left", padx=(10, 0),
                                              anchor="s", pady=(0, 4))
 
-        # Settings: a filled button (matching Save/Delete height) that drops a
-        # small menu. Coloured so it's obviously a button, cog centred.
         self._settings_menu = tk.Menu(self, tearoff=0, bg=SURFACE, fg=TEXT,
                                       activebackground=MAUVE, activeforeground=BASE,
                                       bd=0, relief="flat")
@@ -2815,53 +2810,10 @@ class ProfileBar(ttk.Frame):
                                         command=self._open_settings)
         self._settings_btn.pack(side="right", padx=(8, 0))
 
-        ttk.Button(self, text="Delete", command=self.on_delete).pack(
-            side="right", padx=(8, 0))
-        ttk.Button(self, text="Save", style="Accent.TButton",
-                   command=self.on_save).pack(side="right", padx=8)
-        self.combo = ttk.Combobox(self, values=self.store.names(), width=26)
-        self.combo.pack(side="right")
-        self.combo.bind("<<ComboboxSelected>>", self.on_select)
-        ttk.Label(self, text="Profile:").pack(side="right", padx=(0, 8))
-
     def _open_settings(self):
         btn = self._settings_btn
         self._settings_menu.tk_popup(btn.winfo_rootx(),
                                      btn.winfo_rooty() + btn.winfo_height())
-
-    def _collect(self):
-        return {key: tab.get_state() for key, tab in self.tabs.items()}
-
-    def _apply(self, state):
-        for key, tab in self.tabs.items():
-            if isinstance(state, dict) and state.get(key):
-                tab.set_state(state[key])
-
-    def on_select(self, _event=None):
-        state = self.store.get(self.combo.get())
-        if state:
-            self._apply(state)
-
-    def on_save(self):
-        name = self.combo.get().strip()
-        if not name:
-            messagebox.showerror("Profiles", "Type a profile name first.")
-            return
-        self.store.save(name, self._collect())
-        self.combo.config(values=self.store.names())
-        messagebox.showinfo(
-            "Profiles",
-            f"Saved profile '{name}'.\n\nStored locally (including passwords) at:\n"
-            f"{self.store.path}")
-
-    def on_delete(self):
-        name = self.combo.get().strip()
-        if name not in self.store.data:
-            return
-        if messagebox.askyesno("Profiles", f"Delete profile '{name}'?"):
-            self.store.delete(name)
-            self.combo.set("")
-            self.combo.config(values=self.store.names())
 
 
 # --------------------------------------------------------------------------- #
@@ -3109,8 +3061,6 @@ def main():
         except Exception:
             pass
 
-    store = ProfileStore()
-
     notebook = ttk.Notebook(root)
     asn_tab = AsnTab(notebook)
     proxy_tab = ProxyTab(notebook)
@@ -3123,9 +3073,7 @@ def main():
     notebook.add(converter_tab, text="Converter")
     notebook.add(settings_tab, text="Settings")
 
-    # The top Profile bar covers the testing-credential tabs. The IP Quality
-    # tab is driven by the Settings tab (API keys), kept deliberately separate.
-    bar = ProfileBar(root, store, {"asn": asn_tab, "proxy": proxy_tab})
+    bar = HeaderBar(root)
     bar.pack(fill="x")
     notebook.pack(fill="both", expand=True, padx=12, pady=(4, 12))
 
