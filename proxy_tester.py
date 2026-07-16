@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.22"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.23"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -864,10 +864,46 @@ def configured_resi_providers():
             and load_setting(spec["pass_key"], "").strip()]
 
 
-def generate_resi_batch(provider, state, city, lifetime, count, rotating=False):
-    """Build `count` residential proxy lines. Each gets a unique session token
-    (samples a distinct sticky IP); rotating omits it (new IP per request).
-    Credentials load from settings. Returns (lines, error_or_None)."""
+def _canon(name):
+    return name.lower().replace(".", "").replace(" ", "_")
+
+
+_US_STATE_NAMES = [
+    "Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado",
+    "Connecticut", "Delaware", "District of Columbia", "Florida", "Georgia",
+    "Hawaii", "Idaho", "Illinois", "Indiana", "Iowa", "Kansas", "Kentucky",
+    "Louisiana", "Maine", "Maryland", "Massachusetts", "Michigan", "Minnesota",
+    "Mississippi", "Missouri", "Montana", "Nebraska", "Nevada", "New Hampshire",
+    "New Jersey", "New Mexico", "New York", "North Carolina", "North Dakota",
+    "Ohio", "Oklahoma", "Oregon", "Pennsylvania", "Rhode Island",
+    "South Carolina", "South Dakota", "Tennessee", "Texas", "Utah", "Vermont",
+    "Virginia", "Washington", "West Virginia", "Wisconsin", "Wyoming",
+]
+_US_CITY_NAMES = [
+    "Albuquerque", "Alpharetta", "Anaheim", "Arlington", "Ashburn", "Athens",
+    "Atlanta", "Aurora", "Austin", "Bakersfield", "Baltimore", "Boston",
+    "Buffalo", "Charlotte", "Chicago", "Cincinnati", "Cleveland",
+    "Colorado Springs", "Columbus", "Dallas", "Denver", "Detroit", "El Paso",
+    "Fort Worth", "Fresno", "Houston", "Indianapolis", "Jacksonville",
+    "Kansas City", "Las Vegas", "Long Beach", "Los Angeles", "Louisville",
+    "Memphis", "Mesa", "Miami", "Milwaukee", "Minneapolis", "Nashville",
+    "New Orleans", "New York", "Newark", "Oakland", "Oklahoma City", "Omaha",
+    "Orlando", "Philadelphia", "Phoenix", "Pittsburgh", "Portland", "Raleigh",
+    "Richmond", "Sacramento", "Salt Lake City", "San Antonio", "San Diego",
+    "San Francisco", "San Jose", "Seattle", "St Louis", "Tampa", "Tucson",
+    "Tulsa", "Virginia Beach", "Washington",
+]
+US_STATES = [(_canon(n), n) for n in _US_STATE_NAMES]
+US_CITIES = [(_canon(n), n) for n in sorted(_US_CITY_NAMES)]
+REGION_OPTIONS = {"State": US_STATES, "City": US_CITIES}
+
+
+def generate_resi_batch(provider, region_type, regions, lifetime, count,
+                        rotating=False):
+    """Build `count` residential proxy lines, spread round-robin across the
+    selected `regions` (canonical state/city names). region_type is
+    'Country'/'State'/'City'. Each line gets a unique session token unless
+    rotating. Credentials load from settings. Returns (lines, error_or_None)."""
     spec = RESI_PROVIDERS.get(provider)
     if not spec:
         return [], f"Unknown provider: {provider}"
@@ -875,9 +911,14 @@ def generate_resi_batch(provider, state, city, lifetime, count, rotating=False):
     pw = load_setting(spec["pass_key"], "").strip()
     if not user or not pw:
         return [], f"Add {provider} username/password on the Settings tab first."
-    lines = [spec["build"](user, pw, state, city, lifetime,
-                           None if rotating else _resi_sessid())
-             for _ in range(count)]
+    targets = regions if (region_type in ("State", "City") and regions) else [""]
+    lines = []
+    for i in range(count):
+        tgt = targets[i % len(targets)]
+        state = tgt if region_type == "State" else ""
+        city = tgt if region_type == "City" else ""
+        lines.append(spec["build"](user, pw, state, city, lifetime,
+                                   None if rotating else _resi_sessid()))
     return lines, None
 
 
@@ -2062,51 +2103,103 @@ def open_generate_dialog(parent, text_widget):
     top.resizable(False, False)
 
     provider = tk.StringVar(value=configured[0])
-    state = tk.StringVar()
-    city = tk.StringVar()
+    region_type = tk.StringVar(value="Country")
     lifetime = tk.StringVar(value="30")
     count = tk.StringVar(value="500")
     rotating = tk.BooleanVar(value=False)
     append = tk.BooleanVar(value=False)
-    r = 0
+    region_vars = {}          # canonical -> BooleanVar (rebuilt per region type)
 
-    def row(label, widget):
-        nonlocal r
-        ttk.Label(top, text=label).grid(row=r, column=0, sticky="w",
-                                        padx=16, pady=4)
-        widget.grid(row=r, column=1, sticky="w", padx=(6, 16), pady=4)
-        r += 1
+    frm = ttk.Frame(top, padding=(16, 14))
+    frm.pack(fill="both", expand=True)
 
-    row("Provider", ttk.Combobox(top, textvariable=provider, values=configured,
+    row = 0
+
+    def add(label, widget):
+        nonlocal row
+        ttk.Label(frm, text=label).grid(row=row, column=0, sticky="w", pady=4)
+        widget.grid(row=row, column=1, sticky="w", padx=(8, 0), pady=4)
+        row += 1
+
+    add("Provider", ttk.Combobox(frm, textvariable=provider, values=configured,
                                  width=22, state="readonly"))
-    ttk.Label(top, text="Country", ).grid(row=r, column=0, sticky="w",
-                                          padx=16, pady=4)
-    ttk.Label(top, text="US (fixed)", style="Muted.TLabel").grid(
-        row=r, column=1, sticky="w", padx=(6, 16))
-    r += 1
-    row("State (optional)", ttk.Entry(top, textvariable=state, width=24))
-    row("City (optional)", ttk.Entry(top, textvariable=city, width=24))
-    row("Sticky lifetime (min)", ttk.Entry(top, textvariable=lifetime, width=8))
-    row("Count", ttk.Entry(top, textvariable=count, width=8))
-    ttk.Checkbutton(top, text="Rotating (new IP per request, no sticky session)",
-                    variable=rotating).grid(row=r, column=0, columnspan=2,
-                                            sticky="w", padx=16, pady=2)
-    r += 1
-    ttk.Checkbutton(top, text="Append to existing list (instead of replacing)",
-                    variable=append).grid(row=r, column=0, columnspan=2,
-                                          sticky="w", padx=16, pady=2)
-    r += 1
-    ttk.Label(top, text="State/city: lowercase, e.g. 'arkansas', "
-                        "'los_angeles'. Valid values vary by provider.",
-              style="Muted.TLabel").grid(row=r, column=0, columnspan=2,
-                                         sticky="w", padx=16, pady=(2, 8))
-    r += 1
+    add("Country", ttk.Label(frm, text="United States (fixed)",
+                             style="Muted.TLabel"))
+    add("Region type", ttk.Combobox(frm, textvariable=region_type, width=12,
+                                    state="readonly",
+                                    values=["Country", "State", "City"]))
+
+    # Scrollable checkbox list of regions - repopulated when region type changes.
+    list_lbl = ttk.Label(frm, text="Regions (check one or more)")
+    list_lbl.grid(row=row, column=0, columnspan=2, sticky="w", pady=(6, 2))
+    row += 1
+    holder = ttk.Frame(frm)
+    holder.grid(row=row, column=0, columnspan=2, sticky="w")
+    row += 1
+    canvas = tk.Canvas(holder, bg=SURFACE, highlightthickness=1,
+                       highlightbackground=SURFACE2, width=300, height=200)
+    vsb = ttk.Scrollbar(holder, orient="vertical", command=canvas.yview)
+    inner = ttk.Frame(canvas)
+    inner.bind("<Configure>",
+               lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+    canvas.create_window((0, 0), window=inner, anchor="nw")
+    canvas.configure(yscrollcommand=vsb.set)
+    canvas.pack(side="left", fill="both", expand=True)
+    vsb.pack(side="right", fill="y")
+    canvas.bind("<MouseWheel>",
+                lambda e: canvas.yview_scroll(int(-e.delta / 120), "units"))
+
+    def rebuild_regions(*_):
+        region_vars.clear()
+        for w in inner.winfo_children():
+            w.destroy()
+        opts = REGION_OPTIONS.get(region_type.get())
+        if not opts:
+            ttk.Label(inner, text="Country-wide (no region needed)",
+                      style="Muted.TLabel").pack(anchor="w", padx=6, pady=6)
+            list_lbl.grid_remove()
+            return
+        list_lbl.grid()
+        for canon, disp in opts:
+            v = tk.BooleanVar(value=False)
+            region_vars[canon] = v
+            ttk.Checkbutton(inner, text=disp, variable=v).pack(
+                anchor="w", padx=6)
+        canvas.yview_moveto(0)
+
+    region_type.trace_add("write", rebuild_regions)
+    rebuild_regions()
+
+    opt = ttk.Frame(frm)
+    opt.grid(row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
+    row += 1
+    ttk.Label(opt, text="Sticky lifetime (min)").pack(side="left")
+    ttk.Entry(opt, textvariable=lifetime, width=6).pack(side="left", padx=(6, 16))
+    ttk.Label(opt, text="Count (total)").pack(side="left")
+    ttk.Entry(opt, textvariable=count, width=8).pack(side="left", padx=(6, 0))
+
+    ttk.Checkbutton(frm, text="Rotating (new IP per request, no sticky session)",
+                    variable=rotating).grid(row=row, column=0, columnspan=2,
+                                            sticky="w", pady=(6, 0))
+    row += 1
+    ttk.Checkbutton(frm, text="Append to existing list (instead of replacing)",
+                    variable=append).grid(row=row, column=0, columnspan=2,
+                                          sticky="w")
+    row += 1
 
     def gen():
         try:
             n = max(1, int(count.get().strip()))
         except ValueError:
             messagebox.showerror("Generate batch", "Count must be a number.")
+            return
+        rtype = region_type.get()
+        regions = [c for c, v in region_vars.items() if v.get()]
+        if rtype in ("State", "City") and not regions:
+            messagebox.showerror(
+                "Generate batch",
+                f"Check at least one {rtype.lower()}, or set Region type to "
+                "Country.")
             return
         lt = None
         raw = lifetime.get().strip()
@@ -2115,9 +2208,8 @@ def open_generate_dialog(parent, text_widget):
                 lt = max(1, int(raw))
             except ValueError:
                 lt = None
-        lines, err = generate_resi_batch(
-            provider.get(), state.get().strip().lower(),
-            city.get().strip().lower(), lt, n, rotating.get())
+        lines, err = generate_resi_batch(provider.get(), rtype, regions, lt, n,
+                                         rotating.get())
         if err:
             messagebox.showerror("Generate batch", err)
             return
@@ -2129,8 +2221,8 @@ def open_generate_dialog(parent, text_widget):
         text_widget.insert("1.0", text)
         top.destroy()
 
-    btns = ttk.Frame(top)
-    btns.grid(row=r, column=0, columnspan=2, sticky="w", padx=14, pady=(6, 14))
+    btns = ttk.Frame(frm)
+    btns.grid(row=row, column=0, columnspan=2, sticky="w", pady=(12, 0))
     ttk.Button(btns, text="Generate", style="Accent.TButton",
                command=gen).pack(side="left")
     ttk.Button(btns, text="Cancel", command=top.destroy).pack(side="left",
