@@ -53,7 +53,7 @@ DEFAULT_TIMEOUT = 15  # seconds, per request
 MAX_WORKERS = 6       # thread pool size for parallel targets
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.10"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.11"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -897,10 +897,21 @@ class AsnTab(ttk.Frame):
 
         self.tree = ttk.Treeview(self, columns=self.COLUMNS,
                                  show="headings", height=12)
+        # Status/org stretch, are left-aligned, and have a minwidth so the
+        # exact response and carrier org stay readable (can't be squeezed).
+        layout = {
+            "asn":     (90,  70,  False, "center"),
+            "status":  (200, 150, True,  "w"),
+            "median":  (90,  70,  False, "center"),
+            "min":     (90,  70,  False, "center"),
+            "max":     (90,  70,  False, "center"),
+            "success": (110, 90,  False, "center"),
+            "org":     (220, 140, True,  "w"),
+        }
         for col in self.COLUMNS:
+            w, mw, st, anc = layout[col]
             self.tree.heading(col, text=self.HEADINGS[col])
-            self.tree.column(col, width=110, anchor="center")
-        self.tree.column("org", width=200, anchor="w")
+            self.tree.column(col, width=w, minwidth=mw, stretch=st, anchor=anc)
         tag_tree(self.tree)
         enable_drag_select(self.tree)
         self.tree.pack(fill="both", expand=True, pady=(8, 0))
@@ -1203,10 +1214,21 @@ class ProxyTab(ttk.Frame):
 
         self.tree = ttk.Treeview(self, columns=self.COLUMNS,
                                  show="headings", height=12)
+        # (width, minwidth, stretch, anchor). Status stretches, is left-aligned,
+        # and has a minwidth so the exact response (e.g. "502 exit node not
+        # found") stays readable and can never be squeezed down to "5xx".
+        layout = {
+            "proxy":   (280, 150, True,  "w"),
+            "status":  (200, 150, True,  "w"),
+            "code":    (80,  60,  False, "center"),
+            "median":  (90,  70,  False, "center"),
+            "success": (110, 90,  False, "center"),
+            "exit_ip": (140, 110, False, "center"),
+        }
         for col in self.COLUMNS:
+            w, mw, st, anc = layout[col]
             self.tree.heading(col, text=self.HEADINGS[col])
-            self.tree.column(col, width=120, anchor="center")
-        self.tree.column("proxy", width=260, anchor="w")
+            self.tree.column(col, width=w, minwidth=mw, stretch=st, anchor=anc)
         tag_tree(self.tree)
         enable_drag_select(self.tree)
         self.tree.pack(fill="both", expand=True, pady=(8, 0))
