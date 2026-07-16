@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.14"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.15"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -562,16 +562,25 @@ def spur_lookup(ip, token, timeout=DEFAULT_TIMEOUT):
     org = data.get("organization", "")
     if not org and isinstance(data.get("as"), dict):
         org = data["as"].get("organization", "")
+    behaviours = " ".join(str(b) for b in (client.get("behaviors") or [])).upper()
+    # The killer signal: which residential-proxy networks this IP belongs to,
+    # plus any VPN service - shown in the Flags column so you see WHY it's burnt.
+    services = data.get("services") if isinstance(data.get("services"),
+                                                  list) else []
+    extra = [str(p).replace("_PROXY", "").replace("_", " ").lower().strip()
+             for p in client_proxies]
+    extra += [str(s).lower() for s in services]
     return {
         "fraud_score": fraud,
         "connection_type": conn,        # Datacenter / Mobile / Residential
         "proxy": anon,
         "vpn": is_vpn,
-        "tor": "TOR" in risk_txt,
+        "tor": "TOR" in risk_txt or "TOR" in behaviours,
         "recent_abuse": anon,
         "bot_status": ("SCRAP" in risk_txt or "BOT" in risk_txt),
         "isp": org,
         "country": (data.get("location") or {}).get("country", ""),
+        "flag_extra": list(dict.fromkeys(extra)),   # deduped, order-preserved
     }
 
 
@@ -630,6 +639,8 @@ def build_quality_row(disc, q, has_key):
     flags = [name for name, on in (
         ("abuse", q.get("recent_abuse")), ("bot", q.get("bot_status")),
         ("vpn", q.get("vpn")), ("tor", q.get("tor"))) if on]
+    # Provider-supplied detail (e.g. Spur's named residential-proxy networks).
+    flags += [f for f in (q.get("flag_extra") or []) if f and f not in flags]
     bl = q.get("blacklisted")
     fs = q.get("fraud_score")
     return {
@@ -1965,7 +1976,7 @@ class QualityTab(ttk.Frame):
             "exit_ip":   (150, 100, True,  "w"),
             "fraud":     (70,  50,  False, "center"),
             "type":      (130, 90,  True,  "w"),
-            "flags":     (120, 80,  False, "w"),
+            "flags":     (150, 90,  True,  "w"),
             "blacklist": (90,  70,  False, "center"),
             "ping":      (80,  60,  False, "center"),
             "trust":     (80,  60,  False, "center"),
