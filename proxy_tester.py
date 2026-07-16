@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.28"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.29"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -2768,23 +2768,51 @@ class SettingsTab(ttk.Frame):
     settings.json in your config dir (never hard-coded)."""
 
     def __init__(self, master, on_catalog_change=None):
-        super().__init__(master, padding=20)
+        super().__init__(master)
         self._on_catalog_change = on_catalog_change
+        # The Settings content is taller than the window, so host it in a
+        # scrollable canvas - otherwise the Save button falls off the bottom.
+        self._canvas = tk.Canvas(self, highlightthickness=0, bg=BASE,
+                                 borderwidth=0)
+        vsb = ttk.Scrollbar(self, orient="vertical",
+                            command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self._canvas.pack(side="left", fill="both", expand=True)
+        self.inner = ttk.Frame(self._canvas, padding=20)
+        self._win = self._canvas.create_window((0, 0), window=self.inner,
+                                               anchor="nw")
+        self.inner.bind(
+            "<Configure>",
+            lambda e: self._canvas.configure(
+                scrollregion=self._canvas.bbox("all")))
+        self._canvas.bind(
+            "<Configure>",
+            lambda e: self._canvas.itemconfigure(self._win, width=e.width))
+        # Mousewheel only while the pointer is over this tab.
+        self._canvas.bind("<Enter>", lambda e: self._canvas.bind_all(
+            "<MouseWheel>", self._on_wheel))
+        self._canvas.bind("<Leave>", lambda e: self._canvas.unbind_all(
+            "<MouseWheel>"))
         self._build()
 
+    def _on_wheel(self, event):
+        self._canvas.yview_scroll(int(-event.delta / 120), "units")
+
     def _build(self):
+        host = self.inner
         r = 0
-        ttk.Label(self,
+        ttk.Label(host,
                   text="Reminder: changes on this tab only take effect after you "
                        "click 'Save settings' at the bottom.",
                   style="Warn.TLabel").grid(row=r, column=0, columnspan=2,
                                             sticky="w", pady=(0, 14))
         r += 1
-        ttk.Label(self, text="IP reputation API keys",
+        ttk.Label(host, text="IP reputation API keys",
                   style="Header.TLabel").grid(row=r, column=0, columnspan=2,
                                               sticky="w", pady=(0, 4))
         r += 1
-        ttk.Label(self,
+        ttk.Label(host,
                   text="Used by the IP Quality tab. Only the public exit IP is "
                        "ever sent to these - never your proxy credentials.",
                   style="Muted.TLabel").grid(row=r, column=0, columnspan=2,
@@ -2798,8 +2826,8 @@ class SettingsTab(ttk.Frame):
 
         def key_row(label, var):
             nonlocal r
-            ttk.Label(self, text=label).grid(row=r, column=0, sticky="w", pady=4)
-            e = ttk.Entry(self, textvariable=var, width=46, show="•")
+            ttk.Label(host, text=label).grid(row=r, column=0, sticky="w", pady=4)
+            e = ttk.Entry(host, textvariable=var, width=46, show="•")
             e.grid(row=r, column=1, sticky="w", pady=4, padx=(10, 0))
             reveal_on_focus(e)
             r += 1
@@ -2808,14 +2836,14 @@ class SettingsTab(ttk.Frame):
         key_row("Spur token (Context API)", self.spur)
         key_row("IPQualityScore key", self.ipqs)
 
-        ttk.Separator(self, orient="horizontal").grid(
+        ttk.Separator(host, orient="horizontal").grid(
             row=r, column=0, columnspan=2, sticky="ew", pady=14)
         r += 1
-        ttk.Label(self, text="Proxy provider credentials",
+        ttk.Label(host, text="Proxy provider credentials",
                   style="Header.TLabel").grid(row=r, column=0, columnspan=2,
                                               sticky="w", pady=(0, 4))
         r += 1
-        ttk.Label(self,
+        ttk.Label(host,
                   text="Used by 'Generate batch'. Providers you fill in here "
                        "appear in the generator's dropdown.",
                   style="Muted.TLabel").grid(row=r, column=0, columnspan=2,
@@ -2828,8 +2856,8 @@ class SettingsTab(ttk.Frame):
 
         def cred_row(label, var, secret=False):
             nonlocal r
-            ttk.Label(self, text=label).grid(row=r, column=0, sticky="w", pady=3)
-            e = ttk.Entry(self, textvariable=var, width=46,
+            ttk.Label(host, text=label).grid(row=r, column=0, sticky="w", pady=3)
+            e = ttk.Entry(host, textvariable=var, width=46,
                           show="•" if secret else "")
             e.grid(row=r, column=1, sticky="w", pady=3, padx=(10, 0))
             if secret:
@@ -2841,13 +2869,13 @@ class SettingsTab(ttk.Frame):
         cred_row("IPRoyal username", self.ipr_user)
         cred_row("IPRoyal password", self.ipr_pass, secret=True)
 
-        ttk.Separator(self, orient="horizontal").grid(
+        ttk.Separator(host, orient="horizontal").grid(
             row=r, column=0, columnspan=2, sticky="ew", pady=14)
         r += 1
-        ttk.Label(self, text="Custom ASNs", style="Header.TLabel").grid(
+        ttk.Label(host, text="Custom ASNs", style="Header.TLabel").grid(
             row=r, column=0, columnspan=2, sticky="w", pady=(0, 4))
         r += 1
-        ttk.Label(self,
+        ttk.Label(host,
                   text="Add an ASN and it's looked up automatically (provider "
                        "name + type) and added to the ASN Tester list. Added "
                        "instantly - no need to click Save.",
@@ -2855,7 +2883,7 @@ class SettingsTab(ttk.Frame):
                                              sticky="w", pady=(0, 8))
         r += 1
         self.asn_entry = tk.StringVar()
-        add_row = ttk.Frame(self)
+        add_row = ttk.Frame(host)
         add_row.grid(row=r, column=0, columnspan=2, sticky="w", pady=(0, 6))
         ttk.Label(add_row, text="ASN (number, e.g. 21928)").pack(side="left")
         e = ttk.Entry(add_row, textvariable=self.asn_entry, width=16)
@@ -2868,7 +2896,7 @@ class SettingsTab(ttk.Frame):
         self.asn_status = ttk.Label(add_row, text="", style="Muted.TLabel")
         self.asn_status.pack(side="left", padx=(10, 0))
         r += 1
-        list_wrap = ttk.Frame(self)
+        list_wrap = ttk.Frame(host)
         list_wrap.grid(row=r, column=0, columnspan=2, sticky="w", pady=(0, 4))
         self.custom_list = tk.Listbox(list_wrap, height=4, width=58,
                                       activestyle="none", exportselection=False)
@@ -2885,28 +2913,28 @@ class SettingsTab(ttk.Frame):
         r += 1
         self._reload_custom_list()
 
-        ttk.Separator(self, orient="horizontal").grid(
+        ttk.Separator(host, orient="horizontal").grid(
             row=r, column=0, columnspan=2, sticky="ew", pady=14)
         r += 1
-        ttk.Label(self, text="Performance", style="Header.TLabel").grid(
+        ttk.Label(host, text="Performance", style="Header.TLabel").grid(
             row=r, column=0, columnspan=2, sticky="w", pady=(0, 4))
         r += 1
-        ttk.Label(self, text="Concurrency (parallel workers, 1-100)").grid(
+        ttk.Label(host, text="Concurrency (parallel workers, 1-100)").grid(
             row=r, column=0, sticky="w", pady=4)
-        ttk.Entry(self, textvariable=self.workers, width=6).grid(
+        ttk.Entry(host, textvariable=self.workers, width=6).grid(
             row=r, column=1, sticky="w", pady=4, padx=(10, 0))
         r += 1
-        ttk.Label(self,
+        ttk.Label(host,
                   text="Higher = faster on big lists (network-bound). Too high "
                        "may trip a provider's rate limit. 20-40 is a good range.",
                   style="Muted.TLabel").grid(row=r, column=0, columnspan=2,
                                              sticky="w")
         r += 1
 
-        ttk.Button(self, text="Save settings", style="Accent.TButton",
+        ttk.Button(host, text="Save settings", style="Accent.TButton",
                    command=self.on_save).grid(row=r, column=0, sticky="w",
                                               pady=(16, 4))
-        self.status_lbl = ttk.Label(self, text="", style="Muted.TLabel")
+        self.status_lbl = ttk.Label(host, text="", style="Muted.TLabel")
         self.status_lbl.grid(row=r, column=1, sticky="w", pady=(16, 4))
 
     def on_save(self):
