@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.30"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.31"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1056,17 +1056,25 @@ def save_custom_asns(items):
 
 def all_asns():
     """The hardcoded catalog plus the user's custom ASNs. Custom entries are
-    marked strict=True so the 'Strict only' toggle never hides them.
-    Returns list of (asn, name, cat, strict)."""
-    out = list(ASN_CATALOG)
-    have = {a for a, *_ in out}
+    marked strict=True so the 'Strict only' toggle never hides them - and a
+    custom entry OVERRIDES a catalog entry with the same ASN, so explicitly
+    adding a catalog ASN (e.g. a dual-use ISP like AT&T 7018) pins it into
+    view even when 'Strict only' is on. Returns (asn, name, cat, strict)."""
+    custom = {}
     for c in load_custom_asns():
         asn = str(c.get("asn", "")).strip()
-        if asn and asn not in have:
+        if asn:
             cat = c.get("cat", "residential")
-            out.append((asn, c.get("name") or f"AS{asn}",
-                        cat if cat in CATEGORIES else "residential", True))
-            have.add(asn)
+            custom[asn] = (asn, c.get("name") or f"AS{asn}",
+                           cat if cat in CATEGORIES else "residential", True)
+    out, seen = [], set()
+    for a, name, cat, strict in ASN_CATALOG:
+        out.append(custom.get(a, (a, name, cat, strict)))
+        seen.add(a)
+    for a, tup in custom.items():
+        if a not in seen:
+            out.append(tup)
+            seen.add(a)
     return out
 
 
@@ -2975,23 +2983,30 @@ class SettingsTab(ttk.Frame):
             self.asn_status.config(text="Enter one or more ASN numbers.")
             return
 
-        existing = {str(c.get("asn")) for c in load_custom_asns()}
-        existing |= {a for a, *_ in ASN_CATALOG}
+        pinned = {str(c.get("asn")) for c in load_custom_asns()}
+        catalog = {a: (name, cat) for a, name, cat, _ in ASN_CATALOG}
         total = len(tokens)
         invalid = [t for t in tokens if not t.isdigit()]
-        dup = [t for t in tokens if t.isdigit() and t in existing]
-        todo = [t for t in tokens if t.isdigit() and t not in existing]
+        # Duplicate only means "already pinned in your custom list". An ASN
+        # that's in the catalog but not pinned gets pinned now (no lookup
+        # needed - we already know its name/type) so it shows even under
+        # 'Strict only'.
+        dup = [t for t in tokens if t.isdigit() and t in pinned]
+        preadd = [{"asn": t, "name": catalog[t][0], "cat": catalog[t][1]}
+                  for t in tokens
+                  if t.isdigit() and t not in pinned and t in catalog]
+        todo = [t for t in tokens
+                if t.isdigit() and t not in pinned and t not in catalog]
 
         if not todo:
-            self.asn_status.config(
-                text=self._add_summary(total, 0, len(dup), 0, len(invalid)))
+            self._finish_add(preadd, total, len(dup), len(invalid))
             return
 
         self.asn_add_btn.config(state="disabled")
         self.asn_status.config(text=f"Looking up {len(todo)} ASN(s)...")
 
         def work():
-            found = []
+            found = list(preadd)
             for asn in todo:
                 name, cat = asn_lookup(asn)
                 if name:
