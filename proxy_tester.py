@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.26"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.27"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -2346,6 +2346,8 @@ class QualityTab(ttk.Frame):
         self.tree.bind("<<TreeviewSelect>>", self._update_sel_count)
         self.tree.bind("<Control-c>", lambda e: (self.on_copy_selected(), "break"))
         self.tree.bind("<Control-C>", lambda e: (self.on_copy_selected(), "break"))
+        self.tree.bind("<Control-a>", lambda e: (self._select_all_rows(), "break"))
+        self.tree.bind("<Control-A>", lambda e: (self._select_all_rows(), "break"))
         self.tree.pack(fill="both", expand=True, pady=(8, 0))
         vsb = ttk.Scrollbar(self.tree, orient="vertical",
                             command=self.tree.yview)
@@ -2643,6 +2645,12 @@ class QualityTab(ttk.Frame):
         for idx, (_, i) in enumerate(items):
             self.tree.move(i, "", idx)
 
+    def _select_all_rows(self):
+        """Ctrl+A: select every currently-shown row in the results tree."""
+        rows = self.tree.get_children()
+        if rows:
+            self.tree.selection_set(rows)
+
     def on_copy_selected(self):
         """Copy the highlighted proxies (full host:port:user:pass) to clipboard."""
         lines = [self._item_full.get(i, "") for i in self.tree.selection()]
@@ -2677,8 +2685,8 @@ class SettingsTab(ttk.Frame):
     def _build(self):
         r = 0
         ttk.Label(self,
-                  text="⚠  Changes on this tab only take effect after you click "
-                       "“Save settings” at the bottom.",
+                  text="Reminder: changes on this tab only take effect after you "
+                       "click 'Save settings' at the bottom.",
                   style="Warn.TLabel").grid(row=r, column=0, columnspan=2,
                                             sticky="w", pady=(0, 14))
         r += 1
