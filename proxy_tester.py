@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.40"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.41"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -622,36 +622,36 @@ def proxycheck_lookup(ip, api_key, timeout=DEFAULT_TIMEOUT):
 
 
 def ipinfo_lookup(ip, token, timeout=DEFAULT_TIMEOUT):
-    """Query IPinfo (ipinfo.io) - a neutral IP-data vendor. On the Max plan it
-    returns residential-proxy detection (privacy.service + res-proxy signals);
-    Core adds VPN/Tor/proxy/relay; every plan gives ASN/company type + carrier
-    (mobile). We synthesize a 0-100 fraud score from those flags."""
+    """Query IPinfo's api.ipinfo.io/lookup endpoint (Bearer auth) - a neutral
+    IP-data vendor. The `anonymous` object carries is_proxy/is_vpn/is_tor/
+    is_relay/is_res_proxy; `as` carries ASN type (hosting/isp/business); geo,
+    mobile, and top-level is_hosting/is_mobile round it out. We synthesize a
+    0-100 fraud score from those flags."""
     data, err = http_get_json_ex(
         "https://api.ipinfo.io/lookup/" + quote(ip, safe=""),
         timeout, extra_headers={"Authorization": "Bearer " + token})
     if err or not isinstance(data, dict):
         return {"_error": f"IPinfo: {err or 'no data'}"}
-    priv = data.get("privacy") if isinstance(data.get("privacy"), dict) else {}
-    asn = data.get("asn") if isinstance(data.get("asn"), dict) else {}
-    company = data.get("company") if isinstance(data.get("company"), dict) else {}
-    carrier = data.get("carrier") if isinstance(data.get("carrier"), dict) else {}
+    anon_o = data.get("anonymous") if isinstance(data.get("anonymous"),
+                                                 dict) else {}
+    as_o = data.get("as") if isinstance(data.get("as"), dict) else {}
+    geo_o = data.get("geo") if isinstance(data.get("geo"), dict) else {}
+    mob_o = data.get("mobile") if isinstance(data.get("mobile"), dict) else {}
 
-    vpn = bool(priv.get("vpn"))
-    proxy = bool(priv.get("proxy"))
-    tor = bool(priv.get("tor"))
-    relay = bool(priv.get("relay"))
-    hosting = bool(priv.get("hosting"))
-    service = (priv.get("service") or "").strip()
-    # Residential-proxy signal (Max plan). Keys have shifted over time, so we
-    # accept any of them, plus the 7-day-observation fields that only appear
-    # when an IP is flagged as a residential proxy.
-    res_proxy = bool(priv.get("res_proxy") or priv.get("is_res_proxy")
-                     or priv.get("residential_proxy")
-                     or priv.get("percent_days_seen") is not None
-                     or (service and (proxy or relay)))
+    vpn = bool(anon_o.get("is_vpn"))
+    proxy = bool(anon_o.get("is_proxy"))
+    tor = bool(anon_o.get("is_tor"))
+    relay = bool(anon_o.get("is_relay"))
+    res_proxy = bool(anon_o.get("is_res_proxy"))
+    hosting = bool(data.get("is_hosting"))
+    is_mobile = bool(data.get("is_mobile")) or bool(mob_o.get("carrier")
+                                                    or mob_o.get("name"))
+    # Some tiers include the residential-proxy service name; keep it if present.
+    service = str(anon_o.get("service") or anon_o.get("res_proxy_service")
+                  or "").strip()
+    carrier_name = str(mob_o.get("carrier") or mob_o.get("name") or "").strip()
 
-    org_type = (company.get("type") or asn.get("type") or "").lower()
-    is_mobile = bool(carrier.get("name")) or bool(data.get("mobile"))
+    org_type = (as_o.get("type") or "").lower()
     anon = res_proxy or proxy or vpn or tor or relay
     if res_proxy or proxy:
         fraud = 90                      # a proxy exit -> burnt
@@ -661,10 +661,10 @@ def ipinfo_lookup(ip, token, timeout=DEFAULT_TIMEOUT):
         fraud = 60                      # datacenter / hosting
     else:
         fraud = 5                       # clean residential / ISP / mobile
-    if is_mobile:
-        conn = "Mobile"
-    elif res_proxy:
+    if res_proxy:
         conn = "Residential proxy"
+    elif is_mobile:
+        conn = "Mobile"
     elif hosting or org_type == "hosting":
         conn = "Datacenter"
     elif org_type == "isp":
@@ -673,14 +673,14 @@ def ipinfo_lookup(ip, token, timeout=DEFAULT_TIMEOUT):
         conn = "Business"
     else:
         conn = "Proxy" if anon else "Residential"
-    org = (company.get("name") or asn.get("name") or data.get("org") or "")
+    org = (as_o.get("name") or data.get("org") or "")
     extra = []
     if res_proxy:
         extra.append("residential proxy")
     if service:
         extra.append(service.lower())
-    if carrier.get("name"):
-        extra.append(str(carrier["name"]).lower())
+    if carrier_name:
+        extra.append(carrier_name.lower())
     return {
         "fraud_score": fraud,
         "connection_type": conn,        # Mobile / Residential proxy / DC / ...
@@ -690,7 +690,7 @@ def ipinfo_lookup(ip, token, timeout=DEFAULT_TIMEOUT):
         "recent_abuse": res_proxy or proxy,
         "bot_status": False,
         "isp": org,
-        "country": data.get("country", ""),
+        "country": geo_o.get("country_code") or geo_o.get("country", ""),
         "flag_extra": list(dict.fromkeys(extra)),   # deduped, order-preserved
     }
 
