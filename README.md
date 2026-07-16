@@ -48,6 +48,12 @@ shows just pure consumer-eyeball networks and hides dual-use ISPs that also
 carry business/transit (e.g. AT&T 7018, Lumen 209, Starlink 14593). Business
 and datacenter ASNs are off by default since mobile pools won't contain them.
 
+**Custom ASNs.** On the **Settings** tab you can add any ASN by number; the app
+looks it up against public registries (BGPView for the provider name, PeeringDB
+for the network type, RIPEstat as a fallback) and files it into the ASN Tester
+list with an auto-detected provider name and type. No API key needed. Added
+ASNs persist in `settings.json` and show up immediately in the picker.
+
 ### Generate rotating proxies
 
 On the ASN Tester tab, pick a **Provider**, enter your username/password, list

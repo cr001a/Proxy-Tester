@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.27"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.28"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -986,6 +986,90 @@ ASN_CATALOG = [
 ]
 
 
+def _classify_asn(name, desc, pdb_type=""):
+    """Best-effort network category for an ASN from its name/description plus
+    (optionally) PeeringDB's info_type. Returns one of CATEGORIES."""
+    text = f"{name} {desc}".lower()
+    if any(k in text for k in ("wireless", "mobil", "cellular", " pcs",
+                               "cellco", "cmcc", "moviles", "telcel",
+                               " lte", " 4g", " 5g")):
+        return "mobile"
+    pt = (pdb_type or "").lower()
+    if "cable" in pt or "dsl" in pt or "isp" in pt:
+        return "residential"
+    if pt == "nsp" or "enterprise" in pt or "government" in pt or "educ" in pt:
+        return "business"
+    if "content" in pt or "network services" in pt or "route" in pt:
+        return "datacenter"
+    if any(k in text for k in ("hosting", "datacenter", "data center", "cloud",
+                               "server", " vps", "colocation", " colo",
+                               "dedicated")):
+        return "datacenter"
+    if any(k in text for k in ("broadband", "cable", "fiber", "fibre",
+                               "telecom", "communications", "internet",
+                               "networks", " isp")):
+        return "residential"
+    return "business"
+
+
+def asn_lookup(asn, timeout=DEFAULT_TIMEOUT):
+    """Resolve an ASN to (provider_name, category) using public registries
+    (BGPView for the org name, PeeringDB for the network type, RIPEstat as a
+    name fallback). No API key required. Returns (None, None) on failure."""
+    asn = str(asn).strip().upper()
+    if asn.startswith("AS"):
+        asn = asn[2:]
+    if not asn.isdigit():
+        return None, None
+    name = desc = ""
+    data = http_get_json(f"https://api.bgpview.io/asn/{asn}", timeout=timeout)
+    if data and data.get("status") == "ok":
+        d = data.get("data") or {}
+        name = (d.get("name") or "").strip()
+        desc = (d.get("description_short") or "").strip()
+    if not name and not desc:
+        rs = http_get_json(
+            "https://stat.ripe.net/data/as-overview/data.json"
+            f"?resource=AS{asn}", timeout=timeout)
+        if rs and isinstance(rs.get("data"), dict):
+            name = (rs["data"].get("holder") or "").strip()
+    if not name and not desc:
+        return None, None
+    pdb_type = ""
+    pdb = http_get_json(f"https://www.peeringdb.com/api/net?asn={asn}",
+                        timeout=timeout)
+    if pdb and pdb.get("data"):
+        pdb_type = (pdb["data"][0].get("info_type") or "").strip()
+    label = desc or name
+    return label, _classify_asn(name, desc, pdb_type)
+
+
+def load_custom_asns():
+    """User-added ASNs from settings.json: list of {asn, name, cat}."""
+    v = load_setting("custom_asns", [])
+    return v if isinstance(v, list) else []
+
+
+def save_custom_asns(items):
+    save_setting("custom_asns", items)
+
+
+def all_asns():
+    """The hardcoded catalog plus the user's custom ASNs. Custom entries are
+    marked strict=True so the 'Strict only' toggle never hides them.
+    Returns list of (asn, name, cat, strict)."""
+    out = list(ASN_CATALOG)
+    have = {a for a, *_ in out}
+    for c in load_custom_asns():
+        asn = str(c.get("asn", "")).strip()
+        if asn and asn not in have:
+            cat = c.get("cat", "residential")
+            out.append((asn, c.get("name") or f"AS{asn}",
+                        cat if cat in CATEGORIES else "residential", True))
+            have.add(asn)
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Tab 1: ASN Tester (Oxylabs mobile)
 # --------------------------------------------------------------------------- #
@@ -1365,6 +1449,11 @@ class AsnTab(ttk.Frame):
         self.tree.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
 
+    def refresh_asns(self):
+        """Public hook: re-read the catalog (e.g. after a custom ASN is added
+        on the Settings tab) and rebuild the visible list."""
+        self._refilter_asns()
+
     def _refilter_asns(self):
         """Rebuild the ASN list from the active category/strict/search filters."""
         cats = {c for c, v in self.filter_vars.items() if v.get()}
@@ -1372,7 +1461,7 @@ class AsnTab(ttk.Frame):
         q = self.search_var.get().strip().lower()
         self.asn_list.delete(0, "end")
         self._visible_asns = []
-        for asn, name, cat, strict in ASN_CATALOG:
+        for asn, name, cat, strict in all_asns():
             if cat not in cats:
                 continue
             if strict_only and not strict:
@@ -2678,8 +2767,9 @@ class SettingsTab(ttk.Frame):
     """Central place for API keys and performance. Keys are stored in
     settings.json in your config dir (never hard-coded)."""
 
-    def __init__(self, master):
+    def __init__(self, master, on_catalog_change=None):
         super().__init__(master, padding=20)
+        self._on_catalog_change = on_catalog_change
         self._build()
 
     def _build(self):
@@ -2754,6 +2844,50 @@ class SettingsTab(ttk.Frame):
         ttk.Separator(self, orient="horizontal").grid(
             row=r, column=0, columnspan=2, sticky="ew", pady=14)
         r += 1
+        ttk.Label(self, text="Custom ASNs", style="Header.TLabel").grid(
+            row=r, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        r += 1
+        ttk.Label(self,
+                  text="Add an ASN and it's looked up automatically (provider "
+                       "name + type) and added to the ASN Tester list. Added "
+                       "instantly - no need to click Save.",
+                  style="Muted.TLabel").grid(row=r, column=0, columnspan=2,
+                                             sticky="w", pady=(0, 8))
+        r += 1
+        self.asn_entry = tk.StringVar()
+        add_row = ttk.Frame(self)
+        add_row.grid(row=r, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        ttk.Label(add_row, text="ASN (number, e.g. 21928)").pack(side="left")
+        e = ttk.Entry(add_row, textvariable=self.asn_entry, width=16)
+        e.pack(side="left", padx=(10, 8))
+        e.bind("<Return>", lambda _e: self.on_add_asn())
+        self.asn_add_btn = ttk.Button(add_row, text="Look up & add",
+                                      style="Accent.TButton",
+                                      command=self.on_add_asn)
+        self.asn_add_btn.pack(side="left")
+        self.asn_status = ttk.Label(add_row, text="", style="Muted.TLabel")
+        self.asn_status.pack(side="left", padx=(10, 0))
+        r += 1
+        list_wrap = ttk.Frame(self)
+        list_wrap.grid(row=r, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        self.custom_list = tk.Listbox(list_wrap, height=4, width=58,
+                                      activestyle="none", exportselection=False)
+        self.custom_list.configure(
+            bg=MANTLE, fg=TEXT, selectbackground=MAUVE, selectforeground=BASE,
+            highlightthickness=1, highlightbackground=SURFACE2,
+            highlightcolor=MAUVE, relief="flat", borderwidth=0,
+            font=(UI_FONT, 10))
+        self.custom_list.pack(side="left")
+        cbtns = ttk.Frame(list_wrap)
+        cbtns.pack(side="left", padx=(8, 0), anchor="n")
+        ttk.Button(cbtns, text="Remove", command=self.on_remove_asn).pack(
+            fill="x")
+        r += 1
+        self._reload_custom_list()
+
+        ttk.Separator(self, orient="horizontal").grid(
+            row=r, column=0, columnspan=2, sticky="ew", pady=14)
+        r += 1
         ttk.Label(self, text="Performance", style="Header.TLabel").grid(
             row=r, column=0, columnspan=2, sticky="w", pady=(0, 4))
         r += 1
@@ -2790,6 +2924,67 @@ class SettingsTab(ttk.Frame):
         save_setting("concurrency", w)
         self.workers.set(str(w))
         self.status_lbl.config(text="Saved.")
+
+    # --- Custom ASNs ---------------------------------------------------- #
+    def _reload_custom_list(self):
+        self.custom_list.delete(0, "end")
+        self._custom = load_custom_asns()
+        for c in self._custom:
+            self.custom_list.insert(
+                "end", f"{c.get('asn')}  -  {c.get('name')}  "
+                       f"[{c.get('cat')}]")
+
+    def on_add_asn(self):
+        raw = self.asn_entry.get().strip().upper()
+        if raw.startswith("AS"):
+            raw = raw[2:]
+        if not raw.isdigit():
+            self.asn_status.config(text="Enter an ASN number.")
+            return
+        if any(str(c.get("asn")) == raw for c in load_custom_asns()) or \
+                any(a == raw for a, *_ in ASN_CATALOG):
+            self.asn_status.config(text=f"AS{raw} is already in the list.")
+            return
+        self.asn_add_btn.config(state="disabled")
+        self.asn_status.config(text=f"Looking up AS{raw}...")
+
+        def work():
+            name, cat = asn_lookup(raw)
+            self.after(0, lambda: self._finish_add(raw, name, cat))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finish_add(self, asn, name, cat):
+        self.asn_add_btn.config(state="normal")
+        if not name:
+            self.asn_status.config(
+                text=f"Couldn't look up AS{asn} (offline or unknown).")
+            return
+        items = load_custom_asns()
+        items.append({"asn": asn, "name": name, "cat": cat})
+        save_custom_asns(items)
+        self._reload_custom_list()
+        self.asn_entry.set("")
+        self.asn_status.config(text=f"Added AS{asn}: {name} [{cat}]")
+        if self._on_catalog_change:
+            self._on_catalog_change()
+
+    def on_remove_asn(self):
+        sel = self.custom_list.curselection()
+        if not sel:
+            self.asn_status.config(text="Select a custom ASN to remove.")
+            return
+        items = load_custom_asns()
+        removed = 0
+        for i in sorted(sel, reverse=True):
+            if i < len(items):
+                items.pop(i)
+                removed += 1
+        save_custom_asns(items)
+        self._reload_custom_list()
+        self.asn_status.config(text=f"Removed {removed} ASN(s).")
+        if self._on_catalog_change:
+            self._on_catalog_change()
 
 
 class HeaderBar(ttk.Frame):
@@ -3082,7 +3277,8 @@ def main():
     proxy_tab = ProxyTab(notebook)
     quality_tab = QualityTab(notebook)
     converter_tab = ConverterTab(notebook)
-    settings_tab = SettingsTab(notebook)
+    settings_tab = SettingsTab(notebook,
+                               on_catalog_change=asn_tab.refresh_asns)
     notebook.add(asn_tab, text="ASN Tester")
     notebook.add(proxy_tab, text="Proxy Tester")
     notebook.add(quality_tab, text="IP Quality")
