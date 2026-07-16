@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.39"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.40"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -627,8 +627,8 @@ def ipinfo_lookup(ip, token, timeout=DEFAULT_TIMEOUT):
     Core adds VPN/Tor/proxy/relay; every plan gives ASN/company type + carrier
     (mobile). We synthesize a 0-100 fraud score from those flags."""
     data, err = http_get_json_ex(
-        "https://ipinfo.io/" + quote(ip, safe="") + "?token="
-        + quote(token, safe=""), timeout)
+        "https://api.ipinfo.io/lookup/" + quote(ip, safe=""),
+        timeout, extra_headers={"Authorization": "Bearer " + token})
     if err or not isinstance(data, dict):
         return {"_error": f"IPinfo: {err or 'no data'}"}
     priv = data.get("privacy") if isinstance(data.get("privacy"), dict) else {}
