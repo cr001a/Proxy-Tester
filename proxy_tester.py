@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.37"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.38"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -2668,6 +2668,7 @@ class QualityTab(ttk.Frame):
         style_text(self.proxy_text)
         self.proxy_text.grid(row=1, column=0, rowspan=4, sticky="nw",
                              padx=(0, 24))
+        self.proxy_text.bind("<<Paste>>", self._on_paste_proxies)
 
         self.provider = tk.StringVar(value=load_setting("quality_provider",
                                                         "proxycheck.io"))
@@ -2742,6 +2743,22 @@ class QualityTab(ttk.Frame):
                             command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
+
+    def _on_paste_proxies(self, _event=None):
+        """Paste always appends to the END of the list (never mid-cursor) and
+        leaves the caret on a fresh blank line, so you can immediately paste the
+        next batch without it running onto the last proxy."""
+        try:
+            clip = self.proxy_text.clipboard_get()
+        except tk.TclError:
+            return "break"
+        cur = self.proxy_text.get("1.0", "end-1c").rstrip("\n")
+        parts = [p for p in (cur, clip.strip("\n")) if p]
+        self.proxy_text.delete("1.0", "end")
+        self.proxy_text.insert("1.0", "\n".join(parts) + "\n")
+        self.proxy_text.mark_set("insert", "end-1c")
+        self.proxy_text.see("end")
+        return "break"
 
     # --- profile state (proxies only; the API key lives in settings.json) ---
     def get_state(self):
