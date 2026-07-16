@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.21"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.22"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -805,6 +805,82 @@ def provider_hostport(provider):
     return "", ""
 
 
+# --------------------------------------------------------------------------- #
+# Residential batch generation (client-side session-string construction).
+# Nothing is fetched from an API: you make N distinct proxies by putting a
+# unique random session token in each line (same token = same sticky IP).
+# Credentials come from the Settings tab, never hard-coded.
+# --------------------------------------------------------------------------- #
+def _resi_sessid(n=10):
+    alphabet = string.ascii_letters + string.digits
+    return "".join(random.choice(alphabet) for _ in range(n))
+
+
+def _build_oxylabs_resi(user, pw, state, city, lifetime, sessid):
+    # pr.oxylabs.io: params live in the username; country/state/city + sticky.
+    u = f"customer-{user}-cc-us"
+    if state:
+        u += f"-st-us_{state}"
+    if city:
+        u += f"-city-{city}"
+    if sessid:
+        u += f"-sessid-{sessid}"
+        if lifetime:
+            u += f"-sesstime-{lifetime}"          # minutes
+    return f"pr.oxylabs.io:7777:{u}:{pw}"
+
+
+def _build_iproyal_resi(user, pw, state, city, lifetime, sessid):
+    # geo.iproyal.com: params live in the password; sticky via session+lifetime.
+    p = f"{pw}_country-us"
+    if state:
+        p += f"_state-{state}"
+    if city:
+        p += f"_city-{city}"
+    if sessid:
+        p += f"_session-{sessid}"
+        if lifetime:
+            p += f"_lifetime-{lifetime}m"
+    return f"geo.iproyal.com:12321:{user}:{p}"
+
+
+# Residential providers for the batch generator. user_key/pass_key -> settings.
+RESI_PROVIDERS = {
+    "Oxylabs Residential": {
+        "user_key": "oxylabs_resi_user", "pass_key": "oxylabs_resi_pass",
+        "build": _build_oxylabs_resi,
+    },
+    "IPRoyal": {
+        "user_key": "iproyal_user", "pass_key": "iproyal_pass",
+        "build": _build_iproyal_resi,
+    },
+}
+
+
+def configured_resi_providers():
+    """Providers that have both a username and password saved in settings."""
+    return [name for name, spec in RESI_PROVIDERS.items()
+            if load_setting(spec["user_key"], "").strip()
+            and load_setting(spec["pass_key"], "").strip()]
+
+
+def generate_resi_batch(provider, state, city, lifetime, count, rotating=False):
+    """Build `count` residential proxy lines. Each gets a unique session token
+    (samples a distinct sticky IP); rotating omits it (new IP per request).
+    Credentials load from settings. Returns (lines, error_or_None)."""
+    spec = RESI_PROVIDERS.get(provider)
+    if not spec:
+        return [], f"Unknown provider: {provider}"
+    user = load_setting(spec["user_key"], "").strip()
+    pw = load_setting(spec["pass_key"], "").strip()
+    if not user or not pw:
+        return [], f"Add {provider} username/password on the Settings tab first."
+    lines = [spec["build"](user, pw, state, city, lifetime,
+                           None if rotating else _resi_sessid())
+             for _ in range(count)]
+    return lines, None
+
+
 # Hardcoded ASN catalog, classified by network type (researched via
 # ipinfo/PeeringDB/CAIDA). Fields: (asn, name, category, strict).
 #   category : "mobile" | "residential" | "business" | "datacenter"
@@ -1533,6 +1609,9 @@ class ProxyTab(ttk.Frame):
         self.run_btn = ttk.Button(btns, text="Run", style="Accent.TButton",
                                   command=self.on_run)
         self.run_btn.pack(side="left")
+        ttk.Button(btns, text="Generate batch",
+                   command=lambda: open_generate_dialog(
+                       self, self.proxy_text)).pack(side="left", padx=8)
         self.shuffle_btn = ttk.Button(btns, text="Shuffle list",
                                       command=self.on_shuffle)
         self.shuffle_btn.pack(side="left", padx=8)
@@ -1966,6 +2045,100 @@ class ConverterTab(ttk.Frame):
         self.status_lbl.config(text="")
 
 
+def open_generate_dialog(parent, text_widget):
+    """Batch generator: build N residential proxy lines by spec and drop them
+    into `text_widget`. Optional - if unused, the text box works as before."""
+    configured = configured_resi_providers()
+    if not configured:
+        messagebox.showinfo(
+            "Generate batch",
+            "Add a provider's username/password on the Settings tab first "
+            "(Oxylabs Residential or IPRoyal).")
+        return
+    top = tk.Toplevel(parent)
+    top.title("Generate residential batch")
+    top.configure(bg=BASE)
+    top.transient(parent.winfo_toplevel())
+    top.resizable(False, False)
+
+    provider = tk.StringVar(value=configured[0])
+    state = tk.StringVar()
+    city = tk.StringVar()
+    lifetime = tk.StringVar(value="30")
+    count = tk.StringVar(value="500")
+    rotating = tk.BooleanVar(value=False)
+    append = tk.BooleanVar(value=False)
+    r = 0
+
+    def row(label, widget):
+        nonlocal r
+        ttk.Label(top, text=label).grid(row=r, column=0, sticky="w",
+                                        padx=16, pady=4)
+        widget.grid(row=r, column=1, sticky="w", padx=(6, 16), pady=4)
+        r += 1
+
+    row("Provider", ttk.Combobox(top, textvariable=provider, values=configured,
+                                 width=22, state="readonly"))
+    ttk.Label(top, text="Country", ).grid(row=r, column=0, sticky="w",
+                                          padx=16, pady=4)
+    ttk.Label(top, text="US (fixed)", style="Muted.TLabel").grid(
+        row=r, column=1, sticky="w", padx=(6, 16))
+    r += 1
+    row("State (optional)", ttk.Entry(top, textvariable=state, width=24))
+    row("City (optional)", ttk.Entry(top, textvariable=city, width=24))
+    row("Sticky lifetime (min)", ttk.Entry(top, textvariable=lifetime, width=8))
+    row("Count", ttk.Entry(top, textvariable=count, width=8))
+    ttk.Checkbutton(top, text="Rotating (new IP per request, no sticky session)",
+                    variable=rotating).grid(row=r, column=0, columnspan=2,
+                                            sticky="w", padx=16, pady=2)
+    r += 1
+    ttk.Checkbutton(top, text="Append to existing list (instead of replacing)",
+                    variable=append).grid(row=r, column=0, columnspan=2,
+                                          sticky="w", padx=16, pady=2)
+    r += 1
+    ttk.Label(top, text="State/city: lowercase, e.g. 'arkansas', "
+                        "'los_angeles'. Valid values vary by provider.",
+              style="Muted.TLabel").grid(row=r, column=0, columnspan=2,
+                                         sticky="w", padx=16, pady=(2, 8))
+    r += 1
+
+    def gen():
+        try:
+            n = max(1, int(count.get().strip()))
+        except ValueError:
+            messagebox.showerror("Generate batch", "Count must be a number.")
+            return
+        lt = None
+        raw = lifetime.get().strip()
+        if raw and not rotating.get():
+            try:
+                lt = max(1, int(raw))
+            except ValueError:
+                lt = None
+        lines, err = generate_resi_batch(
+            provider.get(), state.get().strip().lower(),
+            city.get().strip().lower(), lt, n, rotating.get())
+        if err:
+            messagebox.showerror("Generate batch", err)
+            return
+        text = "\n".join(lines)
+        if append.get():
+            cur = text_widget.get("1.0", "end").rstrip("\n")
+            text = (cur + "\n" + text) if cur else text
+        text_widget.delete("1.0", "end")
+        text_widget.insert("1.0", text)
+        top.destroy()
+
+    btns = ttk.Frame(top)
+    btns.grid(row=r, column=0, columnspan=2, sticky="w", padx=14, pady=(6, 14))
+    ttk.Button(btns, text="Generate", style="Accent.TButton",
+               command=gen).pack(side="left")
+    ttk.Button(btns, text="Cancel", command=top.destroy).pack(side="left",
+                                                              padx=8)
+    center_over_parent(top, parent)
+    top.grab_set()
+
+
 # Trust-range buckets for the Trust header filter (label, predicate on trust).
 TRUST_BUCKETS = [
     ("90-100", lambda t: isinstance(t, int) and 90 <= t <= 100),
@@ -2031,6 +2204,9 @@ class QualityTab(ttk.Frame):
         self.run_btn = ttk.Button(btns, text="Score", style="Accent.TButton",
                                   command=self.on_run)
         self.run_btn.pack(side="left")
+        ttk.Button(btns, text="Generate batch",
+                   command=lambda: open_generate_dialog(
+                       self, self.proxy_text)).pack(side="left", padx=8)
         ttk.Button(btns, text="Copy selected",
                    command=self.on_copy_selected).pack(side="left", padx=8)
         # Exports the highlighted rows, or all currently-shown rows if none are.
@@ -2439,6 +2615,39 @@ class SettingsTab(ttk.Frame):
         ttk.Separator(self, orient="horizontal").grid(
             row=r, column=0, columnspan=2, sticky="ew", pady=14)
         r += 1
+        ttk.Label(self, text="Proxy provider credentials",
+                  style="Header.TLabel").grid(row=r, column=0, columnspan=2,
+                                              sticky="w", pady=(0, 4))
+        r += 1
+        ttk.Label(self,
+                  text="Used by 'Generate batch'. Providers you fill in here "
+                       "appear in the generator's dropdown.",
+                  style="Muted.TLabel").grid(row=r, column=0, columnspan=2,
+                                             sticky="w", pady=(0, 8))
+        r += 1
+        self.oxy_user = tk.StringVar(value=load_setting("oxylabs_resi_user", ""))
+        self.oxy_pass = tk.StringVar(value=load_setting("oxylabs_resi_pass", ""))
+        self.ipr_user = tk.StringVar(value=load_setting("iproyal_user", ""))
+        self.ipr_pass = tk.StringVar(value=load_setting("iproyal_pass", ""))
+
+        def cred_row(label, var, secret=False):
+            nonlocal r
+            ttk.Label(self, text=label).grid(row=r, column=0, sticky="w", pady=3)
+            e = ttk.Entry(self, textvariable=var, width=46,
+                          show="•" if secret else "")
+            e.grid(row=r, column=1, sticky="w", pady=3, padx=(10, 0))
+            if secret:
+                reveal_on_focus(e)
+            r += 1
+
+        cred_row("Oxylabs Residential username", self.oxy_user)
+        cred_row("Oxylabs Residential password", self.oxy_pass, secret=True)
+        cred_row("IPRoyal username", self.ipr_user)
+        cred_row("IPRoyal password", self.ipr_pass, secret=True)
+
+        ttk.Separator(self, orient="horizontal").grid(
+            row=r, column=0, columnspan=2, sticky="ew", pady=14)
+        r += 1
         ttk.Label(self, text="Performance", style="Header.TLabel").grid(
             row=r, column=0, columnspan=2, sticky="w", pady=(0, 4))
         r += 1
@@ -2464,6 +2673,10 @@ class SettingsTab(ttk.Frame):
         save_setting("ipqs_api_key", self.ipqs.get().strip())
         save_setting("proxycheck_api_key", self.pcheck.get().strip())
         save_setting("spur_api_token", self.spur.get().strip())
+        save_setting("oxylabs_resi_user", self.oxy_user.get().strip())
+        save_setting("oxylabs_resi_pass", self.oxy_pass.get().strip())
+        save_setting("iproyal_user", self.ipr_user.get().strip())
+        save_setting("iproyal_pass", self.ipr_pass.get().strip())
         try:
             w = max(1, min(100, int(self.workers.get().strip())))
         except (TypeError, ValueError):
@@ -2795,8 +3008,8 @@ def main():
 
     root = tk.Tk()
     root.title("ProxyTester")
-    root.geometry("1100x880")  # roomy enough for the wide ASN selector
-    root.minsize(820, 640)
+    root.geometry("1340x900")  # wide enough that result columns show untruncated
+    root.minsize(900, 640)
     apply_theme(root)
 
     if LOGO_ICON_B64:
