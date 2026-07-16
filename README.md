@@ -179,6 +179,15 @@ Exit IP`. The exit IP is parsed from the `ip` field if the response is JSON.
 This tab is a **plain connectivity/latency tester** — it reports reachability,
 speed, and HTTP status only. No site-specific bot-protection scoring.
 
+**Site ping.** The Proxy Tester tab also has a **Site ping** control that
+measures your *direct* (no-proxy) network latency to a site's edge — pick a
+preset retailer (Walmart, Target, Best Buy, Nike, Foot Locker, Adidas, Amazon,
+GameStop, Pokémon Center, Costco, Newegg, Shopify), **All presets** to compare
+them all, or **Custom (Test URL)** to ping whatever host is in the Test URL box.
+It's a raw TCP-connect round-trip (not an HTTP request), so bot-protection
+`403`s never skew the number — you get clean min / median / max latency to the
+edge. Results append to the table prefixed with `PING`.
+
 ---
 
 ## Notes

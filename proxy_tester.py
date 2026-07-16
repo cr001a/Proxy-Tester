@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.32"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.33"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -403,6 +403,78 @@ def _parse_json_field(body, field):
 
 def _fmt_ms(value):
     return f"{value:.0f}" if value is not None else "-"
+
+
+# --------------------------------------------------------------------------- #
+# Site ping (latency to a website's edge)
+# --------------------------------------------------------------------------- #
+# Common retail / release targets. Handy for gauging your baseline network
+# latency to each site's edge before a drop, or comparing server locations.
+RETAIL_SITES = [
+    ("Walmart", "www.walmart.com"),
+    ("Target", "www.target.com"),
+    ("Best Buy", "www.bestbuy.com"),
+    ("Nike", "www.nike.com"),
+    ("Foot Locker", "www.footlocker.com"),
+    ("Adidas", "www.adidas.com"),
+    ("Amazon", "www.amazon.com"),
+    ("GameStop", "www.gamestop.com"),
+    ("Pokemon Center", "www.pokemoncenter.com"),
+    ("Costco", "www.costco.com"),
+    ("Newegg", "www.newegg.com"),
+    ("Shopify", "www.shopify.com"),
+]
+
+
+def _host_port_from_target(target):
+    """Pull (host, port) out of a URL or a bare host[:port]. Defaults to 443."""
+    t = target.strip()
+    if "://" in t:
+        t = t.split("://", 1)[1]
+    t = t.split("/", 1)[0]
+    if "@" in t:
+        t = t.rsplit("@", 1)[1]
+    port = 443
+    if ":" in t:
+        h, p = t.rsplit(":", 1)
+        if p.isdigit():
+            t, port = h, int(p)
+    return t, port
+
+
+def tcp_ping(host, port=443, timeout=DEFAULT_TIMEOUT):
+    """One TCP-connect round-trip to host:port, in milliseconds (or None on
+    failure). A raw connect - not an HTTP request - so bot-protection 403s
+    never skew the number; it measures pure network latency to the edge."""
+    start = time.perf_counter()
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return (time.perf_counter() - start) * 1000.0
+    except Exception:
+        return None
+
+
+def ping_site(name, target, runs, timeout=DEFAULT_TIMEOUT, stop_event=None):
+    """Ping a site `runs` times and aggregate min/median/max latency."""
+    host, port = _host_port_from_target(target)
+    lat = []
+    fails = 0
+    for _ in range(max(1, runs)):
+        if stop_event is not None and stop_event.is_set():
+            break
+        ms = tcp_ping(host, port, timeout)
+        if ms is None:
+            fails += 1
+        else:
+            lat.append(ms)
+    ran = len(lat) + fails
+    if not lat:
+        return {"name": name, "host": f"{host}:{port}", "status": "unreachable",
+                "median": None, "min": None, "max": None,
+                "success": 0, "runs": ran or runs}
+    return {"name": name, "host": f"{host}:{port}", "status": "OK",
+            "median": statistics.median(lat), "min": min(lat), "max": max(lat),
+            "success": len(lat), "runs": ran}
 
 
 # --------------------------------------------------------------------------- #
@@ -1762,6 +1834,21 @@ class ProxyTab(ttk.Frame):
         self.status_lbl = ttk.Label(btns, text="Idle", style="Muted.TLabel")
         self.status_lbl.pack(side="left", padx=12)
 
+        # Site ping: measure direct (no-proxy) latency to a retailer's edge.
+        ping_bar = ttk.Frame(self)
+        ping_bar.pack(fill="x", pady=(0, 2))
+        ttk.Label(ping_bar,
+                  text="Site ping (direct latency, no proxy):").pack(side="left")
+        self.ping_site_var = tk.StringVar(value="Walmart")
+        ttk.Combobox(
+            ping_bar, textvariable=self.ping_site_var, state="readonly",
+            width=22,
+            values=["All presets"] + [n for n, _ in RETAIL_SITES]
+            + ["Custom (Test URL)"]).pack(side="left", padx=8)
+        self.ping_btn = ttk.Button(ping_bar, text="Ping site",
+                                   command=self.on_ping_site)
+        self.ping_btn.pack(side="left")
+
         self.tree = ttk.Treeview(self, columns=self.COLUMNS,
                                  show="headings", height=12)
         # (width, minwidth, stretch, anchor). Status stretches, is left-aligned,
@@ -1885,17 +1972,73 @@ class ProxyTab(ttk.Frame):
             self.after(100, self._drain_queue)
 
     def _insert_row(self, r):
+        if r.get("_ping"):
+            rng = ("-" if r["min"] is None
+                   else f"min {r['min']:.0f} / max {r['max']:.0f} ms")
+            self.tree.insert("", "end", values=(
+                f"PING  {r['name']} - {r['host']}", r["status"], "-",
+                _fmt_ms(r["median"]), f"{r['success']}/{r['runs']}",
+                "", rng, "direct (no proxy)",
+            ), tags=(status_tag(r["status"]),))
+            return
         self.tree.insert("", "end", values=(
             r["proxy"], r["status"], r["code"], _fmt_ms(r["median"]),
             f"{r['success']}/{r['runs']}", r["exit_ip"],
             r.get("org", ""), r.get("location", ""),
         ), tags=(status_tag(r["status"]),))
 
+    def on_ping_site(self):
+        if self.running:
+            return
+        choice = self.ping_site_var.get()
+        presets = dict(RETAIL_SITES)
+        if choice == "All presets":
+            targets = list(RETAIL_SITES)
+        elif choice in presets:
+            targets = [(choice, presets[choice])]
+        else:  # Custom (Test URL)
+            url = self.url.get().strip()
+            if not url:
+                messagebox.showerror(
+                    "ProxyTester",
+                    "Enter a Test URL to ping, or pick a preset site.")
+                return
+            host, _ = _host_port_from_target(url)
+            targets = [(host, url)]
+        try:
+            runs = max(1, int(self.runs.get().strip()))
+        except ValueError:
+            runs = 5
+
+        self.running = True
+        self.stop_event.clear()
+        self.run_btn.config(state="disabled")
+        self.ping_btn.config(text="Stop", style="Stop.TButton",
+                             command=self.on_stop)
+        self.status_lbl.config(text=f"Pinging {len(targets)} site(s)...")
+        threading.Thread(target=self._ping_worker, args=(targets, runs),
+                         daemon=True).start()
+        self.after(100, self._drain_queue)
+
+    def _ping_worker(self, targets, runs):
+        try:
+            for name, target in targets:
+                if self.stop_event.is_set():
+                    break
+                r = ping_site(name, target, runs, DEFAULT_TIMEOUT,
+                              self.stop_event)
+                r["_ping"] = True
+                self.queue.put(r)
+        finally:
+            self.queue.put({"_done": True})
+
     def _finish(self):
         stopped = self.stop_event.is_set()
         self.running = False
         self.run_btn.config(text="Run", style="Accent.TButton",
                             command=self.on_run, state="normal")
+        self.ping_btn.config(text="Ping site", style="TButton",
+                             command=self.on_ping_site, state="normal")
         self.status_lbl.config(text="Stopped" if stopped else "Done")
 
     def on_shuffle(self):
