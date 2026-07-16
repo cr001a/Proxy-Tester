@@ -18,11 +18,16 @@ Four tabs:
 2. **Proxy Tester (general)** — plain reachability + latency testing for any
    list of proxies against any URL.
 3. **IP Quality** — scores each proxy's exit-IP reputation into a single
-   **Trust** score. Uses [IPQualityScore](https://www.ipqualityscore.com/)
-   (paste your API key) for fraud score / connection type (residential ·
-   mobile · datacenter) / recent-abuse & bot flags, plus a free **Spamhaus**
-   blocklist check (no key needed) and your latency. Results sort best-first so
-   you can keep the cleanest IPs.
+   **Trust** score. Pick a **provider** —
+   [proxycheck.io](https://proxycheck.io/) (cheap, high daily volume) or
+   [IPQualityScore](https://www.ipqualityscore.com/) — for fraud/risk score,
+   connection type (residential · mobile · datacenter) and abuse/bot/VPN/Tor
+   flags, plus a free **Spamhaus** blocklist check (no key) and latency. Unique
+   exit IPs are **deduped** so you only spend one lookup per IP. Results sort
+   best-first; click any header to re-sort, filter by **min trust**, and
+   **copy selected** proxies straight to the clipboard (full
+   `host:port:user:pass`). API keys and worker concurrency live on the
+   **Settings** tab.
 4. **Converter** — paste any provider proxy format (full URLs, Python snippets,
    `user:pass@host:port`, `host,port,user,pass`) and get copy-ready
    `host:port:user:pass` lines.

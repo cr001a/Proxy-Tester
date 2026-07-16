@@ -49,11 +49,12 @@ try:
 except ImportError:  # logo is optional
     LOGO_HEADER_B64 = LOGO_ICON_B64 = None
 
-DEFAULT_TIMEOUT = 15  # seconds, per request
-MAX_WORKERS = 6       # thread pool size for parallel targets
+DEFAULT_TIMEOUT = 15   # seconds, per request
+MAX_WORKERS = 6        # legacy default (kept for reference)
+DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.12"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.13"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -427,18 +428,23 @@ def http_get_json(url, timeout=DEFAULT_TIMEOUT):
 
 def spamhaus_listed(ip):
     """Spamhaus ZEN DNSBL check (free, no key). True=listed, False=clean,
-    None=couldn't tell (IPv6, or the resolver blocks public DNSBL queries)."""
+    None=couldn't tell. Real listings answer 127.0.0.2-127.0.0.11; a
+    127.255.255.x answer means the query was refused (e.g. a public/cloud DNS
+    resolver) - that's 'unknown', NOT listed. Treating those as listed is what
+    made every row flip between listed/clean run to run."""
     parts = ip.split(".")
     if len(parts) != 4 or not all(p.isdigit() for p in parts):
         return None
     query = ".".join(reversed(parts)) + ".zen.spamhaus.org"
     try:
-        socket.gethostbyname(query)
-        return True                 # resolves to 127.0.0.x => listed
+        answers = socket.gethostbyname_ex(query)[2]
     except socket.gaierror:
-        return False                # NXDOMAIN => not listed
+        return False                # NXDOMAIN => not on the list
     except OSError:
         return None
+    if any(a.startswith("127.0.0.") for a in answers):
+        return True                 # a genuine listing code
+    return None                     # 127.255.255.x => resolver refused, unknown
 
 
 def ipqs_lookup(ip, api_key, timeout=DEFAULT_TIMEOUT):
@@ -469,11 +475,11 @@ def _trust_score(q):
     fs = q.get("fraud_score")
     score = (100 - fs) if isinstance(fs, (int, float)) else 50
     ct = (q.get("connection_type") or "").lower()
-    if "mobile" in ct:
+    if any(k in ct for k in ("mobile", "wireless", "cellular")):
         score += 12
     elif "residential" in ct:
         score += 6
-    elif "corporate" in ct:
+    elif any(k in ct for k in ("corporate", "business")):
         score -= 4
     elif any(k in ct for k in ("data center", "datacenter", "hosting")):
         score -= 25
@@ -493,33 +499,87 @@ def _trust_score(q):
     return max(0, min(100, int(round(score))))
 
 
-def analyze_proxy_quality(proxy, api_key, timeout=DEFAULT_TIMEOUT,
-                          stop_event=None):
-    """Route through a proxy to find its exit IP, then score that IP's
-    reputation (IPQS + Spamhaus) into a Trust score. Returns a row dict."""
+def proxycheck_lookup(ip, api_key, timeout=DEFAULT_TIMEOUT):
+    """Query proxycheck.io for an IP. Cheap/high-volume alternative to IPQS
+    (1,000/day free). Returns a normalized dict (same shape as ipqs_lookup)."""
+    url = ("https://proxycheck.io/v2/" + quote(ip, safe="")
+           + "?key=" + quote(api_key, safe="") + "&vpn=1&asn=1&risk=1")
+    data = http_get_json(url, timeout)
+    if not isinstance(data, dict) or data.get("status") != "ok":
+        return None
+    rec = data.get(ip)
+    if not isinstance(rec, dict):
+        return None
+    ptype = rec.get("type") or ""
+    low = ptype.lower()
+    try:
+        risk = int(rec.get("risk")) if rec.get("risk") is not None else None
+    except (TypeError, ValueError):
+        risk = None
+    return {
+        "fraud_score": risk,                 # proxycheck 'risk' 0-100 ~ fraud
+        "connection_type": ptype,            # Residential/Wireless/Business/...
+        "proxy": rec.get("proxy") == "yes",
+        "vpn": "vpn" in low,
+        "tor": "tor" in low,
+        "recent_abuse": False,
+        "bot_status": False,
+        "isp": rec.get("provider", "") or rec.get("organisation", ""),
+        "country": rec.get("isocode", ""),
+    }
+
+
+# Supported IP-reputation providers. The key for each lives in settings.json
+# (entered on the Settings tab), never in code.
+QUALITY_PROVIDERS = {
+    "proxycheck.io": ("proxycheck_api_key", proxycheck_lookup),
+    "IPQualityScore": ("ipqs_api_key", ipqs_lookup),
+}
+
+
+def discover_exit_ip(proxy, timeout=DEFAULT_TIMEOUT, stop_event=None):
+    """Route through a proxy to learn its public exit IP (and latency). This is
+    the only step that touches your proxy credentials - they go to the proxy
+    server only, never to any reputation API."""
     host, port = proxy["host"], proxy["port"]
     user, pw = proxy["user"], proxy["pw"]
     display = (f"{host}:{port}:{user}:****" if user and pw is not None
                else f"{host}:{port}")
-    base = {"proxy": display, "exit_ip": "", "fraud": "", "type": "",
-            "flags": "", "blacklist": "", "ping": None, "trust": None,
-            "status": ""}
-
+    full = (f"{host}:{port}:{user}:{pw}" if user and pw is not None
+            else (f"{host}:{port}:{user}" if user else f"{host}:{port}"))
+    out = {"proxy": display, "full": full, "exit_ip": "", "ping": None,
+           "status": "stopped"}
     if stop_event is not None and stop_event.is_set():
-        return {**base, "status": "stopped"}
-
-    proxy_url = build_proxy_url(host, port, user, pw)
-    r = do_request(proxy_url, IPINFO_URL, timeout)
+        return out
+    r = do_request(build_proxy_url(host, port, user, pw), IPINFO_URL, timeout)
     if not r["ok"]:
-        return {**base, "status": response_label(r)}
-    exit_ip = _parse_json_field(r["body"], "ip")
-    if not exit_ip:
-        return {**base, "status": "no exit ip"}
+        return {**out, "status": response_label(r)}
+    ip = _parse_json_field(r["body"], "ip")
+    if not ip:
+        return {**out, "status": "no exit ip"}
+    return {**out, "exit_ip": ip, "ping": r["ms"], "status": "OK"}
 
-    q = {"latency_ms": r["ms"], "blacklisted": spamhaus_listed(exit_ip)}
-    if api_key:
-        q.update(ipqs_lookup(exit_ip, api_key, timeout) or {})
 
+def score_ip(ip, provider, api_key, timeout=DEFAULT_TIMEOUT):
+    """Score one exit IP: free Spamhaus check + the chosen provider (if a key is
+    set). Only the public IP is sent to the provider - never any credential."""
+    q = {"blacklisted": spamhaus_listed(ip)}
+    lookup = QUALITY_PROVIDERS.get(provider, (None, None))[1]
+    if api_key and lookup:
+        q.update(lookup(ip, api_key, timeout) or {})
+    return q
+
+
+def build_quality_row(disc, q, has_key):
+    """Combine an exit-IP discovery with its reputation score into a table row."""
+    display = disc["proxy"]
+    full = disc.get("full", display)
+    if disc["status"] != "OK":
+        return {"proxy": display, "full": full, "exit_ip": "", "fraud": "",
+                "type": "", "flags": "", "blacklist": "", "ping": None,
+                "trust": None, "status": disc["status"]}
+    q = dict(q)
+    q["latency_ms"] = disc["ping"]
     flags = [name for name, on in (
         ("abuse", q.get("recent_abuse")), ("bot", q.get("bot_status")),
         ("vpn", q.get("vpn")), ("tor", q.get("tor"))) if on]
@@ -527,12 +587,13 @@ def analyze_proxy_quality(proxy, api_key, timeout=DEFAULT_TIMEOUT,
     fs = q.get("fraud_score")
     return {
         "proxy": display,
-        "exit_ip": exit_ip,
+        "full": full,
+        "exit_ip": disc["exit_ip"],
         "fraud": "" if fs is None else str(fs),
-        "type": q.get("connection_type", "") or ("-" if api_key else "no key"),
+        "type": q.get("connection_type", "") or ("-" if has_key else "no key"),
         "flags": ",".join(flags),
         "blacklist": "listed" if bl is True else ("clean" if bl is False else "-"),
-        "ping": r["ms"],
+        "ping": disc["ping"],
         "trust": _trust_score(q),
         "status": "OK",
     }
@@ -612,6 +673,15 @@ def save_setting(key, value):
             json.dump(data, f, indent=2)
     except OSError:
         pass
+
+
+def get_workers():
+    """Parallel worker count (from Settings), clamped to a sane range."""
+    try:
+        n = int(load_setting("concurrency", DEFAULT_WORKERS))
+    except (TypeError, ValueError):
+        n = DEFAULT_WORKERS
+    return max(1, min(100, n))
 
 
 # --------------------------------------------------------------------------- #
@@ -1257,7 +1327,7 @@ class AsnTab(ttk.Frame):
 
     def _run_pool(self, host, port, username, password, asns, url, runs, provider):
         try:
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            with ThreadPoolExecutor(max_workers=get_workers()) as pool:
                 futures = {
                     pool.submit(test_asn, host, port, username, password,
                                 asn, url, runs, DEFAULT_TIMEOUT,
@@ -1467,7 +1537,7 @@ class ProxyTab(ttk.Frame):
 
     def _run_pool(self, proxies, url, runs):
         try:
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            with ThreadPoolExecutor(max_workers=get_workers()) as pool:
                 futures = {
                     pool.submit(test_proxy, p, url, runs, DEFAULT_TIMEOUT,
                                 self.stop_event): p
@@ -1793,6 +1863,8 @@ class QualityTab(ttk.Frame):
         self.running = False
         self.stop_event = threading.Event()
         self._rows = []
+        self._item_full = {}      # tree item id -> full host:port:user:pass
+        self._sort_dir = {}       # column -> current sort direction
         self._build()
 
     def _build(self):
@@ -1805,27 +1877,39 @@ class QualityTab(ttk.Frame):
         self.proxy_text.grid(row=1, column=0, rowspan=4, sticky="nw",
                              padx=(0, 24))
 
-        self.api_key = tk.StringVar(value=load_setting("ipqs_api_key", ""))
-        ttk.Label(form, text="IPQualityScore API key").grid(
+        self.provider = tk.StringVar(value=load_setting("quality_provider",
+                                                        "proxycheck.io"))
+        ttk.Label(form, text="Reputation provider").grid(
             row=1, column=1, sticky="w")
-        key_entry = ttk.Entry(form, textvariable=self.api_key, width=40,
-                              show="•")
-        key_entry.grid(row=1, column=2, sticky="w", pady=3)
-        reveal_on_focus(key_entry)
-        ttk.Label(form,
-                  text="blank = free Spamhaus + latency only (no fraud score)",
-                  style="Muted.TLabel").grid(row=2, column=1, columnspan=2,
-                                             sticky="w")
+        ttk.Combobox(form, textvariable=self.provider,
+                     values=list(QUALITY_PROVIDERS.keys()), width=20,
+                     state="readonly").grid(row=1, column=2, sticky="w", pady=3)
+        ttk.Label(
+            form,
+            text="API keys live in the Settings tab. No key = free Spamhaus "
+                 "+ latency only. Unique exit IPs are scored once (deduped).",
+            style="Muted.TLabel").grid(row=2, column=1, columnspan=2, sticky="w")
 
         btns = ttk.Frame(self)
         btns.pack(fill="x", pady=(12, 4))
         self.run_btn = ttk.Button(btns, text="Score", style="Accent.TButton",
                                   command=self.on_run)
         self.run_btn.pack(side="left")
+        ttk.Button(btns, text="Copy selected",
+                   command=self.on_copy_selected).pack(side="left", padx=8)
         ttk.Button(btns, text="Export CSV", command=self.on_export).pack(
-            side="left", padx=8)
+            side="left", padx=(0, 8))
+        ttk.Label(btns, text="Min trust").pack(side="left", padx=(8, 2))
+        self.min_trust = tk.StringVar(value="")
+        mt = ttk.Entry(btns, textvariable=self.min_trust, width=5)
+        mt.pack(side="left")
+        mt.bind("<Return>", lambda e: self._apply_filter())
+        ttk.Button(btns, text="Filter", command=self._apply_filter).pack(
+            side="left", padx=(4, 0))
         self.status_lbl = ttk.Label(btns, text="Idle", style="Muted.TLabel")
         self.status_lbl.pack(side="left", padx=12)
+        self.sel_lbl = ttk.Label(btns, text="", style="Muted.TLabel")
+        self.sel_lbl.pack(side="right")
 
         self.tree = ttk.Treeview(self, columns=self.COLUMNS,
                                  show="headings", height=12)
@@ -1841,10 +1925,12 @@ class QualityTab(ttk.Frame):
         }
         for col in self.COLUMNS:
             w, mw, st, anc = layout[col]
-            self.tree.heading(col, text=self.HEADINGS[col])
+            self.tree.heading(col, text=self.HEADINGS[col],
+                              command=lambda c=col: self._sort_by(c))
             self.tree.column(col, width=w, minwidth=mw, stretch=st, anchor=anc)
         tag_tree(self.tree)
         enable_drag_select(self.tree)
+        self.tree.bind("<<TreeviewSelect>>", self._update_sel_count)
         self.tree.pack(fill="both", expand=True, pady=(8, 0))
         vsb = ttk.Scrollbar(self.tree, orient="vertical",
                             command=self.tree.yview)
@@ -1862,8 +1948,10 @@ class QualityTab(ttk.Frame):
     def on_run(self):
         if self.running:
             return
-        api_key = self.api_key.get().strip()
-        save_setting("ipqs_api_key", api_key)
+        provider = self.provider.get()
+        save_setting("quality_provider", provider)
+        key_setting = QUALITY_PROVIDERS.get(provider, ("", None))[0]
+        api_key = load_setting(key_setting, "").strip() if key_setting else ""
         proxies, bad = [], 0
         for line in self.proxy_text.get("1.0", "end").splitlines():
             if not line.strip():
@@ -1883,11 +1971,11 @@ class QualityTab(ttk.Frame):
         self.stop_event.clear()
         self.run_btn.config(text="Stop", style="Stop.TButton",
                             command=self.on_stop)
-        note = "" if api_key else " (no key: Spamhaus + latency only)"
+        engine = provider if api_key else "no key (Spamhaus + latency)"
         self.status_lbl.config(
-            text=f"Scoring {len(proxies)} proxy(ies){note}...")
+            text=f"Resolving exit IPs for {len(proxies)} proxy(ies) [{engine}]...")
         worker = threading.Thread(target=self._run_pool,
-                                  args=(proxies, api_key), daemon=True)
+                                  args=(proxies, provider, api_key), daemon=True)
         worker.start()
         self.after(100, self._drain_queue)
 
@@ -1898,24 +1986,50 @@ class QualityTab(ttk.Frame):
         self.run_btn.config(state="disabled")
         self.status_lbl.config(text="Stopping...")
 
-    def _run_pool(self, proxies, api_key):
+    def _run_pool(self, proxies, provider, api_key):
+        """Phase 1: resolve each proxy's exit IP (concurrent). Phase 2: score
+        each UNIQUE exit IP once (dedupe -> fewer paid lookups). Then map the
+        score back onto every proxy that shares that exit IP."""
+        workers = get_workers()
         try:
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-                futures = {
-                    pool.submit(analyze_proxy_quality, p, api_key,
-                                DEFAULT_TIMEOUT, self.stop_event): p
-                    for p in proxies
-                }
-                for fut in futures:
+            discoveries = []
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futs = {pool.submit(discover_exit_ip, p, DEFAULT_TIMEOUT,
+                                    self.stop_event): p for p in proxies}
+                done = 0
+                for fut in futs:
                     try:
-                        result = fut.result()
+                        d = fut.result()
                     except Exception as e:
-                        p = futures[fut]
-                        result = {"proxy": f"{p['host']}:{p['port']}",
-                                  "exit_ip": "", "fraud": "", "type": "",
-                                  "flags": "", "blacklist": "", "ping": None,
-                                  "trust": None, "status": str(e)[:60]}
-                    self.queue.put(result)
+                        p = futs[fut]
+                        d = {"proxy": f"{p['host']}:{p['port']}", "exit_ip": "",
+                             "ping": None, "status": str(e)[:60]}
+                    discoveries.append(d)
+                    done += 1
+                    if done % 25 == 0:
+                        self.queue.put({"_status":
+                                        f"Resolved {done}/{len(proxies)} "
+                                        "exit IPs..."})
+
+            unique = sorted({d["exit_ip"] for d in discoveries if d["exit_ip"]})
+            self.queue.put({"_status": f"Scoring {len(unique)} unique IP(s) "
+                                       f"from {len(proxies)} proxies..."})
+            scores = {}
+            if not self.stop_event.is_set():
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futs = {pool.submit(score_ip, ip, provider, api_key,
+                                        DEFAULT_TIMEOUT): ip for ip in unique}
+                    for fut in futs:
+                        ip = futs[fut]
+                        try:
+                            scores[ip] = fut.result()
+                        except Exception:
+                            scores[ip] = {"blacklisted": None}
+
+            has_key = bool(api_key)
+            for d in discoveries:
+                self.queue.put(build_quality_row(
+                    d, scores.get(d["exit_ip"], {}), has_key))
         finally:
             self.queue.put({"_done": True})
 
@@ -1923,6 +2037,9 @@ class QualityTab(ttk.Frame):
         try:
             while True:
                 item = self.queue.get_nowait()
+                if item.get("_status"):
+                    self.status_lbl.config(text=item["_status"])
+                    continue
                 if item.get("_done"):
                     self._finish()
                     return
@@ -1948,9 +2065,11 @@ class QualityTab(ttk.Frame):
                     int(f) if f not in ("", None) else 999)
 
         self._rows.sort(key=sort_key)
+        self._item_full = {}
         for r in self._rows:
             self._insert_row(r)
         scored = sum(1 for r in self._rows if r.get("status") == "OK")
+        self._update_sel_count()
         self.status_lbl.config(
             text="Stopped" if stopped else f"Done - {scored} scored")
 
@@ -1963,15 +2082,142 @@ class QualityTab(ttk.Frame):
         return "warn" if t >= 50 else "bad"
 
     def _insert_row(self, r):
-        self.tree.insert("", "end", values=(
+        item = self.tree.insert("", "end", values=(
             r["proxy"], r["exit_ip"] or r.get("status", ""), r["fraud"],
             r["type"], r["flags"], r["blacklist"], _fmt_ms(r["ping"]),
             "" if r["trust"] is None else r["trust"],
         ), tags=(self._trust_tag(r),))
+        self._item_full[item] = r.get("full", "")
+
+    def _update_sel_count(self, _event=None):
+        n = len(self.tree.selection())
+        self.sel_lbl.config(text=f"{n} selected" if n else "")
+
+    def _apply_filter(self):
+        """Show only rows with Trust >= the entered threshold (blank = all)."""
+        raw = self.min_trust.get().strip()
+        try:
+            threshold = int(raw) if raw else None
+        except ValueError:
+            threshold = None
+        rows = self._rows
+        if threshold is not None:
+            rows = [r for r in rows if isinstance(r.get("trust"), int)
+                    and r["trust"] >= threshold]
+        self.tree.delete(*self.tree.get_children())
+        self._item_full = {}
+        for r in rows:
+            self._insert_row(r)
+        self._update_sel_count()
+        extra = f" (min trust {threshold})" if threshold is not None else ""
+        self.status_lbl.config(text=f"Showing {len(rows)} row(s){extra}")
+
+    def _sort_by(self, col):
+        """Sort the visible rows by a column (numeric when possible),
+        toggling direction each click. Click 'Trust' to rank by trust."""
+        items = [(self.tree.set(i, col), i) for i in self.tree.get_children("")]
+
+        def key(pair):
+            v = pair[0]
+            try:
+                return (0, float(v))
+            except ValueError:
+                return (1, v.lower())
+
+        rev = self._sort_dir.get(col, False)
+        items.sort(key=key, reverse=rev)
+        self._sort_dir[col] = not rev
+        for idx, (_, i) in enumerate(items):
+            self.tree.move(i, "", idx)
+
+    def on_copy_selected(self):
+        """Copy the highlighted proxies (full host:port:user:pass) to clipboard."""
+        lines = [self._item_full.get(i, "") for i in self.tree.selection()]
+        lines = [ln for ln in lines if ln]
+        if not lines:
+            self.status_lbl.config(text="No rows selected to copy.")
+            return
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(lines))
+        self.update_idletasks()
+        self.status_lbl.config(
+            text=f"Copied {len(lines)} proxy(ies) to clipboard.")
 
     def on_export(self):
         export_tree_csv(self.tree, self.COLUMNS,
                         [self.HEADINGS[c] for c in self.COLUMNS])
+
+
+class SettingsTab(ttk.Frame):
+    """Central place for API keys and performance. Keys are stored in
+    settings.json in your config dir (never hard-coded)."""
+
+    def __init__(self, master):
+        super().__init__(master, padding=20)
+        self._build()
+
+    def _build(self):
+        r = 0
+        ttk.Label(self, text="IP reputation API keys",
+                  style="Header.TLabel").grid(row=r, column=0, columnspan=2,
+                                              sticky="w", pady=(0, 4))
+        r += 1
+        ttk.Label(self,
+                  text="Used by the IP Quality tab. Only the public exit IP is "
+                       "ever sent to these - never your proxy credentials.",
+                  style="Muted.TLabel").grid(row=r, column=0, columnspan=2,
+                                             sticky="w", pady=(0, 12))
+        r += 1
+
+        self.ipqs = tk.StringVar(value=load_setting("ipqs_api_key", ""))
+        self.pcheck = tk.StringVar(value=load_setting("proxycheck_api_key", ""))
+        self.workers = tk.StringVar(value=str(get_workers()))
+
+        def key_row(label, var):
+            nonlocal r
+            ttk.Label(self, text=label).grid(row=r, column=0, sticky="w", pady=4)
+            e = ttk.Entry(self, textvariable=var, width=46, show="•")
+            e.grid(row=r, column=1, sticky="w", pady=4, padx=(10, 0))
+            reveal_on_focus(e)
+            r += 1
+
+        key_row("proxycheck.io key", self.pcheck)
+        key_row("IPQualityScore key", self.ipqs)
+
+        ttk.Separator(self, orient="horizontal").grid(
+            row=r, column=0, columnspan=2, sticky="ew", pady=14)
+        r += 1
+        ttk.Label(self, text="Performance", style="Header.TLabel").grid(
+            row=r, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        r += 1
+        ttk.Label(self, text="Concurrency (parallel workers, 1-100)").grid(
+            row=r, column=0, sticky="w", pady=4)
+        ttk.Entry(self, textvariable=self.workers, width=6).grid(
+            row=r, column=1, sticky="w", pady=4, padx=(10, 0))
+        r += 1
+        ttk.Label(self,
+                  text="Higher = faster on big lists (network-bound). Too high "
+                       "may trip a provider's rate limit. 20-40 is a good range.",
+                  style="Muted.TLabel").grid(row=r, column=0, columnspan=2,
+                                             sticky="w")
+        r += 1
+
+        ttk.Button(self, text="Save settings", style="Accent.TButton",
+                   command=self.on_save).grid(row=r, column=0, sticky="w",
+                                              pady=(16, 4))
+        self.status_lbl = ttk.Label(self, text="", style="Muted.TLabel")
+        self.status_lbl.grid(row=r, column=1, sticky="w", pady=(16, 4))
+
+    def on_save(self):
+        save_setting("ipqs_api_key", self.ipqs.get().strip())
+        save_setting("proxycheck_api_key", self.pcheck.get().strip())
+        try:
+            w = max(1, min(100, int(self.workers.get().strip())))
+        except (TypeError, ValueError):
+            w = DEFAULT_WORKERS
+        save_setting("concurrency", w)
+        self.workers.set(str(w))
+        self.status_lbl.config(text="Saved.")
 
 
 class ProfileBar(ttk.Frame):
@@ -2312,13 +2558,16 @@ def main():
     proxy_tab = ProxyTab(notebook)
     quality_tab = QualityTab(notebook)
     converter_tab = ConverterTab(notebook)
+    settings_tab = SettingsTab(notebook)
     notebook.add(asn_tab, text="ASN Tester")
     notebook.add(proxy_tab, text="Proxy Tester")
     notebook.add(quality_tab, text="IP Quality")
     notebook.add(converter_tab, text="Converter")
+    notebook.add(settings_tab, text="Settings")
 
-    bar = ProfileBar(root, store,
-                     {"asn": asn_tab, "proxy": proxy_tab, "quality": quality_tab})
+    # The top Profile bar covers the testing-credential tabs. The IP Quality
+    # tab is driven by the Settings tab (API keys), kept deliberately separate.
+    bar = ProfileBar(root, store, {"asn": asn_tab, "proxy": proxy_tab})
     bar.pack(fill="x")
     notebook.pack(fill="both", expand=True, padx=12, pady=(4, 12))
 
