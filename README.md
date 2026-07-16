@@ -11,14 +11,21 @@ A barebones Windows GUI tool for testing proxies. Written in Python with the
 **standard library only** (tkinter) so the packaged `.exe` has zero external
 runtime dependencies and never shells out to `curl`.
 
-Three tabs:
+Four tabs:
 
 1. **ASN Tester (Oxylabs mobile)** — targets specific carrier ASNs and reports
    which carrier you actually landed on.
 2. **Proxy Tester (general)** — plain reachability + latency testing for any
    list of proxies against any URL.
-3. **Converter** — paste any provider proxy format (full URLs, Python snippets,
-   `user:pass@host:port`) and get copy-ready `host:port:user:pass` lines.
+3. **IP Quality** — scores each proxy's exit-IP reputation into a single
+   **Trust** score. Uses [IPQualityScore](https://www.ipqualityscore.com/)
+   (paste your API key) for fraud score / connection type (residential ·
+   mobile · datacenter) / recent-abuse & bot flags, plus a free **Spamhaus**
+   blocklist check (no key needed) and your latency. Results sort best-first so
+   you can keep the cleanest IPs.
+4. **Converter** — paste any provider proxy format (full URLs, Python snippets,
+   `user:pass@host:port`, `host,port,user,pass`) and get copy-ready
+   `host:port:user:pass` lines.
 
 Features: a classified **ASN catalog** you filter by type
 (Mobile / Residential / Business / Datacenter, plus a "Strict only" toggle that
