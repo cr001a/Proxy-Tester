@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.16"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.17"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -663,6 +663,26 @@ def build_quality_row(disc, q, has_key):
 def _config_dir():
     base = os.environ.get("APPDATA") or os.path.expanduser("~")
     return os.path.join(base, "ProxyTester")
+
+
+def _install_dir():
+    """Folder the app runs from: next to the .exe when frozen, else the source."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _exports_dir():
+    """An 'exports' folder inside the install dir; created on demand. Falls back
+    to the config dir if the install dir isn't writable."""
+    for base in (_install_dir(), _config_dir()):
+        path = os.path.join(base, "exports")
+        try:
+            os.makedirs(path, exist_ok=True)
+            return path
+        except OSError:
+            continue
+    return _install_dir()
 
 
 class ProfileStore:
@@ -1800,6 +1820,23 @@ def show_output_popup(parent, title, text, shuffle=False):
     box.focus_set()
 
 
+def _reveal_in_folder(path):
+    """Open the containing folder, selecting the file where the OS supports it."""
+    folder = os.path.dirname(path) or "."
+    try:
+        if os.name == "nt":
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", path])
+        else:
+            subprocess.Popen(["xdg-open", folder])
+    except Exception:
+        try:
+            os.startfile(folder)     # Windows fallback
+        except Exception:
+            pass
+
+
 def export_tree_csv(tree, columns, headings):
     rows = tree.get_children()
     if not rows:
@@ -1808,7 +1845,9 @@ def export_tree_csv(tree, columns, headings):
     path = filedialog.asksaveasfilename(
         defaultextension=".csv",
         filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-        title="Export results to CSV")
+        title="Export results to CSV",
+        initialdir=_exports_dir(),
+        initialfile="proxytester_results.csv")
     if not path:
         return
     try:
@@ -1820,7 +1859,7 @@ def export_tree_csv(tree, columns, headings):
     except OSError as e:
         messagebox.showerror("Export CSV", f"Could not write file:\n{e}")
         return
-    messagebox.showinfo("Export CSV", f"Exported {len(rows)} row(s) to:\n{path}")
+    _reveal_in_folder(path)          # pop the folder open with the file selected
 
 
 class ConverterTab(ttk.Frame):
@@ -2565,7 +2604,9 @@ def _download_and_apply(parent, url, tag):
             "timeout /t 2 /nobreak >nul\r\n"
             "set n=0\r\n"
             ":retry\r\n"
+            # /XD exports: never delete the user's exported CSVs on update.
             f'robocopy "{src}" "{install_dir}" /MIR /R:15 /W:1 '
+            f'/XD "{os.path.join(install_dir, "exports")}" '
             "/NFL /NDL /NJH /NJS /NC /NS /NP >nul\r\n"
             "if errorlevel 8 if %n% lss 20 "
             "(set /a n+=1 & timeout /t 1 /nobreak >nul & goto retry)\r\n"
