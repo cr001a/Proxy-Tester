@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.13"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.14"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -413,10 +413,13 @@ def _fmt_ms(value):
 IPINFO_URL = "https://ipinfo.io/json"
 
 
-def http_get_json(url, timeout=DEFAULT_TIMEOUT):
+def http_get_json(url, timeout=DEFAULT_TIMEOUT, extra_headers=None):
     """Direct (no-proxy) HTTPS GET returning parsed JSON, or None on any error."""
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        headers = {"User-Agent": USER_AGENT}
+        if extra_headers:
+            headers.update(extra_headers)
+        req = urllib.request.Request(url, headers=headers)
         opener = (urllib.request.build_opener(
             urllib.request.HTTPSHandler(context=SSL_CTX)) if SSL_CTX
             else urllib.request.build_opener())
@@ -529,10 +532,54 @@ def proxycheck_lookup(ip, api_key, timeout=DEFAULT_TIMEOUT):
     }
 
 
+def spur_lookup(ip, token, timeout=DEFAULT_TIMEOUT):
+    """Query Spur's Context API (api.spur.us) - the residential-proxy specialist.
+    Auth is a `Token` header. Spur gives no 0-100 score, so we synthesize one
+    from whether it detects anonymization (tunnels / client proxies / risks)."""
+    data = http_get_json("https://api.spur.us/v2/context/" + quote(ip, safe=""),
+                         timeout, extra_headers={"Token": token})
+    if not isinstance(data, dict):
+        return None
+    infra = (data.get("infrastructure") or "").upper()
+    tunnels = data.get("tunnels") if isinstance(data.get("tunnels"), list) else []
+    risks = data.get("risks") if isinstance(data.get("risks"), list) else []
+    client = data.get("client") if isinstance(data.get("client"), dict) else {}
+    client_proxies = (client.get("proxies")
+                      if isinstance(client.get("proxies"), list) else [])
+    risk_txt = " ".join(str(r) for r in risks).upper()
+
+    anon = bool(tunnels) or bool(client_proxies) or "TUNNEL" in risk_txt \
+        or "PROXY" in risk_txt
+    if anon:
+        fraud = 90                       # Spur sees anonymization -> burnt
+    elif "DATACENTER" in infra:
+        fraud = 60
+    else:
+        fraud = 5                        # clean residential/mobile, no tunnel
+    is_vpn = any(isinstance(t, dict) and str(t.get("type", "")).upper() == "VPN"
+                 for t in tunnels)
+    conn = infra.title() if infra else ("Proxy" if anon else "Residential")
+    org = data.get("organization", "")
+    if not org and isinstance(data.get("as"), dict):
+        org = data["as"].get("organization", "")
+    return {
+        "fraud_score": fraud,
+        "connection_type": conn,        # Datacenter / Mobile / Residential
+        "proxy": anon,
+        "vpn": is_vpn,
+        "tor": "TOR" in risk_txt,
+        "recent_abuse": anon,
+        "bot_status": ("SCRAP" in risk_txt or "BOT" in risk_txt),
+        "isp": org,
+        "country": (data.get("location") or {}).get("country", ""),
+    }
+
+
 # Supported IP-reputation providers. The key for each lives in settings.json
 # (entered on the Settings tab), never in code.
 QUALITY_PROVIDERS = {
     "proxycheck.io": ("proxycheck_api_key", proxycheck_lookup),
+    "Spur": ("spur_api_token", spur_lookup),
     "IPQualityScore": ("ipqs_api_key", ipqs_lookup),
 }
 
@@ -1991,6 +2038,7 @@ class QualityTab(ttk.Frame):
         each UNIQUE exit IP once (dedupe -> fewer paid lookups). Then map the
         score back onto every proxy that shares that exit IP."""
         workers = get_workers()
+        resolved = unique_n = 0
         try:
             discoveries = []
             with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -2012,8 +2060,11 @@ class QualityTab(ttk.Frame):
                                         "exit IPs..."})
 
             unique = sorted({d["exit_ip"] for d in discoveries if d["exit_ip"]})
-            self.queue.put({"_status": f"Scoring {len(unique)} unique IP(s) "
-                                       f"from {len(proxies)} proxies..."})
+            unique_n = len(unique)
+            resolved = sum(1 for d in discoveries if d["exit_ip"])
+            self.queue.put({"_status": f"Scoring {unique_n} unique IP(s) from "
+                                       f"{resolved} live proxies "
+                                       f"({resolved - unique_n} deduped)..."})
             scores = {}
             if not self.stop_event.is_set():
                 with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -2031,7 +2082,8 @@ class QualityTab(ttk.Frame):
                 self.queue.put(build_quality_row(
                     d, scores.get(d["exit_ip"], {}), has_key))
         finally:
-            self.queue.put({"_done": True})
+            self.queue.put({"_done": True, "resolved": resolved,
+                            "unique": unique_n})
 
     def _drain_queue(self):
         try:
@@ -2041,7 +2093,7 @@ class QualityTab(ttk.Frame):
                     self.status_lbl.config(text=item["_status"])
                     continue
                 if item.get("_done"):
-                    self._finish()
+                    self._finish(item)
                     return
                 self._rows.append(item)
         except queue.Empty:
@@ -2049,7 +2101,8 @@ class QualityTab(ttk.Frame):
         if self.running:
             self.after(100, self._drain_queue)
 
-    def _finish(self):
+    def _finish(self, info=None):
+        info = info or {}
         stopped = self.stop_event.is_set()
         self.running = False
         self.run_btn.config(text="Score", style="Accent.TButton",
@@ -2070,8 +2123,13 @@ class QualityTab(ttk.Frame):
             self._insert_row(r)
         scored = sum(1 for r in self._rows if r.get("status") == "OK")
         self._update_sel_count()
+        dedup = ""
+        if "resolved" in info:
+            deduped = info["resolved"] - info.get("unique", info["resolved"])
+            dedup = (f", {info.get('unique', 0)} unique exit IPs "
+                     f"({deduped} deduped)")
         self.status_lbl.config(
-            text="Stopped" if stopped else f"Done - {scored} scored")
+            text="Stopped" if stopped else f"Done - {scored} scored{dedup}")
 
     def _trust_tag(self, r):
         if r.get("status") != "OK" or r.get("trust") is None:
@@ -2171,6 +2229,7 @@ class SettingsTab(ttk.Frame):
 
         self.ipqs = tk.StringVar(value=load_setting("ipqs_api_key", ""))
         self.pcheck = tk.StringVar(value=load_setting("proxycheck_api_key", ""))
+        self.spur = tk.StringVar(value=load_setting("spur_api_token", ""))
         self.workers = tk.StringVar(value=str(get_workers()))
 
         def key_row(label, var):
@@ -2182,6 +2241,7 @@ class SettingsTab(ttk.Frame):
             r += 1
 
         key_row("proxycheck.io key", self.pcheck)
+        key_row("Spur token (Context API)", self.spur)
         key_row("IPQualityScore key", self.ipqs)
 
         ttk.Separator(self, orient="horizontal").grid(
@@ -2211,6 +2271,7 @@ class SettingsTab(ttk.Frame):
     def on_save(self):
         save_setting("ipqs_api_key", self.ipqs.get().strip())
         save_setting("proxycheck_api_key", self.pcheck.get().strip())
+        save_setting("spur_api_token", self.spur.get().strip())
         try:
             w = max(1, min(100, int(self.workers.get().strip())))
         except (TypeError, ValueError):
