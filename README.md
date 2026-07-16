@@ -72,13 +72,20 @@ Adding a new provider later is a one-function change in `PROVIDERS`
 (`proxy_tester.py`) — tell me the provider's username format and I'll wire it in
 as another dropdown option.
 
-### Profiles
+### Saved credentials
 
-Type a name in the **Profile** box (top bar) and click **Save** to store the
-current inputs of both testing tabs; pick it from the dropdown next launch to
-reload everything. Profiles are saved to `%APPDATA%\ProxyTester\profiles.json`.
-Note: credentials (including passwords) are stored there in **plain text** on
-your own machine — fine for local use, but don't sync that file anywhere public.
+Provider logins live on the **Settings** tab, one box per provider as
+`username:password`:
+
+- **Oxylabs Mobile** — auto-fills the ASN Tester's Username/Password on launch
+  (and the moment you click **Save settings**), so your mobile login persists
+  between sessions.
+- **Oxylabs Residential** and **IPRoyal** — feed the **Generate batch** dialog;
+  a provider only appears in that dropdown once its box is filled in.
+
+Settings are saved to `%APPDATA%\ProxyTester\settings.json`. Credentials
+(including passwords) are stored there in **plain text** on your own machine —
+fine for local use, but don't sync that file anywhere public.
 
 ---
 

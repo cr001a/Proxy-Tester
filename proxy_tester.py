@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.34"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.35"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -836,6 +836,34 @@ def get_workers():
     return max(1, min(100, n))
 
 
+def split_creds(value):
+    """Split a 'user:pass' string into (user, pass) on the FIRST colon, so a
+    password containing colons stays intact. Returns ('', '') if empty."""
+    value = (value or "").strip()
+    if ":" in value:
+        u, p = value.split(":", 1)
+        return u.strip(), p.strip()
+    return value, ""
+
+
+def load_provider_creds(key, legacy=None):
+    """A provider's (user, pass). Prefers the combined 'user:pass' stored under
+    `key`; falls back to legacy (user_key, pass_key) settings for migration."""
+    combined = load_setting(key, "").strip()
+    if combined:
+        return split_creds(combined)
+    if legacy:
+        return (load_setting(legacy[0], "").strip(),
+                load_setting(legacy[1], "").strip())
+    return "", ""
+
+
+def provider_creds_display(key, legacy=None):
+    """The 'user:pass' string to prefill a Settings box (migrates legacy)."""
+    u, p = load_provider_creds(key, legacy)
+    return f"{u}:{p}" if (u or p) else ""
+
+
 # --------------------------------------------------------------------------- #
 # Provider rules
 # --------------------------------------------------------------------------- #
@@ -918,14 +946,17 @@ def _build_iproyal_resi(user, pw, state, city, lifetime, sessid):
     return f"geo.iproyal.com:12321:{user}:{p}"
 
 
-# Residential providers for the batch generator. user_key/pass_key -> settings.
+# Residential providers for the batch generator. `key` -> a combined
+# 'user:pass' setting; `legacy` -> the old split keys, kept for migration.
 RESI_PROVIDERS = {
     "Oxylabs Residential": {
-        "user_key": "oxylabs_resi_user", "pass_key": "oxylabs_resi_pass",
+        "key": "oxylabs_resi",
+        "legacy": ("oxylabs_resi_user", "oxylabs_resi_pass"),
         "build": _build_oxylabs_resi,
     },
     "IPRoyal": {
-        "user_key": "iproyal_user", "pass_key": "iproyal_pass",
+        "key": "iproyal",
+        "legacy": ("iproyal_user", "iproyal_pass"),
         "build": _build_iproyal_resi,
     },
 }
@@ -933,9 +964,12 @@ RESI_PROVIDERS = {
 
 def configured_resi_providers():
     """Providers that have both a username and password saved in settings."""
-    return [name for name, spec in RESI_PROVIDERS.items()
-            if load_setting(spec["user_key"], "").strip()
-            and load_setting(spec["pass_key"], "").strip()]
+    out = []
+    for name, spec in RESI_PROVIDERS.items():
+        u, p = load_provider_creds(spec["key"], spec.get("legacy"))
+        if u and p:
+            out.append(name)
+    return out
 
 
 def _canon(name):
@@ -981,10 +1015,9 @@ def generate_resi_batch(provider, region_type, regions, lifetime, count,
     spec = RESI_PROVIDERS.get(provider)
     if not spec:
         return [], f"Unknown provider: {provider}"
-    user = load_setting(spec["user_key"], "").strip()
-    pw = load_setting(spec["pass_key"], "").strip()
+    user, pw = load_provider_creds(spec["key"], spec.get("legacy"))
     if not user or not pw:
-        return [], f"Add {provider} username/password on the Settings tab first."
+        return [], f"Add {provider} username:password on the Settings tab first."
     targets = regions if (region_type in ("State", "City") and regions) else [""]
     lines = []
     for i in range(count):
@@ -1392,10 +1425,11 @@ class AsnTab(ttk.Frame):
         form = ttk.Frame(self)
         form.pack(fill="x")
 
+        _mu, _mp = load_provider_creds("oxylabs_mobile")
         self.host = tk.StringVar(value="pr.oxylabs.io")
         self.port = tk.StringVar(value="7777")
-        self.username = tk.StringVar()
-        self.password = tk.StringVar()
+        self.username = tk.StringVar(value=_mu)
+        self.password = tk.StringVar(value=_mp)
         self.url = tk.StringVar(value="https://ipinfo.io/json")
         self.runs = tk.StringVar(value="5")
         self.provider = tk.StringVar(value="Oxylabs")
@@ -1650,6 +1684,18 @@ class AsnTab(ttk.Frame):
         failed = total - len(found) - dup - invalid
         self.add_status.config(
             text=self._add_summary(total, len(found), dup, failed, invalid))
+
+    def load_mobile_creds(self):
+        """Fill Username/Password from the Oxylabs mobile creds saved in
+        Settings. Called after Save so newly-entered creds sync into this tab
+        without a restart (only while the provider is Oxylabs)."""
+        if self.provider.get() != "Oxylabs":
+            return
+        u, p = load_provider_creds("oxylabs_mobile")
+        if u:
+            self.username.set(u)
+        if p:
+            self.password.set(p)
 
     # --- profile state ---
     def get_state(self):
@@ -2993,8 +3039,9 @@ class SettingsTab(ttk.Frame):
     """Central place for API keys and performance. Keys are stored in
     settings.json in your config dir (never hard-coded)."""
 
-    def __init__(self, master):
+    def __init__(self, master, on_saved=None):
         super().__init__(master)
+        self._on_saved = on_saved
         # The Settings content is taller than the window, so host it in a
         # scrollable canvas - otherwise the Save button falls off the bottom.
         self._canvas = tk.Canvas(self, highlightthickness=0, bg=BASE,
@@ -3069,30 +3116,29 @@ class SettingsTab(ttk.Frame):
                                               sticky="w", pady=(0, 4))
         r += 1
         ttk.Label(host,
-                  text="Used by 'Generate batch'. Providers you fill in here "
-                       "appear in the generator's dropdown.",
+                  text="One box per provider, as username:password. Oxylabs "
+                       "Mobile fills the ASN Tester login; Residential / IPRoyal "
+                       "feed 'Generate batch'.",
                   style="Muted.TLabel").grid(row=r, column=0, columnspan=2,
                                              sticky="w", pady=(0, 8))
         r += 1
-        self.oxy_user = tk.StringVar(value=load_setting("oxylabs_resi_user", ""))
-        self.oxy_pass = tk.StringVar(value=load_setting("oxylabs_resi_pass", ""))
-        self.ipr_user = tk.StringVar(value=load_setting("iproyal_user", ""))
-        self.ipr_pass = tk.StringVar(value=load_setting("iproyal_pass", ""))
+        self.oxy_mobile = tk.StringVar(
+            value=provider_creds_display("oxylabs_mobile"))
+        self.oxy_resi = tk.StringVar(value=provider_creds_display(
+            "oxylabs_resi", ("oxylabs_resi_user", "oxylabs_resi_pass")))
+        self.ipr = tk.StringVar(value=provider_creds_display(
+            "iproyal", ("iproyal_user", "iproyal_pass")))
 
-        def cred_row(label, var, secret=False):
+        def cred_row(label, var):
             nonlocal r
             ttk.Label(host, text=label).grid(row=r, column=0, sticky="w", pady=3)
-            e = ttk.Entry(host, textvariable=var, width=46,
-                          show="•" if secret else "")
-            e.grid(row=r, column=1, sticky="w", pady=3, padx=(10, 0))
-            if secret:
-                reveal_on_focus(e)
+            ttk.Entry(host, textvariable=var, width=46).grid(
+                row=r, column=1, sticky="w", pady=3, padx=(10, 0))
             r += 1
 
-        cred_row("Oxylabs Residential username", self.oxy_user)
-        cred_row("Oxylabs Residential password", self.oxy_pass, secret=True)
-        cred_row("IPRoyal username", self.ipr_user)
-        cred_row("IPRoyal password", self.ipr_pass, secret=True)
+        cred_row("Oxylabs Mobile (username:password)", self.oxy_mobile)
+        cred_row("Oxylabs Residential (username:password)", self.oxy_resi)
+        cred_row("IPRoyal (username:password)", self.ipr)
 
         ttk.Separator(host, orient="horizontal").grid(
             row=r, column=0, columnspan=2, sticky="ew", pady=14)
@@ -3122,10 +3168,9 @@ class SettingsTab(ttk.Frame):
         save_setting("ipqs_api_key", self.ipqs.get().strip())
         save_setting("proxycheck_api_key", self.pcheck.get().strip())
         save_setting("spur_api_token", self.spur.get().strip())
-        save_setting("oxylabs_resi_user", self.oxy_user.get().strip())
-        save_setting("oxylabs_resi_pass", self.oxy_pass.get().strip())
-        save_setting("iproyal_user", self.ipr_user.get().strip())
-        save_setting("iproyal_pass", self.ipr_pass.get().strip())
+        save_setting("oxylabs_mobile", self.oxy_mobile.get().strip())
+        save_setting("oxylabs_resi", self.oxy_resi.get().strip())
+        save_setting("iproyal", self.ipr.get().strip())
         try:
             w = max(1, min(100, int(self.workers.get().strip())))
         except (TypeError, ValueError):
@@ -3133,6 +3178,8 @@ class SettingsTab(ttk.Frame):
         save_setting("concurrency", w)
         self.workers.set(str(w))
         self.status_lbl.config(text="Saved.")
+        if self._on_saved:
+            self._on_saved()
 
 
 class HeaderBar(ttk.Frame):
@@ -3425,7 +3472,7 @@ def main():
     proxy_tab = ProxyTab(notebook)
     quality_tab = QualityTab(notebook)
     converter_tab = ConverterTab(notebook)
-    settings_tab = SettingsTab(notebook)
+    settings_tab = SettingsTab(notebook, on_saved=asn_tab.load_mobile_creds)
     notebook.add(asn_tab, text="ASN Tester")
     notebook.add(proxy_tab, text="Proxy Tester")
     notebook.add(quality_tab, text="IP Quality")
