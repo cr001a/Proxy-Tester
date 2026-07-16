@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.31"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.32"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1373,9 +1373,10 @@ class AsnTab(ttk.Frame):
         self.strict_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(frow2, text="Strict only", variable=self.strict_var,
                         command=self._refilter_asns).pack(side="left")
-        ttk.Label(frow2, text="search").pack(side="left", padx=(12, 4))
+        ttk.Label(frow2, text="search (comma-sep)").pack(
+            side="left", padx=(12, 4))
         self.search_var = tk.StringVar()
-        ttk.Entry(frow2, textvariable=self.search_var, width=14).pack(
+        ttk.Entry(frow2, textvariable=self.search_var, width=20).pack(
             side="left")
         self.search_var.trace_add("write", lambda *a: self._refilter_asns())
 
@@ -1466,7 +1467,10 @@ class AsnTab(ttk.Frame):
         """Rebuild the ASN list from the active category/strict/search filters."""
         cats = {c for c, v in self.filter_vars.items() if v.get()}
         strict_only = self.strict_var.get()
-        q = self.search_var.get().strip().lower()
+        # Search accepts several terms separated by commas or spaces; a row
+        # matches if ANY term is found in its ASN number or provider name.
+        terms = [t for t in re.split(r"[\s,]+",
+                                     self.search_var.get().strip().lower()) if t]
         self.asn_list.delete(0, "end")
         self._visible_asns = []
         for asn, name, cat, strict in all_asns():
@@ -1474,7 +1478,7 @@ class AsnTab(ttk.Frame):
                 continue
             if strict_only and not strict:
                 continue
-            if q and q not in asn and q not in name.lower():
+            if terms and not any(t in asn or t in name.lower() for t in terms):
                 continue
             label = f"{asn}  -  {name}  [{cat}]"
             if cat == "residential" and not strict:
