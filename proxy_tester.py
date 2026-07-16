@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.25"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.26"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -108,6 +108,8 @@ def apply_theme(root):
     style.configure("Muted.TLabel", background=BASE, foreground=SUBTEXT)
     style.configure("Header.TLabel", background=BASE, foreground=MAUVE,
                     font=(UI_FONT + " Semibold", 15))
+    style.configure("Warn.TLabel", background=BASE, foreground=YELLOW,
+                    font=(UI_FONT + " Semibold", 11))
 
     style.configure("TButton", background=SURFACE, foreground=TEXT,
                     bordercolor=SURFACE2, focuscolor=BASE, padding=(12, 6),
@@ -2674,6 +2676,12 @@ class SettingsTab(ttk.Frame):
 
     def _build(self):
         r = 0
+        ttk.Label(self,
+                  text="⚠  Changes on this tab only take effect after you click "
+                       "“Save settings” at the bottom.",
+                  style="Warn.TLabel").grid(row=r, column=0, columnspan=2,
+                                            sticky="w", pady=(0, 14))
+        r += 1
         ttk.Label(self, text="IP reputation API keys",
                   style="Header.TLabel").grid(row=r, column=0, columnspan=2,
                                               sticky="w", pady=(0, 4))
