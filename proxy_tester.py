@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.36"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.37"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -487,8 +487,10 @@ def ping_site(name, target, runs, timeout=DEFAULT_TIMEOUT, stop_event=None):
 IPINFO_URL = "https://ipinfo.io/json"
 
 
-def http_get_json(url, timeout=DEFAULT_TIMEOUT, extra_headers=None):
-    """Direct (no-proxy) HTTPS GET returning parsed JSON, or None on any error."""
+def http_get_json_ex(url, timeout=DEFAULT_TIMEOUT, extra_headers=None):
+    """Direct (no-proxy) HTTPS GET. Returns (data_or_None, error_or_None) where
+    error is a short human string so callers can tell WHY it failed: 'HTTP 401'
+    (bad/expired key), 'HTTP 429' (rate limited), 'timeout', 'bad json', etc."""
     try:
         headers = {"User-Agent": USER_AGENT}
         if extra_headers:
@@ -498,9 +500,22 @@ def http_get_json(url, timeout=DEFAULT_TIMEOUT, extra_headers=None):
             urllib.request.HTTPSHandler(context=SSL_CTX)) if SSL_CTX
             else urllib.request.build_opener())
         with opener.open(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8", "replace"))
+            raw = resp.read().decode("utf-8", "replace")
+        try:
+            return json.loads(raw), None
+        except ValueError:
+            return None, "bad json"
+    except urllib.error.HTTPError as e:
+        return None, f"HTTP {e.code}"
+    except socket.timeout:
+        return None, "timeout"
     except Exception:
-        return None
+        return None, "network"
+
+
+def http_get_json(url, timeout=DEFAULT_TIMEOUT, extra_headers=None):
+    """Direct (no-proxy) HTTPS GET returning parsed JSON, or None on any error."""
+    return http_get_json_ex(url, timeout, extra_headers)[0]
 
 
 def spamhaus_listed(ip):
@@ -610,10 +625,11 @@ def spur_lookup(ip, token, timeout=DEFAULT_TIMEOUT):
     """Query Spur's Context API (api.spur.us) - the residential-proxy specialist.
     Auth is a `Token` header. Spur gives no 0-100 score, so we synthesize one
     from whether it detects anonymization (tunnels / client proxies / risks)."""
-    data = http_get_json("https://api.spur.us/v2/context/" + quote(ip, safe=""),
-                         timeout, extra_headers={"Token": token})
-    if not isinstance(data, dict):
-        return None
+    data, err = http_get_json_ex(
+        "https://api.spur.us/v2/context/" + quote(ip, safe=""),
+        timeout, extra_headers={"Token": token})
+    if err or not isinstance(data, dict):
+        return {"_error": f"Spur: {err or 'no data'}"}
     infra = (data.get("infrastructure") or "").upper()
     tunnels = data.get("tunnels") if isinstance(data.get("tunnels"), list) else []
     risks = data.get("risks") if isinstance(data.get("risks"), list) else []
@@ -717,12 +733,14 @@ def build_quality_row(disc, q, has_key):
     flags += [f for f in (q.get("flag_extra") or []) if f and f not in flags]
     bl = q.get("blacklisted")
     fs = q.get("fraud_score")
+    err = q.get("_error")
     return {
         "proxy": display,
         "full": full,
         "exit_ip": disc["exit_ip"],
         "fraud": "" if fs is None else str(fs),
-        "type": q.get("connection_type", "") or ("-" if has_key else "no key"),
+        "type": (q.get("connection_type", "")
+                 or (err if err else ("-" if has_key else "no key"))),
         "flags": ",".join(flags),
         "blacklist": "listed" if bl is True else ("clean" if bl is False else "-"),
         "ping": disc["ping"],
@@ -2780,6 +2798,7 @@ class QualityTab(ttk.Frame):
         score back onto every proxy that shares that exit IP."""
         workers = get_workers()
         resolved = unique_n = 0
+        provider_err, err_ct = "", 0
         try:
             discoveries = []
             with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -2818,13 +2837,18 @@ class QualityTab(ttk.Frame):
                         except Exception:
                             scores[ip] = {"blacklisted": None}
 
+            for q in scores.values():
+                if q.get("_error"):
+                    err_ct += 1
+                    provider_err = q["_error"]
             has_key = bool(api_key)
             for d in discoveries:
                 self.queue.put(build_quality_row(
                     d, scores.get(d["exit_ip"], {}), has_key))
         finally:
             self.queue.put({"_done": True, "resolved": resolved,
-                            "unique": unique_n})
+                            "unique": unique_n, "provider_err": provider_err,
+                            "err_ct": err_ct})
 
     def _drain_queue(self):
         try:
@@ -2865,8 +2889,21 @@ class QualityTab(ttk.Frame):
             deduped = info["resolved"] - info.get("unique", info["resolved"])
             dedup = (f", {info.get('unique', 0)} unique exit IPs "
                      f"({deduped} deduped)")
+        # Loud provider-error banner: if the reputation API rejected every
+        # lookup (bad/expired key, rate limit), say so instead of leaving a
+        # silent wall of Trust 50.
+        err_note = ""
+        if info.get("err_ct") and info.get("provider_err"):
+            hint = ""
+            if "401" in info["provider_err"] or "403" in info["provider_err"]:
+                hint = " - check the key/token in Settings"
+            elif "429" in info["provider_err"]:
+                hint = " - rate limited, slow down or wait"
+            err_note = (f"  |  {info['provider_err']} on {info['err_ct']} "
+                        f"IP(s){hint}")
         # Persistent summary so filtering never wipes the scored/dedupe counts.
-        self._summary = "Stopped" if stopped else f"Done - {scored} scored{dedup}"
+        self._summary = ("Stopped" if stopped
+                         else f"Done - {scored} scored{dedup}{err_note}")
         self._trust_buckets = set()       # a fresh run clears prior filters
         self._type_filter = set()
         self._render_rows()
@@ -3085,10 +3122,10 @@ class SettingsTab(ttk.Frame):
         host = self.inner
         r = 0
         ttk.Label(host,
-                  text="Reminder: changes on this tab only take effect after you "
-                       "click 'Save settings' at the bottom.",
-                  style="Warn.TLabel").grid(row=r, column=0, columnspan=2,
-                                            sticky="w", pady=(0, 14))
+                  text="Changes save automatically as you type - no need to "
+                       "click anything.",
+                  style="Muted.TLabel").grid(row=r, column=0, columnspan=2,
+                                             sticky="w", pady=(0, 14))
         r += 1
         ttk.Label(host, text="IP reputation API keys",
                   style="Header.TLabel").grid(row=r, column=0, columnspan=2,
@@ -3112,6 +3149,7 @@ class SettingsTab(ttk.Frame):
             e = ttk.Entry(host, textvariable=var, width=46, show="•")
             e.grid(row=r, column=1, sticky="w", pady=4, padx=(10, 0))
             reveal_on_focus(e)
+            e.bind("<FocusOut>", lambda _e: self._persist(), add="+")
             r += 1
 
         key_row("proxycheck.io key", self.pcheck)
@@ -3142,8 +3180,9 @@ class SettingsTab(ttk.Frame):
         def cred_row(label, var):
             nonlocal r
             ttk.Label(host, text=label).grid(row=r, column=0, sticky="w", pady=3)
-            ttk.Entry(host, textvariable=var, width=46).grid(
-                row=r, column=1, sticky="w", pady=3, padx=(10, 0))
+            e = ttk.Entry(host, textvariable=var, width=46)
+            e.grid(row=r, column=1, sticky="w", pady=3, padx=(10, 0))
+            e.bind("<FocusOut>", lambda _e: self._persist(), add="+")
             r += 1
 
         cred_row("Oxylabs Mobile (username:password)", self.oxy_mobile)
@@ -3158,9 +3197,16 @@ class SettingsTab(ttk.Frame):
         r += 1
         ttk.Label(host, text="Concurrency (parallel workers, 1-100)").grid(
             row=r, column=0, sticky="w", pady=4)
-        ttk.Entry(host, textvariable=self.workers, width=6).grid(
-            row=r, column=1, sticky="w", pady=4, padx=(10, 0))
+        wkr = ttk.Entry(host, textvariable=self.workers, width=6)
+        wkr.grid(row=r, column=1, sticky="w", pady=4, padx=(10, 0))
+        wkr.bind("<FocusOut>", lambda _e: self._persist(), add="+")
         r += 1
+
+        # Auto-save: any edit persists after a short debounce, so a forgotten
+        # click on 'Save settings' can never silently drop a key again.
+        for _v in (self.ipqs, self.pcheck, self.spur, self.oxy_mobile,
+                   self.oxy_resi, self.ipr, self.workers):
+            _v.trace_add("write", self._schedule_autosave)
         ttk.Label(host,
                   text="Higher = faster on big lists (network-bound). Too high "
                        "may trip a provider's rate limit. 20-40 is a good range.",
@@ -3168,13 +3214,24 @@ class SettingsTab(ttk.Frame):
                                              sticky="w")
         r += 1
 
-        ttk.Button(host, text="Save settings", style="Accent.TButton",
+        ttk.Button(host, text="Save now", style="Accent.TButton",
                    command=self.on_save).grid(row=r, column=0, sticky="w",
                                               pady=(16, 4))
         self.status_lbl = ttk.Label(host, text="", style="Muted.TLabel")
         self.status_lbl.grid(row=r, column=1, sticky="w", pady=(16, 4))
 
-    def on_save(self):
+    def _schedule_autosave(self, *_):
+        """Debounce rapid edits into a single write ~0.6s after typing stops."""
+        job = getattr(self, "_save_job", None)
+        if job:
+            try:
+                self.after_cancel(job)
+            except Exception:
+                pass
+        self._save_job = self.after(600, self._persist)
+
+    def _persist(self, announce=True):
+        """Write every setting to disk. Called on auto-save and manual save."""
         save_setting("ipqs_api_key", self.ipqs.get().strip())
         save_setting("proxycheck_api_key", self.pcheck.get().strip())
         save_setting("spur_api_token", self.spur.get().strip())
@@ -3186,10 +3243,19 @@ class SettingsTab(ttk.Frame):
         except (TypeError, ValueError):
             w = DEFAULT_WORKERS
         save_setting("concurrency", w)
-        self.workers.set(str(w))
-        self.status_lbl.config(text="Saved.")
+        if announce:
+            self.status_lbl.config(text="Saved.")
         if self._on_saved:
             self._on_saved()
+
+    def on_save(self):
+        # Manual save also normalizes the worker count shown in the box.
+        try:
+            w = max(1, min(100, int(self.workers.get().strip())))
+        except (TypeError, ValueError):
+            w = DEFAULT_WORKERS
+        self.workers.set(str(w))
+        self._persist(announce=True)
 
 
 class HeaderBar(ttk.Frame):
