@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.38"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.39"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -621,55 +621,76 @@ def proxycheck_lookup(ip, api_key, timeout=DEFAULT_TIMEOUT):
     }
 
 
-def spur_lookup(ip, token, timeout=DEFAULT_TIMEOUT):
-    """Query Spur's Context API (api.spur.us) - the residential-proxy specialist.
-    Auth is a `Token` header. Spur gives no 0-100 score, so we synthesize one
-    from whether it detects anonymization (tunnels / client proxies / risks)."""
+def ipinfo_lookup(ip, token, timeout=DEFAULT_TIMEOUT):
+    """Query IPinfo (ipinfo.io) - a neutral IP-data vendor. On the Max plan it
+    returns residential-proxy detection (privacy.service + res-proxy signals);
+    Core adds VPN/Tor/proxy/relay; every plan gives ASN/company type + carrier
+    (mobile). We synthesize a 0-100 fraud score from those flags."""
     data, err = http_get_json_ex(
-        "https://api.spur.us/v2/context/" + quote(ip, safe=""),
-        timeout, extra_headers={"Token": token})
+        "https://ipinfo.io/" + quote(ip, safe="") + "?token="
+        + quote(token, safe=""), timeout)
     if err or not isinstance(data, dict):
-        return {"_error": f"Spur: {err or 'no data'}"}
-    infra = (data.get("infrastructure") or "").upper()
-    tunnels = data.get("tunnels") if isinstance(data.get("tunnels"), list) else []
-    risks = data.get("risks") if isinstance(data.get("risks"), list) else []
-    client = data.get("client") if isinstance(data.get("client"), dict) else {}
-    client_proxies = (client.get("proxies")
-                      if isinstance(client.get("proxies"), list) else [])
-    risk_txt = " ".join(str(r) for r in risks).upper()
+        return {"_error": f"IPinfo: {err or 'no data'}"}
+    priv = data.get("privacy") if isinstance(data.get("privacy"), dict) else {}
+    asn = data.get("asn") if isinstance(data.get("asn"), dict) else {}
+    company = data.get("company") if isinstance(data.get("company"), dict) else {}
+    carrier = data.get("carrier") if isinstance(data.get("carrier"), dict) else {}
 
-    anon = bool(tunnels) or bool(client_proxies) or "TUNNEL" in risk_txt \
-        or "PROXY" in risk_txt
-    if anon:
-        fraud = 90                       # Spur sees anonymization -> burnt
-    elif "DATACENTER" in infra:
-        fraud = 60
+    vpn = bool(priv.get("vpn"))
+    proxy = bool(priv.get("proxy"))
+    tor = bool(priv.get("tor"))
+    relay = bool(priv.get("relay"))
+    hosting = bool(priv.get("hosting"))
+    service = (priv.get("service") or "").strip()
+    # Residential-proxy signal (Max plan). Keys have shifted over time, so we
+    # accept any of them, plus the 7-day-observation fields that only appear
+    # when an IP is flagged as a residential proxy.
+    res_proxy = bool(priv.get("res_proxy") or priv.get("is_res_proxy")
+                     or priv.get("residential_proxy")
+                     or priv.get("percent_days_seen") is not None
+                     or (service and (proxy or relay)))
+
+    org_type = (company.get("type") or asn.get("type") or "").lower()
+    is_mobile = bool(carrier.get("name")) or bool(data.get("mobile"))
+    anon = res_proxy or proxy or vpn or tor or relay
+    if res_proxy or proxy:
+        fraud = 90                      # a proxy exit -> burnt
+    elif vpn or tor or relay:
+        fraud = 85
+    elif hosting or org_type == "hosting":
+        fraud = 60                      # datacenter / hosting
     else:
-        fraud = 5                        # clean residential/mobile, no tunnel
-    is_vpn = any(isinstance(t, dict) and str(t.get("type", "")).upper() == "VPN"
-                 for t in tunnels)
-    conn = infra.title() if infra else ("Proxy" if anon else "Residential")
-    org = data.get("organization", "")
-    if not org and isinstance(data.get("as"), dict):
-        org = data["as"].get("organization", "")
-    behaviours = " ".join(str(b) for b in (client.get("behaviors") or [])).upper()
-    # The killer signal: which residential-proxy networks this IP belongs to,
-    # plus any VPN service - shown in the Flags column so you see WHY it's burnt.
-    services = data.get("services") if isinstance(data.get("services"),
-                                                  list) else []
-    extra = [str(p).replace("_PROXY", "").replace("_", " ").lower().strip()
-             for p in client_proxies]
-    extra += [str(s).lower() for s in services]
+        fraud = 5                       # clean residential / ISP / mobile
+    if is_mobile:
+        conn = "Mobile"
+    elif res_proxy:
+        conn = "Residential proxy"
+    elif hosting or org_type == "hosting":
+        conn = "Datacenter"
+    elif org_type == "isp":
+        conn = "Residential/ISP"
+    elif org_type == "business":
+        conn = "Business"
+    else:
+        conn = "Proxy" if anon else "Residential"
+    org = (company.get("name") or asn.get("name") or data.get("org") or "")
+    extra = []
+    if res_proxy:
+        extra.append("residential proxy")
+    if service:
+        extra.append(service.lower())
+    if carrier.get("name"):
+        extra.append(str(carrier["name"]).lower())
     return {
         "fraud_score": fraud,
-        "connection_type": conn,        # Datacenter / Mobile / Residential
+        "connection_type": conn,        # Mobile / Residential proxy / DC / ...
         "proxy": anon,
-        "vpn": is_vpn,
-        "tor": "TOR" in risk_txt or "TOR" in behaviours,
-        "recent_abuse": anon,
-        "bot_status": ("SCRAP" in risk_txt or "BOT" in risk_txt),
+        "vpn": vpn,
+        "tor": tor,
+        "recent_abuse": res_proxy or proxy,
+        "bot_status": False,
         "isp": org,
-        "country": (data.get("location") or {}).get("country", ""),
+        "country": data.get("country", ""),
         "flag_extra": list(dict.fromkeys(extra)),   # deduped, order-preserved
     }
 
@@ -678,7 +699,7 @@ def spur_lookup(ip, token, timeout=DEFAULT_TIMEOUT):
 # (entered on the Settings tab), never in code.
 QUALITY_PROVIDERS = {
     "proxycheck.io": ("proxycheck_api_key", proxycheck_lookup),
-    "Spur": ("spur_api_token", spur_lookup),
+    "IPinfo": ("ipinfo_token", ipinfo_lookup),
     "IPQualityScore": ("ipqs_api_key", ipqs_lookup),
 }
 
@@ -729,7 +750,7 @@ def build_quality_row(disc, q, has_key):
     flags = [name for name, on in (
         ("abuse", q.get("recent_abuse")), ("bot", q.get("bot_status")),
         ("vpn", q.get("vpn")), ("tor", q.get("tor"))) if on]
-    # Provider-supplied detail (e.g. Spur's named residential-proxy networks).
+    # Provider-supplied detail (e.g. IPinfo's residential-proxy service name).
     flags += [f for f in (q.get("flag_extra") or []) if f and f not in flags]
     bl = q.get("blacklisted")
     fs = q.get("fraud_score")
@@ -3157,7 +3178,7 @@ class SettingsTab(ttk.Frame):
 
         self.ipqs = tk.StringVar(value=load_setting("ipqs_api_key", ""))
         self.pcheck = tk.StringVar(value=load_setting("proxycheck_api_key", ""))
-        self.spur = tk.StringVar(value=load_setting("spur_api_token", ""))
+        self.ipinfo = tk.StringVar(value=load_setting("ipinfo_token", ""))
         self.workers = tk.StringVar(value=str(get_workers()))
 
         def key_row(label, var):
@@ -3170,7 +3191,7 @@ class SettingsTab(ttk.Frame):
             r += 1
 
         key_row("proxycheck.io key", self.pcheck)
-        key_row("Spur token (Context API)", self.spur)
+        key_row("IPinfo token (Max = residential proxy)", self.ipinfo)
         key_row("IPQualityScore key", self.ipqs)
 
         ttk.Separator(host, orient="horizontal").grid(
@@ -3221,7 +3242,7 @@ class SettingsTab(ttk.Frame):
 
         # Auto-save: any edit persists after a short debounce, so a forgotten
         # click on 'Save settings' can never silently drop a key again.
-        for _v in (self.ipqs, self.pcheck, self.spur, self.oxy_mobile,
+        for _v in (self.ipqs, self.pcheck, self.ipinfo, self.oxy_mobile,
                    self.oxy_resi, self.ipr, self.workers):
             _v.trace_add("write", self._schedule_autosave)
         ttk.Label(host,
@@ -3251,7 +3272,7 @@ class SettingsTab(ttk.Frame):
         """Write every setting to disk. Called on auto-save and manual save."""
         save_setting("ipqs_api_key", self.ipqs.get().strip())
         save_setting("proxycheck_api_key", self.pcheck.get().strip())
-        save_setting("spur_api_token", self.spur.get().strip())
+        save_setting("ipinfo_token", self.ipinfo.get().strip())
         save_setting("oxylabs_mobile", self.oxy_mobile.get().strip())
         save_setting("oxylabs_resi", self.oxy_resi.get().strip())
         save_setting("iproyal", self.ipr.get().strip())

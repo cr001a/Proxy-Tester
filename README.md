@@ -19,10 +19,13 @@ Four tabs:
    list of proxies against any URL.
 3. **IP Quality** — scores each proxy's exit-IP reputation into a single
    **Trust** score. Pick a **provider** —
-   [proxycheck.io](https://proxycheck.io/) (cheap, high daily volume) or
+   [proxycheck.io](https://proxycheck.io/) (cheap, high daily volume),
+   [IPinfo](https://ipinfo.io/) (neutral IP-data vendor; the **Max** plan adds
+   residential-proxy detection + carrier/mobile), or
    [IPQualityScore](https://www.ipqualityscore.com/) — for fraud/risk score,
-   connection type (residential · mobile · datacenter) and abuse/bot/VPN/Tor
-   flags, plus a free **Spamhaus** blocklist check (no key) and latency. Unique
+   connection type (residential · mobile · datacenter · residential-proxy) and
+   abuse/bot/VPN/Tor flags, plus a free **Spamhaus** blocklist check (no key)
+   and latency. Unique
    exit IPs are **deduped** so you only spend one lookup per IP. Results sort
    best-first; click any header to re-sort, filter by **min trust**, and
    **copy selected** proxies straight to the clipboard (full
