@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.29"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.30"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -2876,17 +2876,18 @@ class SettingsTab(ttk.Frame):
             row=r, column=0, columnspan=2, sticky="w", pady=(0, 4))
         r += 1
         ttk.Label(host,
-                  text="Add an ASN and it's looked up automatically (provider "
-                       "name + type) and added to the ASN Tester list. Added "
-                       "instantly - no need to click Save.",
+                  text="Add one or more ASNs (separate with commas or spaces) "
+                       "and each is looked up automatically (provider name + "
+                       "type) and added to the ASN Tester list. Added instantly "
+                       "- no need to click Save.",
                   style="Muted.TLabel").grid(row=r, column=0, columnspan=2,
                                              sticky="w", pady=(0, 8))
         r += 1
         self.asn_entry = tk.StringVar()
         add_row = ttk.Frame(host)
         add_row.grid(row=r, column=0, columnspan=2, sticky="w", pady=(0, 6))
-        ttk.Label(add_row, text="ASN (number, e.g. 21928)").pack(side="left")
-        e = ttk.Entry(add_row, textvariable=self.asn_entry, width=16)
+        ttk.Label(add_row, text="ASN(s), e.g. 21928, 6167").pack(side="left")
+        e = ttk.Entry(add_row, textvariable=self.asn_entry, width=28)
         e.pack(side="left", padx=(10, 8))
         e.bind("<Return>", lambda _e: self.on_add_asn())
         self.asn_add_btn = ttk.Button(add_row, text="Look up & add",
@@ -2963,39 +2964,67 @@ class SettingsTab(ttk.Frame):
                        f"[{c.get('cat')}]")
 
     def on_add_asn(self):
-        raw = self.asn_entry.get().strip().upper()
-        if raw.startswith("AS"):
-            raw = raw[2:]
-        if not raw.isdigit():
-            self.asn_status.config(text="Enter an ASN number.")
+        # Accept one or many ASNs, separated by commas / spaces / newlines.
+        tokens, seen = [], set()
+        for tok in re.split(r"[\s,]+", self.asn_entry.get().strip().upper()):
+            tok = tok[2:] if tok.startswith("AS") else tok
+            if tok and tok not in seen:
+                seen.add(tok)
+                tokens.append(tok)
+        if not tokens:
+            self.asn_status.config(text="Enter one or more ASN numbers.")
             return
-        if any(str(c.get("asn")) == raw for c in load_custom_asns()) or \
-                any(a == raw for a, *_ in ASN_CATALOG):
-            self.asn_status.config(text=f"AS{raw} is already in the list.")
+
+        existing = {str(c.get("asn")) for c in load_custom_asns()}
+        existing |= {a for a, *_ in ASN_CATALOG}
+        total = len(tokens)
+        invalid = [t for t in tokens if not t.isdigit()]
+        dup = [t for t in tokens if t.isdigit() and t in existing]
+        todo = [t for t in tokens if t.isdigit() and t not in existing]
+
+        if not todo:
+            self.asn_status.config(
+                text=self._add_summary(total, 0, len(dup), 0, len(invalid)))
             return
+
         self.asn_add_btn.config(state="disabled")
-        self.asn_status.config(text=f"Looking up AS{raw}...")
+        self.asn_status.config(text=f"Looking up {len(todo)} ASN(s)...")
 
         def work():
-            name, cat = asn_lookup(raw)
-            self.after(0, lambda: self._finish_add(raw, name, cat))
+            found = []
+            for asn in todo:
+                name, cat = asn_lookup(asn)
+                if name:
+                    found.append({"asn": asn, "name": name, "cat": cat})
+            self.after(0, lambda: self._finish_add(
+                found, total, len(dup), len(invalid)))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _finish_add(self, asn, name, cat):
+    @staticmethod
+    def _add_summary(total, added, dup, failed, invalid):
+        parts = [f"{added}/{total} added"]
+        if dup:
+            parts.append(f"{dup} duplicate")
+        if failed:
+            parts.append(f"{failed} not found")
+        if invalid:
+            parts.append(f"{invalid} invalid")
+        return ", ".join(parts)
+
+    def _finish_add(self, found, total, dup, invalid):
         self.asn_add_btn.config(state="normal")
-        if not name:
-            self.asn_status.config(
-                text=f"Couldn't look up AS{asn} (offline or unknown).")
-            return
         items = load_custom_asns()
-        items.append({"asn": asn, "name": name, "cat": cat})
-        save_custom_asns(items)
-        self._reload_custom_list()
-        self.asn_entry.set("")
-        self.asn_status.config(text=f"Added AS{asn}: {name} [{cat}]")
-        if self._on_catalog_change:
-            self._on_catalog_change()
+        items.extend(found)
+        if found:
+            save_custom_asns(items)
+            self._reload_custom_list()
+            self.asn_entry.set("")
+            if self._on_catalog_change:
+                self._on_catalog_change()
+        failed = total - len(found) - dup - invalid
+        self.asn_status.config(
+            text=self._add_summary(total, len(found), dup, failed, invalid))
 
     def on_remove_asn(self):
         sel = self.custom_list.curselection()
