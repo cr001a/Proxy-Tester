@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.23"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.24"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -2299,8 +2299,6 @@ class QualityTab(ttk.Frame):
         ttk.Button(btns, text="Generate batch",
                    command=lambda: open_generate_dialog(
                        self, self.proxy_text)).pack(side="left", padx=8)
-        ttk.Button(btns, text="Copy selected",
-                   command=self.on_copy_selected).pack(side="left", padx=8)
         # Exports the highlighted rows, or all currently-shown rows if none are.
         ttk.Button(btns, text="Export shown/selected",
                    command=self.on_export).pack(side="left", padx=(0, 8))
