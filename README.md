@@ -48,11 +48,14 @@ shows just pure consumer-eyeball networks and hides dual-use ISPs that also
 carry business/transit (e.g. AT&T 7018, Lumen 209, Starlink 14593). Business
 and datacenter ASNs are off by default since mobile pools won't contain them.
 
-**Custom ASNs.** On the **Settings** tab you can add any ASN by number; the app
-looks it up against public registries (BGPView for the provider name, PeeringDB
-for the network type, RIPEstat as a fallback) and files it into the ASN Tester
-list with an auto-detected provider name and type. No API key needed. Added
-ASNs persist in `settings.json` and show up immediately in the picker.
+**Custom ASNs.** On the **ASN Tester** tab, paste any ASN number(s) into the
+custom-ASN box (one per line or comma-separated) and click **Look up & add to
+list**. Each is looked up against public registries (BGPView for the provider
+name, PeeringDB for the network type, RIPEstat as a fallback) and pinned into
+the ASN list above with an auto-detected provider name and type — shown even
+under **Strict only**. No API key needed; pinned ASNs persist in
+`settings.json`. The status line reports a summary like `2/5 added,
+3 duplicate`.
 
 ### Generate rotating proxies
 

@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.33"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.34"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1484,11 +1484,22 @@ class AsnTab(ttk.Frame):
         ttk.Button(lb_btns, text="Copy",
                    command=self._copy_selected_asns).pack(side="left")
 
-        ttk.Label(asn_frame, text="+ paste custom ASNs (one per line)").pack(
+        ttk.Label(asn_frame,
+                  text="+ custom ASNs (one per line or comma-separated)").pack(
             anchor="w", pady=(8, 0))
         self.asn_text = tk.Text(asn_frame, width=34, height=4)
         style_text(self.asn_text)
         self.asn_text.pack(fill="x")
+
+        # Look them up (provider + type) and pin them into the list above so
+        # they persist and show even under 'Strict only'.
+        addbar = ttk.Frame(asn_frame)
+        addbar.pack(fill="x", pady=(4, 0))
+        self.add_btn = ttk.Button(addbar, text="Look up & add to list",
+                                  command=self.on_lookup_add)
+        self.add_btn.pack(side="left")
+        self.add_status = ttk.Label(addbar, text="", style="Muted.TLabel")
+        self.add_status.pack(side="left", padx=(8, 0))
 
         btns = ttk.Frame(self)
         btns.pack(fill="x", pady=(12, 4))
@@ -1529,11 +1540,6 @@ class AsnTab(ttk.Frame):
                             command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
-
-    def refresh_asns(self):
-        """Public hook: re-read the catalog (e.g. after a custom ASN is added
-        on the Settings tab) and rebuild the visible list."""
-        self._refilter_asns()
 
     def _refilter_asns(self):
         """Rebuild the ASN list from the active category/strict/search filters."""
@@ -1579,6 +1585,71 @@ class AsnTab(ttk.Frame):
                 seen.add(asn)
                 out.append(asn)
         return out
+
+    # --- look up & pin custom ASNs -------------------------------------- #
+    def on_lookup_add(self):
+        tokens, seen = [], set()
+        for tok in re.split(r"[\s,]+", self.asn_text.get("1.0", "end").upper()):
+            tok = tok[2:] if tok.startswith("AS") else tok
+            if tok and tok not in seen:
+                seen.add(tok)
+                tokens.append(tok)
+        if not tokens:
+            self.add_status.config(text="Paste one or more ASNs above first.")
+            return
+
+        pinned = {str(c.get("asn")) for c in load_custom_asns()}
+        catalog = {a: (name, cat) for a, name, cat, _ in ASN_CATALOG}
+        total = len(tokens)
+        invalid = [t for t in tokens if not t.isdigit()]
+        # Duplicate = already pinned. A catalog ASN not yet pinned is pinned
+        # now (no lookup needed) so it shows even under 'Strict only'.
+        dup = [t for t in tokens if t.isdigit() and t in pinned]
+        preadd = [{"asn": t, "name": catalog[t][0], "cat": catalog[t][1]}
+                  for t in tokens
+                  if t.isdigit() and t not in pinned and t in catalog]
+        todo = [t for t in tokens
+                if t.isdigit() and t not in pinned and t not in catalog]
+
+        if not todo:
+            self._finish_lookup_add(preadd, total, len(dup), len(invalid))
+            return
+
+        self.add_btn.config(state="disabled")
+        self.add_status.config(text=f"Looking up {len(todo)} ASN(s)...")
+
+        def work():
+            found = list(preadd)
+            for asn in todo:
+                name, cat = asn_lookup(asn)
+                if name:
+                    found.append({"asn": asn, "name": name, "cat": cat})
+            self.after(0, lambda: self._finish_lookup_add(
+                found, total, len(dup), len(invalid)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    @staticmethod
+    def _add_summary(total, added, dup, failed, invalid):
+        parts = [f"{added}/{total} added"]
+        if dup:
+            parts.append(f"{dup} duplicate")
+        if failed:
+            parts.append(f"{failed} not found")
+        if invalid:
+            parts.append(f"{invalid} invalid")
+        return ", ".join(parts)
+
+    def _finish_lookup_add(self, found, total, dup, invalid):
+        self.add_btn.config(state="normal")
+        if found:
+            items = load_custom_asns()
+            items.extend(found)
+            save_custom_asns(items)
+            self._refilter_asns()
+        failed = total - len(found) - dup - invalid
+        self.add_status.config(
+            text=self._add_summary(total, len(found), dup, failed, invalid))
 
     # --- profile state ---
     def get_state(self):
@@ -2922,9 +2993,8 @@ class SettingsTab(ttk.Frame):
     """Central place for API keys and performance. Keys are stored in
     settings.json in your config dir (never hard-coded)."""
 
-    def __init__(self, master, on_catalog_change=None):
+    def __init__(self, master):
         super().__init__(master)
-        self._on_catalog_change = on_catalog_change
         # The Settings content is taller than the window, so host it in a
         # scrollable canvas - otherwise the Save button falls off the bottom.
         self._canvas = tk.Canvas(self, highlightthickness=0, bg=BASE,
@@ -3027,51 +3097,6 @@ class SettingsTab(ttk.Frame):
         ttk.Separator(host, orient="horizontal").grid(
             row=r, column=0, columnspan=2, sticky="ew", pady=14)
         r += 1
-        ttk.Label(host, text="Custom ASNs", style="Header.TLabel").grid(
-            row=r, column=0, columnspan=2, sticky="w", pady=(0, 4))
-        r += 1
-        ttk.Label(host,
-                  text="Add one or more ASNs (separate with commas or spaces) "
-                       "and each is looked up automatically (provider name + "
-                       "type) and added to the ASN Tester list. Added instantly "
-                       "- no need to click Save.",
-                  style="Muted.TLabel").grid(row=r, column=0, columnspan=2,
-                                             sticky="w", pady=(0, 8))
-        r += 1
-        self.asn_entry = tk.StringVar()
-        add_row = ttk.Frame(host)
-        add_row.grid(row=r, column=0, columnspan=2, sticky="w", pady=(0, 6))
-        ttk.Label(add_row, text="ASN(s), e.g. 21928, 6167").pack(side="left")
-        e = ttk.Entry(add_row, textvariable=self.asn_entry, width=28)
-        e.pack(side="left", padx=(10, 8))
-        e.bind("<Return>", lambda _e: self.on_add_asn())
-        self.asn_add_btn = ttk.Button(add_row, text="Look up & add",
-                                      style="Accent.TButton",
-                                      command=self.on_add_asn)
-        self.asn_add_btn.pack(side="left")
-        self.asn_status = ttk.Label(add_row, text="", style="Muted.TLabel")
-        self.asn_status.pack(side="left", padx=(10, 0))
-        r += 1
-        list_wrap = ttk.Frame(host)
-        list_wrap.grid(row=r, column=0, columnspan=2, sticky="w", pady=(0, 4))
-        self.custom_list = tk.Listbox(list_wrap, height=4, width=58,
-                                      activestyle="none", exportselection=False)
-        self.custom_list.configure(
-            bg=MANTLE, fg=TEXT, selectbackground=MAUVE, selectforeground=BASE,
-            highlightthickness=1, highlightbackground=SURFACE2,
-            highlightcolor=MAUVE, relief="flat", borderwidth=0,
-            font=(UI_FONT, 10))
-        self.custom_list.pack(side="left")
-        cbtns = ttk.Frame(list_wrap)
-        cbtns.pack(side="left", padx=(8, 0), anchor="n")
-        ttk.Button(cbtns, text="Remove", command=self.on_remove_asn).pack(
-            fill="x")
-        r += 1
-        self._reload_custom_list()
-
-        ttk.Separator(host, orient="horizontal").grid(
-            row=r, column=0, columnspan=2, sticky="ew", pady=14)
-        r += 1
         ttk.Label(host, text="Performance", style="Header.TLabel").grid(
             row=r, column=0, columnspan=2, sticky="w", pady=(0, 4))
         r += 1
@@ -3108,102 +3133,6 @@ class SettingsTab(ttk.Frame):
         save_setting("concurrency", w)
         self.workers.set(str(w))
         self.status_lbl.config(text="Saved.")
-
-    # --- Custom ASNs ---------------------------------------------------- #
-    def _reload_custom_list(self):
-        self.custom_list.delete(0, "end")
-        self._custom = load_custom_asns()
-        for c in self._custom:
-            self.custom_list.insert(
-                "end", f"{c.get('asn')}  -  {c.get('name')}  "
-                       f"[{c.get('cat')}]")
-
-    def on_add_asn(self):
-        # Accept one or many ASNs, separated by commas / spaces / newlines.
-        tokens, seen = [], set()
-        for tok in re.split(r"[\s,]+", self.asn_entry.get().strip().upper()):
-            tok = tok[2:] if tok.startswith("AS") else tok
-            if tok and tok not in seen:
-                seen.add(tok)
-                tokens.append(tok)
-        if not tokens:
-            self.asn_status.config(text="Enter one or more ASN numbers.")
-            return
-
-        pinned = {str(c.get("asn")) for c in load_custom_asns()}
-        catalog = {a: (name, cat) for a, name, cat, _ in ASN_CATALOG}
-        total = len(tokens)
-        invalid = [t for t in tokens if not t.isdigit()]
-        # Duplicate only means "already pinned in your custom list". An ASN
-        # that's in the catalog but not pinned gets pinned now (no lookup
-        # needed - we already know its name/type) so it shows even under
-        # 'Strict only'.
-        dup = [t for t in tokens if t.isdigit() and t in pinned]
-        preadd = [{"asn": t, "name": catalog[t][0], "cat": catalog[t][1]}
-                  for t in tokens
-                  if t.isdigit() and t not in pinned and t in catalog]
-        todo = [t for t in tokens
-                if t.isdigit() and t not in pinned and t not in catalog]
-
-        if not todo:
-            self._finish_add(preadd, total, len(dup), len(invalid))
-            return
-
-        self.asn_add_btn.config(state="disabled")
-        self.asn_status.config(text=f"Looking up {len(todo)} ASN(s)...")
-
-        def work():
-            found = list(preadd)
-            for asn in todo:
-                name, cat = asn_lookup(asn)
-                if name:
-                    found.append({"asn": asn, "name": name, "cat": cat})
-            self.after(0, lambda: self._finish_add(
-                found, total, len(dup), len(invalid)))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    @staticmethod
-    def _add_summary(total, added, dup, failed, invalid):
-        parts = [f"{added}/{total} added"]
-        if dup:
-            parts.append(f"{dup} duplicate")
-        if failed:
-            parts.append(f"{failed} not found")
-        if invalid:
-            parts.append(f"{invalid} invalid")
-        return ", ".join(parts)
-
-    def _finish_add(self, found, total, dup, invalid):
-        self.asn_add_btn.config(state="normal")
-        items = load_custom_asns()
-        items.extend(found)
-        if found:
-            save_custom_asns(items)
-            self._reload_custom_list()
-            self.asn_entry.set("")
-            if self._on_catalog_change:
-                self._on_catalog_change()
-        failed = total - len(found) - dup - invalid
-        self.asn_status.config(
-            text=self._add_summary(total, len(found), dup, failed, invalid))
-
-    def on_remove_asn(self):
-        sel = self.custom_list.curselection()
-        if not sel:
-            self.asn_status.config(text="Select a custom ASN to remove.")
-            return
-        items = load_custom_asns()
-        removed = 0
-        for i in sorted(sel, reverse=True):
-            if i < len(items):
-                items.pop(i)
-                removed += 1
-        save_custom_asns(items)
-        self._reload_custom_list()
-        self.asn_status.config(text=f"Removed {removed} ASN(s).")
-        if self._on_catalog_change:
-            self._on_catalog_change()
 
 
 class HeaderBar(ttk.Frame):
@@ -3496,8 +3425,7 @@ def main():
     proxy_tab = ProxyTab(notebook)
     quality_tab = QualityTab(notebook)
     converter_tab = ConverterTab(notebook)
-    settings_tab = SettingsTab(notebook,
-                               on_catalog_change=asn_tab.refresh_asns)
+    settings_tab = SettingsTab(notebook)
     notebook.add(asn_tab, text="ASN Tester")
     notebook.add(proxy_tab, text="Proxy Tester")
     notebook.add(quality_tab, text="IP Quality")
