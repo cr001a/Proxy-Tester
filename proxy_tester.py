@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.19"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.20"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1853,11 +1853,13 @@ def _reveal_in_folder(path):
             pass
 
 
-def export_tree_csv(tree, columns, headings, full_map=None, full_col=0):
-    """Write the tree to CSV. If full_map (item id -> full 'host:port:user:pass')
-    is given, its value replaces the masked proxy cell at full_col so exports
-    carry the real, usable credentials instead of '****'."""
-    rows = tree.get_children()
+def export_tree_csv(tree, columns, headings, full_map=None, full_col=0,
+                    items=None):
+    """Write tree rows to CSV. `items` limits the export to specific row ids
+    (e.g. the current selection); None exports every visible row. If full_map
+    (item id -> full 'host:port:user:pass') is given, its value replaces the
+    masked proxy cell at full_col so exports carry usable credentials."""
+    rows = list(items) if items is not None else list(tree.get_children())
     if not rows:
         messagebox.showinfo("Export CSV", "No results to export yet.")
         return
@@ -1964,6 +1966,18 @@ class ConverterTab(ttk.Frame):
         self.status_lbl.config(text="")
 
 
+# Trust-range buckets for the Trust header filter (label, predicate on trust).
+TRUST_BUCKETS = [
+    ("90-100", lambda t: isinstance(t, int) and 90 <= t <= 100),
+    ("75-89", lambda t: isinstance(t, int) and 75 <= t <= 89),
+    ("50-74", lambda t: isinstance(t, int) and 50 <= t <= 74),
+    ("25-49", lambda t: isinstance(t, int) and 25 <= t <= 49),
+    ("1-24", lambda t: isinstance(t, int) and 1 <= t <= 24),
+    ("0 (burnt)", lambda t: t == 0),
+    ("no score", lambda t: not isinstance(t, int)),
+]
+
+
 class QualityTab(ttk.Frame):
     """Score each proxy's exit-IP reputation (IPQualityScore + Spamhaus) into a
     single Trust score, so you can rank a list and keep the cleanest IPs."""
@@ -1985,8 +1999,8 @@ class QualityTab(ttk.Frame):
         self._item_full = {}      # tree item id -> full host:port:user:pass
         self._sort_dir = {}       # column -> current sort direction
         self._summary = ""        # persistent run summary (survives filtering)
-        self._min_trust = None    # active min-trust filter
-        self._type_filter = set() # active Type filter (empty = all)
+        self._trust_buckets = set()  # active Trust-range filter (empty = all)
+        self._type_filter = set()    # active Type filter (empty = all)
         self._build()
 
     def _build(self):
@@ -2019,15 +2033,11 @@ class QualityTab(ttk.Frame):
         self.run_btn.pack(side="left")
         ttk.Button(btns, text="Copy selected",
                    command=self.on_copy_selected).pack(side="left", padx=8)
-        ttk.Button(btns, text="Export CSV", command=self.on_export).pack(
-            side="left", padx=(0, 8))
-        ttk.Label(btns, text="Min trust").pack(side="left", padx=(8, 2))
-        self.min_trust = tk.StringVar(value="")
-        mt = ttk.Entry(btns, textvariable=self.min_trust, width=5)
-        mt.pack(side="left")
-        mt.bind("<Return>", lambda e: self._apply_filter())
-        ttk.Button(btns, text="Filter", command=self._apply_filter).pack(
-            side="left", padx=(4, 0))
+        # Exports the highlighted rows, or all currently-shown rows if none are.
+        ttk.Button(btns, text="Export shown/selected",
+                   command=self.on_export).pack(side="left", padx=(0, 8))
+        ttk.Label(btns, text="Filter Type / Trust from their column headers ▾",
+                  style="Muted.TLabel").pack(side="left", padx=(4, 0))
         self.status_lbl = ttk.Label(btns, text="Idle", style="Muted.TLabel")
         self.status_lbl.pack(side="left", padx=12)
         self.sel_lbl = ttk.Label(btns, text="", style="Muted.TLabel")
@@ -2045,13 +2055,15 @@ class QualityTab(ttk.Frame):
             "ping":      (80,  60,  False, "center"),
             "trust":     (80,  60,  False, "center"),
         }
+        # Type and Trust headers open multi-select filter dropdowns (▾); the
+        # other headers sort on click.
+        header_filters = {"type": self._open_type_filter,
+                          "trust": self._open_trust_filter}
         for col in self.COLUMNS:
             w, mw, st, anc = layout[col]
-            # Clicking the Type header opens a multi-select filter; other
-            # headers sort. (▾ hints the Type column is a filter dropdown.)
-            if col == "type":
+            if col in header_filters:
                 self.tree.heading(col, text=self.HEADINGS[col] + " ▾",
-                                  command=self._open_type_filter)
+                                  command=header_filters[col])
             else:
                 self.tree.heading(col, text=self.HEADINGS[col],
                                   command=lambda c=col: self._sort_by(c))
@@ -2209,9 +2221,8 @@ class QualityTab(ttk.Frame):
                      f"({deduped} deduped)")
         # Persistent summary so filtering never wipes the scored/dedupe counts.
         self._summary = "Stopped" if stopped else f"Done - {scored} scored{dedup}"
-        self._min_trust = None            # a fresh run clears prior filters
+        self._trust_buckets = set()       # a fresh run clears prior filters
         self._type_filter = set()
-        self.min_trust.set("")
         self._render_rows()
 
     def _trust_tag(self, r):
@@ -2234,22 +2245,14 @@ class QualityTab(ttk.Frame):
         n = len(self.tree.selection())
         self.sel_lbl.config(text=f"{n} selected" if n else "")
 
-    def _apply_filter(self):
-        """Apply the Min-trust threshold (blank = no trust filter)."""
-        raw = self.min_trust.get().strip()
-        try:
-            self._min_trust = int(raw) if raw else None
-        except ValueError:
-            self._min_trust = None
-        self._render_rows()
-
     def _render_rows(self):
-        """Re-render the table applying the active Trust + Type filters, while
-        keeping the run summary (scored / unique / deduped) in the status."""
+        """Re-render applying the active Trust-range + Type filters, keeping the
+        run summary (scored / unique / deduped) in the status."""
         rows = self._rows
-        if self._min_trust is not None:
-            rows = [r for r in rows if isinstance(r.get("trust"), int)
-                    and r["trust"] >= self._min_trust]
+        if self._trust_buckets:
+            preds = [p for (lbl, p) in TRUST_BUCKETS
+                     if lbl in self._trust_buckets]
+            rows = [r for r in rows if any(p(r.get("trust")) for p in preds)]
         if self._type_filter:
             rows = [r for r in rows if r.get("type") in self._type_filter]
         self.tree.delete(*self.tree.get_children())
@@ -2258,8 +2261,9 @@ class QualityTab(ttk.Frame):
             self._insert_row(r)
         self._update_sel_count()
         filt = []
-        if self._min_trust is not None:
-            filt.append(f"trust>={self._min_trust}")
+        if self._trust_buckets:
+            filt.append("trust=" + "/".join(
+                lbl for (lbl, _) in TRUST_BUCKETS if lbl in self._trust_buckets))
         if self._type_filter:
             filt.append("type=" + "/".join(sorted(self._type_filter)))
         status = self._summary or f"Showing {len(rows)}"
@@ -2267,38 +2271,33 @@ class QualityTab(ttk.Frame):
             status += f"  |  showing {len(rows)} [{', '.join(filt)}]"
         self.status_lbl.config(text=status)
 
-    def _open_type_filter(self):
-        """Dropdown from the Type header: multi-select which connection types to
-        show. Options are pulled from the actual results."""
-        types = sorted({r.get("type", "") for r in self._rows
-                        if r.get("status") == "OK" and r.get("type")})
-        if not types:
+    def _open_checkbox_filter(self, title, options, current, on_apply):
+        """Shared multi-select dropdown for the Type and Trust headers. `options`
+        is a list of labels; `on_apply` receives the selected set (an empty set
+        means no filter / show all)."""
+        if not options:
             self.status_lbl.config(text="No results to filter yet - Score first.")
             return
         top = tk.Toplevel(self)
-        top.title("Filter by Type")
+        top.title(title)
         top.configure(bg=BASE)
         top.transient(self.winfo_toplevel())
         top.resizable(False, False)
-        cur = self._type_filter
         cbvars = {}
-        ttk.Label(top, text="Show types:", style="Muted.TLabel").grid(
+        ttk.Label(top, text=title + ":", style="Muted.TLabel").grid(
             row=0, column=0, sticky="w", padx=14, pady=(12, 4))
-        for i, t in enumerate(types):
-            v = tk.BooleanVar(value=(t in cur) if cur else True)
-            cbvars[t] = v
-            ttk.Checkbutton(top, text=t, variable=v).grid(
+        for i, opt in enumerate(options):
+            v = tk.BooleanVar(value=(opt in current) if current else True)
+            cbvars[opt] = v
+            ttk.Checkbutton(top, text=opt, variable=v).grid(
                 row=i + 1, column=0, sticky="w", padx=18, pady=1)
         btns = ttk.Frame(top)
-        btns.grid(row=len(types) + 1, column=0, sticky="ew", padx=12,
+        btns.grid(row=len(options) + 1, column=0, sticky="ew", padx=12,
                   pady=(10, 12))
 
         def apply_():
-            sel = {t for t, v in cbvars.items() if v.get()}
-            # all (or none) selected => no filter, show everything
-            self._type_filter = (set() if not sel or len(sel) == len(types)
-                                 else sel)
-            self._render_rows()
+            sel = {o for o, v in cbvars.items() if v.get()}
+            on_apply(set() if not sel or len(sel) == len(options) else sel)
             top.destroy()
 
         ttk.Button(btns, text="Apply", style="Accent.TButton",
@@ -2315,6 +2314,29 @@ class QualityTab(ttk.Frame):
         except Exception:
             pass
         top.grab_set()
+
+    def _open_type_filter(self):
+        types = sorted({r.get("type", "") for r in self._rows
+                        if r.get("status") == "OK" and r.get("type")})
+
+        def apply(sel):
+            self._type_filter = sel
+            self._render_rows()
+
+        self._open_checkbox_filter("Filter by Type", types, self._type_filter,
+                                   apply)
+
+    def _open_trust_filter(self):
+        # Only offer trust ranges that actually have matching rows.
+        labels = [lbl for (lbl, p) in TRUST_BUCKETS
+                  if any(p(r.get("trust")) for r in self._rows)]
+
+        def apply(sel):
+            self._trust_buckets = sel
+            self._render_rows()
+
+        self._open_checkbox_filter("Filter by Trust range", labels,
+                                   self._trust_buckets, apply)
 
     def _sort_by(self, col):
         """Sort the visible rows by a column (numeric when possible),
@@ -2348,9 +2370,13 @@ class QualityTab(ttk.Frame):
             text=f"Copied {len(lines)} proxy(ies) to clipboard.")
 
     def on_export(self):
+        # Export the highlighted rows; if nothing is highlighted, export every
+        # currently-shown (filtered) row.
+        sel = self.tree.selection()
         export_tree_csv(self.tree, self.COLUMNS,
                         [self.HEADINGS[c] for c in self.COLUMNS],
-                        full_map=self._item_full, full_col=0)
+                        full_map=self._item_full, full_col=0,
+                        items=sel if sel else None)
 
 
 class SettingsTab(ttk.Frame):
