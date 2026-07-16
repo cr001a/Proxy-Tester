@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.20"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.21"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -2036,8 +2036,13 @@ class QualityTab(ttk.Frame):
         # Exports the highlighted rows, or all currently-shown rows if none are.
         ttk.Button(btns, text="Export shown/selected",
                    command=self.on_export).pack(side="left", padx=(0, 8))
-        ttk.Label(btns, text="Filter Type / Trust from their column headers ▾",
-                  style="Muted.TLabel").pack(side="left", padx=(4, 0))
+        # Collapse to one row (best Trust) per distinct exit IP.
+        self._unique_only = tk.BooleanVar(value=False)
+        ttk.Checkbutton(btns, text="Unique exit IPs only",
+                        variable=self._unique_only,
+                        command=self._render_rows).pack(side="left", padx=(4, 0))
+        ttk.Label(btns, text="Filter Type / Trust from headers ▾",
+                  style="Muted.TLabel").pack(side="left", padx=(8, 0))
         self.status_lbl = ttk.Label(btns, text="Idle", style="Muted.TLabel")
         self.status_lbl.pack(side="left", padx=12)
         self.sel_lbl = ttk.Label(btns, text="", style="Muted.TLabel")
@@ -2255,12 +2260,26 @@ class QualityTab(ttk.Frame):
             rows = [r for r in rows if any(p(r.get("trust")) for p in preds)]
         if self._type_filter:
             rows = [r for r in rows if r.get("type") in self._type_filter]
+        unique_only = self._unique_only.get()
+        if unique_only:
+            # Rows arrive best-Trust-first, so first seen per exit IP is the
+            # best proxy for that IP. Rows without an exit IP (failures) drop.
+            seen, collapsed = set(), []
+            for r in rows:
+                ip = r.get("exit_ip")
+                if not ip or ip in seen:
+                    continue
+                seen.add(ip)
+                collapsed.append(r)
+            rows = collapsed
         self.tree.delete(*self.tree.get_children())
         self._item_full = {}
         for r in rows:
             self._insert_row(r)
         self._update_sel_count()
         filt = []
+        if unique_only:
+            filt.append("unique IPs")
         if self._trust_buckets:
             filt.append("trust=" + "/".join(
                 lbl for (lbl, _) in TRUST_BUCKETS if lbl in self._trust_buckets))
