@@ -2691,11 +2691,12 @@ class QualityTab(ttk.Frame):
                              padx=(0, 24))
         self.proxy_text.bind("<<Paste>>", self._on_paste_proxies)
 
-        # Fall back to a valid provider if the saved one no longer exists
-        # (e.g. a removed provider like the old "Spur" lingering in settings).
-        _saved_prov = load_setting("quality_provider", "proxycheck.io")
+        # IPinfo is the primary provider (residential-proxy detection); fall
+        # back to it if the saved provider no longer exists (e.g. the old
+        # "Spur" lingering in settings).
+        _saved_prov = load_setting("quality_provider", "IPinfo")
         if _saved_prov not in QUALITY_PROVIDERS:
-            _saved_prov = "proxycheck.io"
+            _saved_prov = "IPinfo"
         self.provider = tk.StringVar(value=_saved_prov)
         ttk.Label(form, text="Reputation provider").grid(
             row=1, column=1, sticky="w")
