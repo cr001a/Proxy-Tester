@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.43"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.44"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -2691,8 +2691,12 @@ class QualityTab(ttk.Frame):
                              padx=(0, 24))
         self.proxy_text.bind("<<Paste>>", self._on_paste_proxies)
 
-        self.provider = tk.StringVar(value=load_setting("quality_provider",
-                                                        "proxycheck.io"))
+        # Fall back to a valid provider if the saved one no longer exists
+        # (e.g. a removed provider like the old "Spur" lingering in settings).
+        _saved_prov = load_setting("quality_provider", "proxycheck.io")
+        if _saved_prov not in QUALITY_PROVIDERS:
+            _saved_prov = "proxycheck.io"
+        self.provider = tk.StringVar(value=_saved_prov)
         ttk.Label(form, text="Reputation provider").grid(
             row=1, column=1, sticky="w")
         ttk.Combobox(form, textvariable=self.provider,
