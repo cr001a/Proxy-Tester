@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.52"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.53"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -798,22 +798,67 @@ def _configured_lookups():
     return out
 
 
-def score_ip(ip, provider, api_key, timeout=DEFAULT_TIMEOUT):
+class _ProviderBreaker:
+    """Per-run failure tracker for the aggregate. After `threshold` failures a
+    provider is disabled for the rest of the run, so a dead / keyless / rate-
+    limited provider isn't retried on every IP. Thread-safe (scoring is
+    concurrent)."""
+
+    def __init__(self, threshold=4):
+        self.threshold = threshold
+        self._lock = threading.Lock()
+        self._fail, self._ok, self.disabled = {}, {}, {}
+
+    def active(self, name):
+        return name not in self.disabled
+
+    def record(self, name, ok, err=""):
+        with self._lock:
+            if ok:
+                self._fail[name] = 0
+                self._ok[name] = self._ok.get(name, 0) + 1
+            else:
+                self._fail[name] = self._fail.get(name, 0) + 1
+                if name not in self.disabled \
+                        and self._fail[name] >= self.threshold:
+                    self.disabled[name] = err or "failed"
+
+    def summary(self):
+        out = []
+        for name in set(self._ok) | set(self._fail) | set(self.disabled):
+            if name in self.disabled:
+                out.append(f"{name}: {self.disabled[name]} (stopped)")
+            elif self._ok.get(name):
+                out.append(f"{name}: ok")
+            else:
+                out.append(f"{name}: failing")
+        return out
+
+
+def score_ip(ip, provider, api_key, timeout=DEFAULT_TIMEOUT, breaker=None):
     """Score one exit IP: free Spamhaus check + provider signal(s). Only the
     public IP is sent to a provider - never any credential. The aggregate runs
-    EVERY configured provider concurrently and fuses them; a single provider
-    runs just that one."""
+    EVERY configured provider concurrently and fuses them (skipping any the
+    breaker has disabled); a single provider runs just that one."""
     if provider == AGGREGATE_PROVIDER:
-        tasks = [lambda: {"blacklisted": spamhaus_listed(ip)}]
-        for _name, lookup, key in _configured_lookups():
-            tasks.append(lambda lk=lookup, k=key: lk(ip, k, timeout))
+        tasks = [("_spamhaus", lambda: {"blacklisted": spamhaus_listed(ip)})]
+        for name, lookup, key in _configured_lookups():
+            if breaker and not breaker.active(name):
+                continue
+            tasks.append((name, lambda lk=lookup, k=key: lk(ip, k, timeout)))
         results = []
         with ThreadPoolExecutor(max_workers=max(2, len(tasks))) as pool:
-            for fut in [pool.submit(t) for t in tasks]:
+            futs = {pool.submit(fn): name for name, fn in tasks}
+            for fut in futs:
+                name = futs[fut]
                 try:
-                    results.append(fut.result() or {})
-                except Exception:
-                    pass
+                    r = fut.result() or {}
+                except Exception as e:
+                    r = {"_error": str(e)[:40]}
+                if breaker and name != "_spamhaus":
+                    breaker.record(name, bool(r) and not r.get("_error"),
+                                   r.get("_error", ""))
+                results.append(r)
         return _merge_signals(results)
     q = {"blacklisted": spamhaus_listed(ip)}
     key_setting, lookup = QUALITY_PROVIDERS.get(provider, ("", None))
@@ -2781,8 +2826,12 @@ def open_generate_dialog(parent, text_widget):
         if append.get():
             cur = text_widget.get("1.0", "end").rstrip("\n")
             text = (cur + "\n" + text) if cur else text
+        # Trailing newline leaves the caret on a fresh blank line so you can
+        # paste more proxies straight below without them running onto the last.
         text_widget.delete("1.0", "end")
-        text_widget.insert("1.0", text)
+        text_widget.insert("1.0", text + "\n")
+        text_widget.mark_set("insert", "end-1c")
+        text_widget.see("end")
         top.destroy()
 
     btns = ttk.Frame(frm)
@@ -3055,6 +3104,7 @@ class QualityTab(ttk.Frame):
         workers = get_workers()
         resolved = unique_n = gated_out = 0
         provider_err, err_ct = "", 0
+        prov_status = []
         try:
             # --- Stage 1: resolve exit IPs (neutral endpoint, free) ---
             discoveries = []
@@ -3094,11 +3144,14 @@ class QualityTab(ttk.Frame):
                                        f"{resolved} live proxies "
                                        f"({resolved - unique_n} deduped)"
                                        f"{gate_note}..."})
+            breaker = (_ProviderBreaker()
+                       if provider == AGGREGATE_PROVIDER else None)
             scores = {}
             if not self.stop_event.is_set():
                 with ThreadPoolExecutor(max_workers=workers) as pool:
                     futs = {pool.submit(score_ip, ip, provider, api_key,
-                                        DEFAULT_TIMEOUT): ip for ip in unique}
+                                        DEFAULT_TIMEOUT, breaker): ip
+                            for ip in unique}
                     for fut in futs:
                         ip = futs[fut]
                         try:
@@ -3110,6 +3163,15 @@ class QualityTab(ttk.Frame):
                 if q.get("_error"):
                     err_ct += 1
                     provider_err = q["_error"]
+            # Per-provider status for the aggregate: which ran ok, which the
+            # breaker stopped, and which were skipped for a missing key.
+            prov_status = breaker.summary() if breaker else []
+            if provider == AGGREGATE_PROVIDER:
+                for name, (ks, lk) in QUALITY_PROVIDERS.items():
+                    if lk is None or not ks:
+                        continue
+                    if not load_setting(ks, "").strip():
+                        prov_status.append(f"{name}: skipped (no key)")
             has_key = bool(api_key) or provider == AGGREGATE_PROVIDER
             for d in discoveries:
                 if d.get("_slow"):
@@ -3120,7 +3182,8 @@ class QualityTab(ttk.Frame):
         finally:
             self.queue.put({"_done": True, "resolved": resolved,
                             "unique": unique_n, "provider_err": provider_err,
-                            "err_ct": err_ct, "gated_out": gated_out})
+                            "err_ct": err_ct, "gated_out": gated_out,
+                            "prov_status": prov_status})
 
     def _drain_queue(self):
         try:
@@ -3176,10 +3239,14 @@ class QualityTab(ttk.Frame):
                 hint = " - rate limited, slow down or wait"
             err_note = (f"  |  {info['provider_err']} on {info['err_ct']} "
                         f"IP(s){hint}")
+        # Per-provider status for the fused run (ok / stopped / skipped-no-key).
+        prov_note = ""
+        if info.get("prov_status"):
+            prov_note = "  |  providers - " + "; ".join(info["prov_status"])
         # Persistent summary so filtering never wipes the scored/dedupe counts.
         self._summary = ("Stopped" if stopped
                          else f"Done - {scored} scored{dedup}{gate_note}"
-                              f"{err_note}")
+                              f"{err_note}{prov_note}")
         self._trust_buckets = set()       # a fresh run clears prior filters
         self._type_filter = set()
         self._render_rows()
