@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.46"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.47"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1594,14 +1594,14 @@ class AsnTab(ttk.Frame):
         # Status/org stretch, are left-aligned, and have a minwidth so the
         # exact response and carrier org stay readable (can't be squeezed).
         layout = {
-            "asn":     (80,  60,  False, "center"),
+            "asn":     (80,  60,  False, "w"),
             "type":    (110, 80,  False, "center"),
             "status":  (200, 150, True,  "center"),
             "median":  (90,  70,  False, "center"),
             "min":     (90,  70,  False, "center"),
             "max":     (90,  70,  False, "center"),
             "success": (110, 90,  False, "center"),
-            "org":     (220, 140, True,  "w"),
+            "org":     (220, 140, True,  "center"),
         }
         for col in self.COLUMNS:
             w, mw, st, anc = layout[col]
@@ -1997,6 +1997,9 @@ class ProxyTab(ttk.Frame):
         self.shuffle_btn = ttk.Button(btns, text="Shuffle list",
                                       command=self.on_shuffle)
         self.shuffle_btn.pack(side="left", padx=8)
+        self.cull_btn = ttk.Button(btns, text="Cull dead",
+                                   command=self.on_cull_dead)
+        self.cull_btn.pack(side="left", padx=(0, 8))
         self.status_lbl = ttk.Label(btns, text="Idle", style="Muted.TLabel")
         self.status_lbl.pack(side="left", padx=12)
 
@@ -2022,7 +2025,7 @@ class ProxyTab(ttk.Frame):
         # found") stays readable and can never be squeezed down to "5xx".
         layout = {
             "proxy":    (240, 140, True,  "w"),
-            "status":   (150, 110, False, "w"),
+            "status":   (150, 110, False, "center"),
             "code":     (75,  55,  False, "center"),
             "median":   (85,  65,  False, "center"),
             "success":  (95,  80,  False, "center"),
@@ -2205,7 +2208,59 @@ class ProxyTab(ttk.Frame):
                             command=self.on_run, state="normal")
         self.ping_btn.config(text="Ping site", style="TButton",
                              command=self.on_ping_site, state="normal")
-        self.status_lbl.config(text="Stopped" if stopped else "Done")
+        tested, alive = self._proxy_counts()
+        dead = tested - alive
+        base = "Stopped" if stopped else "Done"
+        self.status_lbl.config(
+            text=f"{base} - {tested} tested, {alive} live, {dead} dead")
+
+    def _proxy_counts(self):
+        """(tested, live) over proxy-test rows only (Site-ping rows excluded)."""
+        tested = alive = 0
+        for iid in self.tree.get_children():
+            vals = self.tree.item(iid, "values")
+            if str(vals[0]).startswith("PING"):
+                continue
+            tested += 1
+            if vals[1] == "OK":
+                alive += 1
+        return tested, alive
+
+    @staticmethod
+    def _proxy_ident(s):
+        """Identity (host, port, user) of a proxy line or masked display, so a
+        result row can be matched back to its original input line."""
+        p = parse_proxy_line(str(s))
+        if not p:
+            return None
+        return (p["host"], str(p["port"]), p.get("user") or "")
+
+    def on_cull_dead(self):
+        """Drop dead (non-OK) proxies: remove their result rows AND rewrite the
+        input list to keep only the live ones (full creds preserved). Site-ping
+        rows are left untouched."""
+        live, dead_iids = set(), []
+        for iid in self.tree.get_children():
+            vals = self.tree.item(iid, "values")
+            if str(vals[0]).startswith("PING"):
+                continue
+            if vals[1] == "OK":
+                ident = self._proxy_ident(vals[0])
+                if ident:
+                    live.add(ident)
+            else:
+                dead_iids.append(iid)
+        if not dead_iids:
+            self.status_lbl.config(text="No dead proxies to cull")
+            return
+        for iid in dead_iids:
+            self.tree.delete(iid)
+        kept = [ln for ln in self.proxy_text.get("1.0", "end").splitlines()
+                if ln.strip() and self._proxy_ident(ln) in live]
+        self.proxy_text.delete("1.0", "end")
+        self.proxy_text.insert("1.0", "\n".join(kept))
+        self.status_lbl.config(
+            text=f"Culled {len(dead_iids)} dead; kept {len(kept)} live")
 
     def on_shuffle(self):
         """Randomly reorder the pasted proxy lines in place."""
@@ -2752,7 +2807,7 @@ class QualityTab(ttk.Frame):
         self.tree = ttk.Treeview(self, columns=self.COLUMNS,
                                  show="headings", height=12)
         layout = {
-            "proxy":     (260, 150, True,  "center"),
+            "proxy":     (260, 150, True,  "w"),
             "exit_ip":   (150, 100, True,  "center"),
             "fraud":     (70,  50,  False, "center"),
             "type":      (130, 90,  True,  "center"),
