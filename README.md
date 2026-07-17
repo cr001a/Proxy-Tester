@@ -27,12 +27,13 @@ Four tabs:
    abuse/bot/VPN/Tor flags, plus a free **Spamhaus** blocklist check (no key)
    and latency. Unique
    exit IPs are **deduped** so you only spend one lookup per IP. An optional
-   **Speed gate** runs a **two-stage funnel**: first a *free* latency test
-   through each proxy to the real target (Walmart/Target/custom URL), then the
-   *paid* reputation lookup runs **only on proxies that reach the target under
-   your threshold** — so a slow proxy never costs an API call, and the Ping
-   column reflects proxy→target latency (which differs from a generic ping).
-   Results sort best-first; click any header to re-sort, filter by **min
+   **Speed gate** runs a **two-stage funnel**: exit-IP resolution already times
+   each proxy against the *neutral* `ipinfo.io/json` endpoint (**no retailer is
+   ever contacted during scanning**), and the *paid* reputation lookup runs
+   **only on proxies that resolved under your millisecond threshold** — so a
+   slow proxy never costs an API call. (The actual retailer latency test is your
+   deliberate final step on the vetted list — use the Proxy Tester tab with the
+   retailer as the test URL.) Results sort best-first; click any header to re-sort, filter by **min
    trust**, and **copy selected** proxies straight to the clipboard (full
    `host:port:user:pass`). API keys and worker concurrency live on the
    **Settings** tab.
