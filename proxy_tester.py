@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.47"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.48"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1970,11 +1970,13 @@ class ProxyTab(ttk.Frame):
         form = ttk.Frame(self)
         form.pack(fill="x")
 
-        ttk.Label(form, text="Proxies (host:port:user:pass, one per line)").grid(
-            row=0, column=0, sticky="w")
+        self.proxy_hdr = ttk.Label(
+            form, text="Proxies (host:port:user:pass, one per line)")
+        self.proxy_hdr.grid(row=0, column=0, sticky="w")
         self.proxy_text = tk.Text(form, width=50, height=8)
         style_text(self.proxy_text)
         self.proxy_text.grid(row=1, column=0, rowspan=4, sticky="nw", padx=(0, 24))
+        self.proxy_text.bind("<<Modified>>", self._update_proxy_count)
 
         self.url = tk.StringVar(value="https://ipinfo.io/json")
         self.runs = tk.StringVar(value="3")
@@ -2234,6 +2236,16 @@ class ProxyTab(ttk.Frame):
         if not p:
             return None
         return (p["host"], str(p["port"]), p.get("user") or "")
+
+    def _update_proxy_count(self, _e=None):
+        """Live count of non-empty proxy lines, shown in the box's header."""
+        if not self.proxy_text.edit_modified():
+            return
+        n = sum(1 for ln in self.proxy_text.get("1.0", "end").splitlines()
+                if ln.strip())
+        self.proxy_hdr.config(
+            text=f"Proxies (host:port:user:pass, one per line) - {n} in list")
+        self.proxy_text.edit_modified(False)
 
     def on_cull_dead(self):
         """Drop dead (non-OK) proxies: remove their result rows AND rewrite the
@@ -2738,13 +2750,15 @@ class QualityTab(ttk.Frame):
     def _build(self):
         form = ttk.Frame(self)
         form.pack(fill="x")
-        ttk.Label(form, text="Proxies (host:port:user:pass, one per line)").grid(
-            row=0, column=0, sticky="w")
+        self.proxy_hdr = ttk.Label(
+            form, text="Proxies (host:port:user:pass, one per line)")
+        self.proxy_hdr.grid(row=0, column=0, sticky="w")
         self.proxy_text = tk.Text(form, width=50, height=8)
         style_text(self.proxy_text)
         self.proxy_text.grid(row=1, column=0, rowspan=4, sticky="nw",
                              padx=(0, 24))
         self.proxy_text.bind("<<Paste>>", self._on_paste_proxies)
+        self.proxy_text.bind("<<Modified>>", self._update_proxy_count)
 
         # IPinfo is the primary provider (residential-proxy detection); fall
         # back to it if the saved provider no longer exists (e.g. the old
@@ -2856,7 +2870,18 @@ class QualityTab(ttk.Frame):
         self.proxy_text.insert("1.0", "\n".join(parts) + "\n")
         self.proxy_text.mark_set("insert", "end-1c")
         self.proxy_text.see("end")
+        self._update_proxy_count(force=True)
         return "break"
+
+    def _update_proxy_count(self, _e=None, force=False):
+        """Live count of non-empty proxy lines, shown in the box's header."""
+        if not force and not self.proxy_text.edit_modified():
+            return
+        n = sum(1 for ln in self.proxy_text.get("1.0", "end").splitlines()
+                if ln.strip())
+        self.proxy_hdr.config(
+            text=f"Proxies (host:port:user:pass, one per line) - {n} in list")
+        self.proxy_text.edit_modified(False)
 
     # --- profile state (proxies only; the API key lives in settings.json) ---
     def get_state(self):
