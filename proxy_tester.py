@@ -2752,11 +2752,11 @@ class QualityTab(ttk.Frame):
         self.tree = ttk.Treeview(self, columns=self.COLUMNS,
                                  show="headings", height=12)
         layout = {
-            "proxy":     (260, 150, True,  "w"),
-            "exit_ip":   (150, 100, True,  "w"),
+            "proxy":     (260, 150, True,  "center"),
+            "exit_ip":   (150, 100, True,  "center"),
             "fraud":     (70,  50,  False, "center"),
-            "type":      (130, 90,  True,  "w"),
-            "flags":     (150, 90,  True,  "w"),
+            "type":      (130, 90,  True,  "center"),
+            "flags":     (150, 90,  True,  "center"),
             "blacklist": (90,  70,  False, "center"),
             "ping":      (80,  60,  False, "center"),
             "trust":     (80,  60,  False, "center"),
