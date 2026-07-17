@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.48"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.49"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -540,23 +540,36 @@ def spamhaus_listed(ip):
 
 
 def ipqs_lookup(ip, api_key, timeout=DEFAULT_TIMEOUT):
-    """Query IPQualityScore for an IP. Returns a normalized dict or None."""
+    """Query IPQualityScore for an IP. IPQS uses honeypot networks + real-time
+    behavioral analysis (like Spur did), not just passive lists, so it catches
+    live residential-proxy pools that IPinfo misses. We run it AGGRESSIVELY:
+    strictness=2, no lighter penalties, and do NOT whitelist public access
+    points - all of which maximize residential-proxy flagging. A detected proxy
+    is the burnt signal, so we force its fraud score high if IPQS under-rates it.
+    Returns a normalized dict or None."""
     url = ("https://ipqualityscore.com/api/json/ip/"
            f"{quote(api_key, safe='')}/{quote(ip, safe='')}"
-           "?strictness=1&allow_public_access_points=true")
+           "?strictness=2&allow_public_access_points=false"
+           "&lighter_penalties=false&fast=false")
     data = http_get_json(url, timeout)
     if not isinstance(data, dict) or not data.get("success", False):
         return None
+    is_proxy = bool(data.get("proxy"))
+    fraud = data.get("fraud_score")
+    # A detected proxy that IPQS scored soft still means "seen proxying" -> burnt.
+    if is_proxy and isinstance(fraud, (int, float)) and fraud < 85:
+        fraud = 90
     return {
-        "fraud_score": data.get("fraud_score"),
+        "fraud_score": fraud,
         "connection_type": data.get("connection_type", ""),
-        "recent_abuse": bool(data.get("recent_abuse")),
+        "recent_abuse": bool(data.get("recent_abuse")) or is_proxy,
         "bot_status": bool(data.get("bot_status")),
-        "proxy": bool(data.get("proxy")),
-        "vpn": bool(data.get("vpn")),
-        "tor": bool(data.get("tor")),
+        "proxy": is_proxy,
+        "vpn": bool(data.get("vpn")) or bool(data.get("active_vpn")),
+        "tor": bool(data.get("tor")) or bool(data.get("active_tor")),
         "isp": data.get("ISP", "") or data.get("organization", ""),
         "country": data.get("country_code", ""),
+        "flag_extra": (["proxy"] if is_proxy else []),
     }
 
 
@@ -2760,12 +2773,13 @@ class QualityTab(ttk.Frame):
         self.proxy_text.bind("<<Paste>>", self._on_paste_proxies)
         self.proxy_text.bind("<<Modified>>", self._update_proxy_count)
 
-        # IPinfo is the primary provider (residential-proxy detection); fall
-        # back to it if the saved provider no longer exists (e.g. the old
-        # "Spur" lingering in settings).
-        _saved_prov = load_setting("quality_provider", "IPinfo")
+        # IPQualityScore is the primary provider: honeypot + behavioral
+        # detection (like Spur) actually catches live residential-proxy pools
+        # that IPinfo's passive lists miss. Fall back to it if the saved
+        # provider no longer exists.
+        _saved_prov = load_setting("quality_provider", "IPQualityScore")
         if _saved_prov not in QUALITY_PROVIDERS:
-            _saved_prov = "IPinfo"
+            _saved_prov = "IPQualityScore"
         self.provider = tk.StringVar(value=_saved_prov)
         ttk.Label(form, text="Reputation provider").grid(
             row=1, column=1, sticky="w")
