@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.50"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.51"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -3580,22 +3580,42 @@ def _version_tuple(v):
     return tuple(nums)
 
 
-def _fetch_latest_release():
-    url = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
-    req = urllib.request.Request(url, headers={
-        "User-Agent": "ProxyTester", "Accept": "application/vnd.github+json"})
-    with urllib.request.urlopen(req, timeout=15, context=SSL_CTX) as r:
-        data = json.loads(r.read().decode("utf-8", "replace"))
-    tag = data.get("tag_name", "")
-    assets = data.get("assets", [])
-    # Prefer the onedir .zip (reliable, no runtime unpacking); fall back to a
-    # legacy .exe if that's all a release carries.
+def _release_asset_url(rel):
+    """Download URL of a release's app asset: prefer the onedir .zip (no runtime
+    unpacking); fall back to a legacy .exe. None if the release has neither."""
+    assets = rel.get("assets", [])
     asset = next((a for a in assets
                   if a.get("name", "").lower().endswith(".zip")), None)
     if asset is None:
         asset = next((a for a in assets
                       if a.get("name", "").lower().endswith(".exe")), None)
-    return tag, (asset or {}).get("browser_download_url")
+    return (asset or {}).get("browser_download_url")
+
+
+def _fetch_latest_release():
+    """Return (tag, download_url) for the HIGHEST-VERSION release. We scan the
+    full release list and pick the max version number - NOT GitHub's
+    /releases/latest, which is ordered by publish time and can point at an older
+    tag if a release was re-published. This guarantees one update hops straight
+    to the newest version instead of one version at a time. Releases without a
+    downloadable asset (e.g. a build that failed mid-publish) are skipped so
+    they can't block or short-hop the update."""
+    url = f"https://api.github.com/repos/{UPDATE_REPO}/releases?per_page=100"
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "ProxyTester", "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=15, context=SSL_CTX) as r:
+        data = json.loads(r.read().decode("utf-8", "replace"))
+    best_tag, best_url = "", None
+    for rel in (data if isinstance(data, list) else []):
+        if rel.get("draft") or rel.get("prerelease"):
+            continue
+        tag = rel.get("tag_name", "")
+        durl = _release_asset_url(rel)
+        if not tag or not durl:
+            continue
+        if not best_tag or _version_tuple(tag) > _version_tuple(best_tag):
+            best_tag, best_url = tag, durl
+    return best_tag, best_url
 
 
 def check_for_updates(parent, silent=False):
