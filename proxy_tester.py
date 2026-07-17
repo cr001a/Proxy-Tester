@@ -24,6 +24,7 @@ import os
 import queue
 import random
 import re
+import select
 import shutil
 import socket
 import ssl
@@ -54,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.49"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.50"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -708,9 +709,76 @@ def ipinfo_lookup(ip, token, timeout=DEFAULT_TIMEOUT):
     }
 
 
+# Common open-proxy ports. If an exit IP answers on one of these, it's running
+# proxy server software reachable from the public internet - exactly the
+# "socks5 / squid" signal Spur reports, obtained the same way (external scan).
+_PROXY_PORTS = {
+    1080: "socks5", 1081: "socks", 4145: "socks4", 9050: "tor",
+    3128: "squid", 8080: "http-proxy", 8888: "http-proxy", 8118: "privoxy",
+}
+
+
+def port_scan_lookup(ip, api_key="", timeout=DEFAULT_TIMEOUT):
+    """FREE, key-less residential-proxy detector: TCP-probe the exit IP for open
+    proxy ports. An open SOCKS/HTTP-proxy/Squid port means the IP runs proxy
+    software (i.e. it's a proxy exit) - the same evidence behind Spur's socks5/
+    squid flags. No vendor, no rate limit, unlimited. All ports are probed
+    concurrently (non-blocking connect + select) so a clean IP costs a single
+    timeout window, not one per port."""
+    if not all(o.isdigit() for o in ip.split(".")) or ip.count(".") != 3:
+        return {"fraud_score": 5, "connection_type": "", "proxy": False,
+                "flag_extra": []}
+    per = max(0.6, min(3.0, timeout / 3.0))
+    pending = {}
+    for port in _PROXY_PORTS:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setblocking(False)
+        try:
+            s.connect_ex((ip, port))
+            pending[port] = s
+        except Exception:
+            try:
+                s.close()
+            except Exception:
+                pass
+    hits = []
+    end = time.time() + per
+    while pending:
+        remaining = end - time.time()
+        if remaining <= 0:
+            break
+        try:
+            _, wready, _ = select.select([], list(pending.values()), [],
+                                         remaining)
+        except Exception:
+            break
+        if not wready:
+            break
+        for port in [p for p, s in pending.items() if s in wready]:
+            s = pending.pop(port)
+            if s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) == 0:
+                hits.append(_PROXY_PORTS[port])      # connected => port open
+            try:
+                s.close()
+            except Exception:
+                pass
+    for s in pending.values():
+        try:
+            s.close()
+        except Exception:
+            pass
+    if not hits:
+        return {"fraud_score": 5, "connection_type": "", "proxy": False,
+                "flag_extra": []}
+    return {"fraud_score": 90, "connection_type": "Proxy", "proxy": True,
+            "recent_abuse": True, "flag_extra": sorted(set(hits))}
+
+
 # Supported IP-reputation providers. The key for each lives in settings.json
-# (entered on the Settings tab), never in code.
+# (entered on the Settings tab), never in code. A provider whose key name is
+# empty ("") is key-less and always runs (e.g. the free port scan).
 QUALITY_PROVIDERS = {
+    "Port scan (free)": ("", port_scan_lookup),
     "proxycheck.io": ("proxycheck_api_key", proxycheck_lookup),
     "IPinfo": ("ipinfo_token", ipinfo_lookup),
     "IPQualityScore": ("ipqs_api_key", ipqs_lookup),
@@ -741,11 +809,13 @@ def discover_exit_ip(proxy, timeout=DEFAULT_TIMEOUT, stop_event=None):
 
 
 def score_ip(ip, provider, api_key, timeout=DEFAULT_TIMEOUT):
-    """Score one exit IP: free Spamhaus check + the chosen provider (if a key is
-    set). Only the public IP is sent to the provider - never any credential."""
+    """Score one exit IP: free Spamhaus check + the chosen provider. Only the
+    public IP is sent to the provider - never any credential. Key-less providers
+    (empty key name, e.g. the free port scan) always run; keyed providers run
+    only when a key is set."""
     q = {"blacklisted": spamhaus_listed(ip)}
-    lookup = QUALITY_PROVIDERS.get(provider, (None, None))[1]
-    if api_key and lookup:
+    key_setting, lookup = QUALITY_PROVIDERS.get(provider, ("", None))
+    if lookup and (api_key or not key_setting):
         q.update(lookup(ip, api_key, timeout) or {})
     return q
 
@@ -2773,13 +2843,13 @@ class QualityTab(ttk.Frame):
         self.proxy_text.bind("<<Paste>>", self._on_paste_proxies)
         self.proxy_text.bind("<<Modified>>", self._update_proxy_count)
 
-        # IPQualityScore is the primary provider: honeypot + behavioral
-        # detection (like Spur) actually catches live residential-proxy pools
-        # that IPinfo's passive lists miss. Fall back to it if the saved
+        # Default to the FREE port scan: it detects open proxy ports (socks5/
+        # squid/http-proxy) on the exit IP - the same signal Spur used - with no
+        # key, no rate limit, and unlimited volume. Fall back to it if the saved
         # provider no longer exists.
-        _saved_prov = load_setting("quality_provider", "IPQualityScore")
+        _saved_prov = load_setting("quality_provider", "Port scan (free)")
         if _saved_prov not in QUALITY_PROVIDERS:
-            _saved_prov = "IPQualityScore"
+            _saved_prov = "Port scan (free)"
         self.provider = tk.StringVar(value=_saved_prov)
         ttk.Label(form, text="Reputation provider").grid(
             row=1, column=1, sticky="w")
@@ -2788,8 +2858,9 @@ class QualityTab(ttk.Frame):
                      state="readonly").grid(row=1, column=2, sticky="w", pady=3)
         ttk.Label(
             form,
-            text="API keys live in the Settings tab. No key = free Spamhaus "
-                 "+ latency only. Unique exit IPs are scored once (deduped).",
+            text="'Port scan (free)' needs no key - it probes each exit for "
+                 "open proxy ports (like Spur's socks5/squid). Keyed providers "
+                 "live in Settings. Unique exit IPs are scored once (deduped).",
             style="Muted.TLabel").grid(row=2, column=1, columnspan=2, sticky="w")
 
         # Speed gate (two-stage funnel): filter on the NEUTRAL exit-IP-discovery
@@ -2938,7 +3009,10 @@ class QualityTab(ttk.Frame):
         self.stop_event.clear()
         self.run_btn.config(text="Stop", style="Stop.TButton",
                             command=self.on_stop)
-        engine = provider if api_key else "no key (Spamhaus + latency)"
+        # Key-less providers (empty key name, e.g. the free port scan) run
+        # without a key; keyed providers fall back to Spamhaus-only if unset.
+        engine = (provider if (api_key or not key_setting)
+                  else "no key (Spamhaus + latency)")
         self.status_lbl.config(
             text=f"Resolving exit IPs for {len(proxies)} proxy(ies) "
                  f"[{engine}]...")
