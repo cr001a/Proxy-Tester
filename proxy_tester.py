@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.67"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.68"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -4218,14 +4218,19 @@ class SettingsTab(ttk.Frame):
         def cred_row(label, var):
             nonlocal r
             ttk.Label(host, text=label).grid(row=r, column=0, sticky="w", pady=3)
-            e = ttk.Entry(host, textvariable=var, width=46)
-            e.grid(row=r, column=1, sticky="w", pady=3, padx=(10, 0))
+            # Entry + inline warning packed together in one cell so the warning
+            # sits right next to the box (a separate grid column drifts to the
+            # far edge when the column stretches).
+            box = ttk.Frame(host)
+            box.grid(row=r, column=1, sticky="w", pady=3, padx=(10, 0))
+            e = ttk.Entry(box, textvariable=var, width=46)
+            e.pack(side="left")
             e.bind("<FocusOut>", lambda _e: self._persist(), add="+")
             # Inline validation for the username:password format - flag a missing
             # colon or a space in the username right here, where creds are typed,
             # rather than at generate time.
-            warn = ttk.Label(host, text="", style="Warn.TLabel")
-            warn.grid(row=r, column=2, sticky="w", padx=(10, 0))
+            warn = ttk.Label(box, text="", style="Warn.TLabel")
+            warn.pack(side="left", padx=(10, 0))
             var.trace_add("write",
                           lambda *_: warn.config(text=_cred_warning(var.get())))
             warn.config(text=_cred_warning(var.get()))
