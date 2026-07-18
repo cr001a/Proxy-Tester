@@ -13,8 +13,12 @@ runtime dependencies and never shells out to `curl`.
 
 Four tabs:
 
-1. **ASN Tester (Oxylabs mobile)** — targets specific carrier ASNs and reports
-   which carrier you actually landed on.
+1. **ASN Tester** — targets specific carrier ASNs and reports which carrier you
+   actually landed on. Pick a **Provider** (Oxylabs mobile or Proxy-Haus); the
+   provider's saved login and its supported ASN set load automatically
+   (Proxy-Haus restricts to AT&T / Comcast / Cox / T-Mobile / Verizon). A
+   **target picker** lets you point the test at a retailer (Walmart, Target, …)
+   instead of `ipinfo.io/json`, to see which ASNs' IPs reach the site.
 2. **Proxy Tester (general)** — plain reachability + latency testing for any
    list of proxies against any URL.
 3. **IP Quality** — scores each proxy's exit-IP reputation into a single
@@ -70,31 +74,34 @@ under **Strict only**. No API key needed; pinned ASNs persist in
 `settings.json`. The status line reports a summary like `2/5 added,
 3 duplicate`.
 
-### Generate rotating proxies
+### Generate batch (residential)
 
-On the ASN Tester tab, pick a **Provider**, enter your username/password, list
-the ASNs you want (one per line), and click **Generate proxies**. You get one
-**rotating** proxy per ASN (new IP each request, US carrier via the ASN) as
-copy-ready `host:port:user:pass`, e.g.:
+**Generate batch** (Proxy Tester / IP Quality tabs) builds sticky or rotating
+residential proxies for **one or more providers at once** —
+**Oxylabs Residential**, **IPRoyal**, **Smartproxy**, and **Proxy-Haus**. Check
+the providers you want, set your shared **sticky lifetime**, **count per
+provider**, and **location** once, and it generates a combined list. Each
+provider's exact session-string format is built for you, and each provider's
+**sticky-lifetime cap is hardcoded and enforced** — Oxylabs 1440 min, IPRoyal
+59 min / 168 h, Proxy-Haus 120 min, Smartproxy inherent (~30 min, no token). If
+your lifetime exceeds a checked provider's cap it warns and generates nothing.
+Proxy-Haus can additionally target carrier **ASNs** via an optional field.
 
-```
-pr.oxylabs.io:7777:customer-USERNAME-ASN-21928:PASSWORD
-```
-
-Adding a new provider later is a one-function change in `PROVIDERS`
-(`proxy_tester.py`) — tell me the provider's username format and I'll wire it in
-as another dropdown option.
+The **ASN Tester** tab also generates per-ASN proxies (static or rotating) for
+the selected provider. Adding a provider is a small change in `RESI_PROVIDERS` /
+`PROVIDERS` (`proxy_tester.py`).
 
 ### Saved credentials
 
 Provider logins live on the **Settings** tab, one box per provider as
 `username:password`:
 
-- **Oxylabs Mobile** — auto-fills the ASN Tester's Username/Password on launch
-  (and the moment you click **Save settings**), so your mobile login persists
-  between sessions.
-- **Oxylabs Residential** and **IPRoyal** — feed the **Generate batch** dialog;
-  a provider only appears in that dropdown once its box is filled in.
+- **Oxylabs Mobile** and **Proxy-Haus** — auto-fill the ASN Tester's
+  Username/Password when their provider is selected (Proxy-Haus username is the
+  package, e.g. `pkg-hausresi`).
+- **Oxylabs Residential**, **IPRoyal**, **Smartproxy**, **Proxy-Haus** — feed
+  the **Generate batch** dialog; a provider only appears there once its box is
+  filled in.
 
 Settings are saved to `%APPDATA%\ProxyTester\settings.json`. Credentials
 (including passwords) are stored there in **plain text** on your own machine —

@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.62"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.63"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1193,10 +1193,34 @@ def _oxylabs_username(user, asn, sessid=None, sesstime=None):
     return name
 
 
+def _proxyhaus_asn_username(user, asn, sessid=None, sesstime=None):
+    # Proxy-Haus. The account username is the package (e.g. pkg-hausresi); the
+    # carrier is pinned with -asn-<n>. sessid => sticky (-session-<tok>-ttl-<min>,
+    # ttl defaults to 10 for a fresh sample).
+    name = f"{user}-country-us-asn-{asn}"
+    if sessid:
+        name += f"-session-{sessid}-ttl-{sesstime or 10}"
+    return name
+
+
 PROVIDERS = {
     "Oxylabs": {"host": "pr.oxylabs.io", "port": "7777",
-                "build": _oxylabs_username},
+                "build": _oxylabs_username, "creds": "oxylabs_mobile",
+                "max_min": 1440},
+    "Proxy-Haus": {"host": "us-gw.proxy-haus.com", "port": "7777",
+                   "build": _proxyhaus_asn_username, "creds": "proxyhaus",
+                   "max_min": 120},
 }
+
+# Proxy-Haus only supports these carrier ASNs (US). When Proxy-Haus is the ASN
+# Tester provider, the ASN list is restricted to exactly these.
+PROXYHAUS_ASNS = [
+    ("7018", "AT&T", "residential"),
+    ("7922", "Comcast", "residential"),
+    ("22773", "Cox", "residential"),
+    ("21928", "T-Mobile", "mobile"),
+    ("6167", "Verizon", "mobile"),
+]
 
 
 def build_username(provider, user, asn, sessid=None, sesstime=None):
@@ -1883,7 +1907,21 @@ class AsnTab(ttk.Frame):
         field(3, "Username", self.username)
         pw_entry = field(4, "Password", self.password, show="•")
         reveal_on_focus(pw_entry)
-        field(5, "Test URL", self.url, width=40)
+        # Test URL + a retailer target picker (like the Proxy Tester tab): pick
+        # a preset site and it drops the URL in, so you can test each ASN's IPs
+        # straight against Walmart/Target/etc.
+        ttk.Label(form, text="Test URL").grid(row=5, column=0, sticky="w",
+                                              pady=3)
+        url_row = ttk.Frame(form)
+        url_row.grid(row=5, column=1, sticky="w", pady=3, padx=(8, 24))
+        ttk.Entry(url_row, textvariable=self.url, width=30).pack(side="left")
+        self.target_site = tk.StringVar(value="Custom")
+        tcb = ttk.Combobox(url_row, textvariable=self.target_site, width=13,
+                           state="readonly",
+                           values=["Custom", "ipinfo.io/json"]
+                           + [n for n, _ in RETAIL_SITES])
+        tcb.pack(side="left", padx=(6, 0))
+        tcb.bind("<<ComboboxSelected>>", self._on_target_site)
         field(6, "Runs per ASN", self.runs, width=6)
 
         asn_frame = ttk.Frame(form)
@@ -2008,7 +2046,9 @@ class AsnTab(ttk.Frame):
         vsb.pack(side="right", fill="y")
 
     def _refilter_asns(self):
-        """Rebuild the ASN list from the active category/strict/search filters."""
+        """Rebuild the ASN list from the active category/strict/search filters.
+        Proxy-Haus only serves a fixed carrier set, so when it's the provider the
+        list is restricted to exactly those ASNs (the full catalog is Oxylabs')."""
         cats = {c for c, v in self.filter_vars.items() if v.get()}
         if not cats:                       # nothing checked -> show everything
             cats = set(CATEGORIES)
@@ -2017,9 +2057,13 @@ class AsnTab(ttk.Frame):
         # matches if ANY term is found in its ASN number or provider name.
         terms = [t for t in re.split(r"[\s,]+",
                                      self.search_var.get().strip().lower()) if t]
+        if getattr(self, "provider", None) and self.provider.get() == "Proxy-Haus":
+            source = [(a, n, c, True) for a, n, c in PROXYHAUS_ASNS]
+        else:
+            source = all_asns()
         self.asn_list.delete(0, "end")
         self._visible_asns = []
-        for asn, name, cat, strict in all_asns():
+        for asn, name, cat, strict in source:
             if cat not in cats:
                 continue
             if strict_only and not strict:
@@ -2031,6 +2075,19 @@ class AsnTab(ttk.Frame):
                 label += " +biz"
             self.asn_list.insert("end", label)
             self._visible_asns.append(asn)
+
+    def _on_target_site(self, _event=None):
+        """Set the Test URL from the retailer target picker."""
+        choice = self.target_site.get()
+        if choice == "Custom":
+            return
+        if choice == "ipinfo.io/json":
+            self.url.set("https://ipinfo.io/json")
+            return
+        for name, host in RETAIL_SITES:
+            if name == choice:
+                self.url.set(f"https://{host}/")
+                return
 
     def _copy_selected_asns(self, _event=None):
         """Copy just the ASN numbers (not the labels), one per line."""
@@ -2120,12 +2177,13 @@ class AsnTab(ttk.Frame):
             text=self._add_summary(total, len(found), dup, failed, invalid))
 
     def load_mobile_creds(self):
-        """Fill Username/Password from the Oxylabs mobile creds saved in
-        Settings. Called after Save so newly-entered creds sync into this tab
-        without a restart (only while the provider is Oxylabs)."""
-        if self.provider.get() != "Oxylabs":
+        """Fill Username/Password from the current provider's saved creds
+        (Oxylabs mobile / Proxy-Haus package). Called after Save so newly-entered
+        creds sync into this tab without a restart."""
+        creds_key = (PROVIDERS.get(self.provider.get()) or {}).get("creds")
+        if not creds_key:
             return
-        u, p = load_provider_creds("oxylabs_mobile")
+        u, p = load_provider_creds(creds_key)
         if u:
             self.username.set(u)
         if p:
@@ -2152,11 +2210,22 @@ class AsnTab(ttk.Frame):
         self.provider.set(d.get("provider", "Oxylabs"))
 
     def on_provider(self, _event=None):
-        host, port = provider_hostport(self.provider.get())
+        prov = self.provider.get()
+        host, port = provider_hostport(prov)
         if host:
             self.host.set(host)
         if port:
             self.port.set(port)
+        # Auto-fill this provider's saved username:password (Oxylabs mobile /
+        # Proxy-Haus package) and restrict the ASN list to what it supports.
+        creds_key = (PROVIDERS.get(prov) or {}).get("creds")
+        if creds_key:
+            u, p = load_provider_creds(creds_key)
+            if u:
+                self.username.set(u)
+            if p:
+                self.password.set(p)
+        self._refilter_asns()
 
     def on_generate(self):
         # Build proxies from the ASNs selected in the RESULTS table.
@@ -2184,6 +2253,15 @@ class AsnTab(ttk.Frame):
         if not opts:
             return
         mode, count, sesstime = opts  # mode: "static" | "rotating"
+
+        # Enforce the provider's hardcoded sticky max (don't generate over it).
+        mx = (PROVIDERS.get(provider) or {}).get("max_min")
+        if mode == "static" and sesstime and mx and sesstime > mx:
+            messagebox.showerror(
+                "Generate proxies",
+                f"{provider} sticky session maxes out at {mx} minutes. "
+                f"You entered {sesstime} - lower the session time.")
+            return
 
         lines = []
         # Sequential sessids (like the Oxylabs endpoint generator): a random
