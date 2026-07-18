@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.53"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.54"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -2922,12 +2922,18 @@ class QualityTab(ttk.Frame):
         self.gate_on = tk.BooleanVar(value=False)
         gate_row = ttk.Frame(form)
         gate_row.grid(row=3, column=1, columnspan=2, sticky="w", pady=(10, 0))
+        # Toggling the gate (or editing the ms) re-filters the ALREADY-scored
+        # rows on-screen too - so you can apply a speed cut to a finished run
+        # without re-scoring thousands of proxies.
         ttk.Checkbutton(
             gate_row, text="Speed gate: only score proxies that resolve under",
-            variable=self.gate_on).pack(side="left")
-        self.gate_ms = tk.StringVar(value="2500")
-        ttk.Entry(gate_row, textvariable=self.gate_ms, width=6).pack(
-            side="left", padx=4)
+            variable=self.gate_on,
+            command=self._render_rows).pack(side="left")
+        self.gate_ms = tk.StringVar(value="1000")
+        gate_entry = ttk.Entry(gate_row, textvariable=self.gate_ms, width=6)
+        gate_entry.pack(side="left", padx=4)
+        gate_entry.bind("<Return>", lambda e: self._render_rows())
+        gate_entry.bind("<FocusOut>", lambda e: self._render_rows())
         ttk.Label(gate_row, text="ms (to ipinfo.io/json - no retailer "
                                  "contact)").pack(side="left")
 
@@ -2949,10 +2955,19 @@ class QualityTab(ttk.Frame):
                         command=self._render_rows).pack(side="left", padx=(4, 0))
         ttk.Label(btns, text="Filter Type / Trust from headers ▾",
                   style="Muted.TLabel").pack(side="left", padx=(8, 0))
-        self.status_lbl = ttk.Label(btns, text="Idle", style="Muted.TLabel")
-        self.status_lbl.pack(side="left", padx=12)
         self.sel_lbl = ttk.Label(btns, text="", style="Muted.TLabel")
         self.sel_lbl.pack(side="right")
+
+        # Run summary / progress on its own full-width row so it can never be
+        # clipped off-screen; wraplength tracks the window so it reflows to fit.
+        status_row = ttk.Frame(self)
+        status_row.pack(fill="x", pady=(0, 2))
+        self.status_lbl = ttk.Label(status_row, text="Idle", style="Muted.TLabel",
+                                    anchor="w", justify="left")
+        self.status_lbl.pack(fill="x", expand=True)
+        status_row.bind(
+            "<Configure>",
+            lambda e: self.status_lbl.config(wraplength=max(200, e.width - 8)))
 
         self.tree = ttk.Treeview(self, columns=self.COLUMNS,
                                  show="headings", height=12)
@@ -3052,7 +3067,7 @@ class QualityTab(ttk.Frame):
             try:
                 gate_ms = max(1, int(self.gate_ms.get().strip()))
             except (TypeError, ValueError):
-                gate_ms = 2500
+                gate_ms = 1000
 
         self.tree.delete(*self.tree.get_children())
         self._rows = []
@@ -3152,12 +3167,17 @@ class QualityTab(ttk.Frame):
                     futs = {pool.submit(score_ip, ip, provider, api_key,
                                         DEFAULT_TIMEOUT, breaker): ip
                             for ip in unique}
+                    done = 0
                     for fut in futs:
                         ip = futs[fut]
                         try:
                             scores[ip] = fut.result()
                         except Exception:
                             scores[ip] = {"blacklisted": None}
+                        done += 1
+                        if done % 50 == 0:
+                            self.queue.put({"_status": f"Scored {done}/"
+                                            f"{unique_n} unique IP(s)..."})
 
             for q in scores.values():
                 if q.get("_error"):
@@ -3272,15 +3292,30 @@ class QualityTab(ttk.Frame):
         self.sel_lbl.config(text=f"{n} selected" if n else "")
 
     def _render_rows(self):
-        """Re-render applying the active Trust-range + Type filters, keeping the
-        run summary (scored / unique / deduped) in the status."""
-        rows = self._rows
+        """Re-render applying the active Trust-range + Type filters. Rows are
+        inserted in chunks (yielding to the GUI between batches) so a large
+        result set - thousands of rows - never freezes the window; the status
+        shows live paint progress and only flips to the final summary once every
+        row is actually on screen."""
+        rows = getattr(self, "_rows", [])
         if self._trust_buckets:
             preds = [p for (lbl, p) in TRUST_BUCKETS
                      if lbl in self._trust_buckets]
             rows = [r for r in rows if any(p(r.get("trust")) for p in preds)]
         if self._type_filter:
             rows = [r for r in rows if r.get("type") in self._type_filter]
+        # Speed gate also acts as a post-run display filter: hide rows whose
+        # resolve latency is over the threshold, using the ping we already have
+        # - so you can filter a finished list without re-scanning.
+        gate_ms = None
+        if self.gate_on.get():
+            try:
+                gate_ms = max(1, int(self.gate_ms.get().strip()))
+            except (TypeError, ValueError):
+                gate_ms = 1000
+            rows = [r for r in rows
+                    if isinstance(r.get("ping"), (int, float))
+                    and r["ping"] <= gate_ms]
         unique_only = self._unique_only.get()
         if unique_only:
             # Rows arrive best-Trust-first, so first seen per exit IP is the
@@ -3293,23 +3328,45 @@ class QualityTab(ttk.Frame):
                 seen.add(ip)
                 collapsed.append(r)
             rows = collapsed
-        self.tree.delete(*self.tree.get_children())
-        self._item_full = {}
-        for r in rows:
-            self._insert_row(r)
-        self._update_sel_count()
+
         filt = []
         if unique_only:
             filt.append("unique IPs")
+        if gate_ms is not None:
+            filt.append(f"≤{gate_ms}ms")
         if self._trust_buckets:
             filt.append("trust=" + "/".join(
                 lbl for (lbl, _) in TRUST_BUCKETS if lbl in self._trust_buckets))
         if self._type_filter:
             filt.append("type=" + "/".join(sorted(self._type_filter)))
-        status = self._summary or f"Showing {len(rows)}"
+        self._final_status = self._summary or f"Showing {len(rows)}"
         if filt:
-            status += f"  |  showing {len(rows)} [{', '.join(filt)}]"
-        self.status_lbl.config(text=status)
+            self._final_status += f"  |  showing {len(rows)} [{', '.join(filt)}]"
+
+        # Cancel any in-flight paint (e.g. a filter toggled mid-render).
+        if getattr(self, "_render_job", None):
+            try:
+                self.after_cancel(self._render_job)
+            except Exception:
+                pass
+            self._render_job = None
+        self.tree.delete(*self.tree.get_children())
+        self._item_full = {}
+        self._pending_rows = rows
+        self._render_chunk(0)
+
+    def _render_chunk(self, start):
+        rows = self._pending_rows
+        end = min(start + 500, len(rows))
+        for r in rows[start:end]:
+            self._insert_row(r)
+        if end < len(rows):
+            self.status_lbl.config(text=f"Rendering {end}/{len(rows)} rows...")
+            self._render_job = self.after(1, lambda: self._render_chunk(end))
+        else:
+            self._render_job = None
+            self.status_lbl.config(text=self._final_status)
+            self._update_sel_count()
 
     def _open_checkbox_filter(self, title, options, current, on_apply):
         """Shared multi-select dropdown for the Type and Trust headers. `options`
