@@ -54,7 +54,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.54"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.55"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -2094,6 +2094,7 @@ class ProxyTab(ttk.Frame):
         self.queue = queue.Queue()
         self.running = False
         self.stop_event = threading.Event()
+        self._sort_dir = {}       # column -> current sort direction
         self._build()
 
     def _build(self):
@@ -2167,7 +2168,9 @@ class ProxyTab(ttk.Frame):
         }
         for col in self.COLUMNS:
             w, mw, st, anc = layout[col]
-            self.tree.heading(col, text=self.HEADINGS[col])
+            # Click any header to sort by that column (toggles asc/desc).
+            self.tree.heading(col, text=self.HEADINGS[col],
+                              command=lambda c=col: self._sort_by(c))
             self.tree.column(col, width=w, minwidth=mw, stretch=st, anchor=anc)
         tag_tree(self.tree)
         enable_drag_select(self.tree)
@@ -2287,6 +2290,25 @@ class ProxyTab(ttk.Frame):
             f"{r['success']}/{r['runs']}", r["exit_ip"],
             r.get("org", ""), r.get("location", ""),
         ), tags=(status_tag(r["status"]),))
+
+    def _sort_by(self, col):
+        """Sort the visible rows by a column (numeric when possible),
+        toggling direction each click. Non-numeric / blank cells (e.g. a dead
+        proxy's '-' latency) sort to the end on an ascending pass."""
+        items = [(self.tree.set(i, col), i) for i in self.tree.get_children("")]
+
+        def key(pair):
+            v = pair[0]
+            try:
+                return (0, float(v))
+            except ValueError:
+                return (1, v.lower())
+
+        rev = self._sort_dir.get(col, False)
+        items.sort(key=key, reverse=rev)
+        self._sort_dir[col] = not rev
+        for idx, (_, i) in enumerate(items):
+            self.tree.move(i, "", idx)
 
     def on_ping_site(self):
         if self.running:
