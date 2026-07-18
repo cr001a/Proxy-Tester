@@ -52,10 +52,10 @@ except ImportError:  # logo is optional
 
 DEFAULT_TIMEOUT = 15   # seconds, per request
 MAX_WORKERS = 6        # legacy default (kept for reference)
-DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
+DEFAULT_WORKERS = 40   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.56"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.57"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1608,6 +1608,7 @@ def test_proxy(proxy, url, runs, timeout, stop_event=None):
 
     latencies = []
     successes = 0
+    attempts = 0
     last_code = None
     exit_ip = ""
     org = city = region = country = ""
@@ -1616,6 +1617,7 @@ def test_proxy(proxy, url, runs, timeout, stop_event=None):
     for _ in range(runs):
         if stop_event is not None and stop_event.is_set():
             break
+        attempts += 1
         r = do_request(proxy_url, url, timeout)
         code = response_code(r)
         if code is not None:
@@ -1634,6 +1636,14 @@ def test_proxy(proxy, url, runs, timeout, stop_event=None):
             country = _parse_json_field(r["body"], "country") or country
         else:
             labels.append(response_label(r))
+            # Fail-fast: a connection-level failure (timeout / refused / tunnel
+            # failure) with no success yet means the proxy is dead - retrying
+            # only burns another full per-request timeout while holding a
+            # worker. Stop now instead of paying runs x timeout on dead proxies.
+            # An HTTP response (even a 403) means the proxy reached the target,
+            # so those keep testing every run.
+            if r.get("error") == "conn" and successes == 0:
+                break
 
     location = ", ".join(p for p in (city, region, country) if p)
 
@@ -1653,7 +1663,7 @@ def test_proxy(proxy, url, runs, timeout, stop_event=None):
         "code": str(last_code) if last_code is not None else "-",
         "median": statistics.median(latencies) if latencies else None,
         "success": successes,
-        "runs": runs,
+        "runs": attempts,
         "exit_ip": exit_ip,
         "org": org,
         "location": location,
@@ -2326,7 +2336,12 @@ class ProxyTab(ttk.Frame):
         self.stop_event.clear()
         self.run_btn.config(text="Stop", style="Stop.TButton",
                             command=self.on_stop)
-        self.status_lbl.config(text=f"Testing {len(proxies)} proxy(ies)...")
+        # Live progress counter (updated per result as they stream in).
+        self._run_total = len(proxies)
+        self._tested = self._live = 0
+        self._count_cfg = ("Tested", "live", "dead")
+        self._ping_mode = None
+        self.status_lbl.config(text=f"Testing 0/{len(proxies)}...")
 
         worker = threading.Thread(
             target=self._run_pool, args=(proxies, url, runs), daemon=True)
@@ -2341,8 +2356,12 @@ class ProxyTab(ttk.Frame):
         self.status_lbl.config(text="Stopping...")
 
     def _run_pool(self, proxies, url, runs):
+        # Proxy testing is pure network I/O, so parallelism is the main speed
+        # lever. Honour a higher Settings concurrency, but floor at 40 for big
+        # lists so a large run isn't throttled by a low saved value.
+        workers = min(100, max(get_workers(), min(len(proxies), 40)))
         try:
-            with ThreadPoolExecutor(max_workers=get_workers()) as pool:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = {
                     pool.submit(test_proxy, p, url, runs, DEFAULT_TIMEOUT,
                                 self.stop_event): p
@@ -2368,6 +2387,20 @@ class ProxyTab(ttk.Frame):
                     self._finish()
                     return
                 self._insert_row(item)
+                # Live counter: count proxy-test results and proxy-ping results
+                # (both stream one row per proxy); skip direct site-ping rows.
+                cfg = getattr(self, "_count_cfg", None)
+                if cfg and not item.get("_ping"):
+                    self._tested += 1
+                    if item.get("status") == "OK":
+                        self._live += 1
+                    total = getattr(self, "_run_total", 0) or self._tested
+                    verb, live_word, dead_word = cfg
+                    dead = self._tested - self._live
+                    pct = int(self._tested * 100 / total) if total else 0
+                    self.status_lbl.config(
+                        text=f"{verb} {self._tested}/{total} ({pct}%) - "
+                             f"{self._live} {live_word}, {dead} {dead_word}")
         except queue.Empty:
             pass
         if self.running:
@@ -2384,13 +2417,17 @@ class ProxyTab(ttk.Frame):
             ), tags=(status_tag(r["status"]),))
             return
         if r.get("_pping"):
-            rng = ("-" if r["min"] is None
-                   else f"min {r['min']:.0f} / max {r['max']:.0f} ms")
+            # Carry the proxy's exit IP / provider / location from the prior
+            # Run (matched by host:port:user) so a ping row keeps its geo. Fall
+            # back to the ping target when there's no prior Run to draw from.
+            ident = self._proxy_ident(r["proxy"])
+            exit_ip, org, location = getattr(self, "_loc_map", {}).get(
+                ident, ("", "", f"via proxy -> {r['name']} ({r['target']})"))
             self.tree.insert("", "end", values=(
                 f"PING  {r['proxy']}", r["status"],
                 str(r["code"]) if r["code"] is not None else "-",
                 _fmt_ms(r["median"]), f"{r['success']}/{r['runs']}",
-                "", rng, f"via proxy -> {r['name']} ({r['target']})",
+                exit_ip, org, location,
             ), tags=(status_tag(r["status"]),))
             return
         self.tree.insert("", "end", values=(
@@ -2462,6 +2499,21 @@ class ProxyTab(ttk.Frame):
                     "Paste proxies above to ping the site through them.")
                 return
 
+        # Before wiping the table, harvest each proxy's exit IP / provider /
+        # location from the just-finished Run so we can carry that geo context
+        # onto the ping rows (the CONNECT ping itself resolves no geo).
+        self._loc_map = {}
+        if via_proxy:
+            for iid in self.tree.get_children():
+                vals = self.tree.item(iid, "values")
+                if str(vals[0]).startswith("PING"):
+                    continue
+                ident = self._proxy_ident(vals[0])
+                if ident:
+                    self._loc_map[ident] = (vals[5], vals[6], vals[7])
+        # A fresh ping starts with a clean table (results replace the Run).
+        self.tree.delete(*self.tree.get_children())
+
         self.running = True
         self.stop_event.clear()
         self.run_btn.config(state="disabled")
@@ -2469,13 +2521,16 @@ class ProxyTab(ttk.Frame):
                              command=self.on_stop)
         self._ping_mode = "proxy" if via_proxy else "direct"
         if via_proxy:
+            self._run_total = len(proxies)
+            self._tested = self._live = 0
+            self._count_cfg = ("Pinged", "reachable", "failed")
             self.status_lbl.config(
-                text=f"Pinging {targets[0][0]} through {len(proxies)} "
-                     f"proxy(ies)...")
+                text=f"Pinging {targets[0][0]} through 0/{len(proxies)}...")
             threading.Thread(
                 target=self._proxy_ping_worker,
                 args=(proxies, targets[0], runs), daemon=True).start()
         else:
+            self._count_cfg = None       # direct ping: no per-proxy counter
             self.status_lbl.config(text=f"Pinging {len(targets)} site(s)...")
             threading.Thread(target=self._ping_worker, args=(targets, runs),
                              daemon=True).start()
@@ -2495,8 +2550,9 @@ class ProxyTab(ttk.Frame):
 
     def _proxy_ping_worker(self, proxies, target, runs):
         name, url = target
+        workers = min(100, max(get_workers(), min(len(proxies), 40)))
         try:
-            with ThreadPoolExecutor(max_workers=get_workers()) as pool:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
                 futs = {pool.submit(ping_site_via_proxy, p, name, url, runs,
                                     DEFAULT_TIMEOUT, self.stop_event): p
                         for p in proxies}
@@ -2517,19 +2573,11 @@ class ProxyTab(ttk.Frame):
                              command=self.on_ping_site, state="normal")
         base = "Stopped" if stopped else "Done"
         if getattr(self, "_ping_mode", None) == "proxy":
-            # Summarise the CONNECT-tunnel ping run over its own rows.
-            ok = bad = 0
-            for iid in self.tree.get_children():
-                vals = self.tree.item(iid, "values")
-                if not str(vals[7]).startswith("via proxy"):
-                    continue
-                if vals[1] == "OK":
-                    ok += 1
-                else:
-                    bad += 1
+            # Summarise the CONNECT-tunnel ping run from the live counters.
+            ok, total = self._live, self._tested
             self.status_lbl.config(
-                text=f"{base} - {ok + bad} pinged, {ok} reachable, "
-                     f"{bad} failed")
+                text=f"{base} - {total} pinged, {ok} reachable, "
+                     f"{total - ok} failed")
         else:
             tested, alive = self._proxy_counts()
             dead = tested - alive

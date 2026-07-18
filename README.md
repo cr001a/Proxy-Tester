@@ -222,9 +222,18 @@ status (`200` reachable, `407` auth, `502`/`504` upstream). Pick a single site
 ## Notes
 
 - Requests use `urllib.request` with a `ProxyHandler` (standard library).
-- Tests run on a background thread with a `ThreadPoolExecutor` (max 6 workers)
-  so the GUI never freezes; results are marshalled back to the table via a
-  thread-safe queue.
+- Tests run on a background thread with a `ThreadPoolExecutor` so the GUI never
+  freezes; results are marshalled back to the table via a thread-safe queue.
+  Worker count comes from **Settings ▸ Concurrency** (default 40); the Proxy
+  Tester floors it at 40 for large lists so a run isn't throttled by a low
+  saved value. Raise it for more parallelism.
+- **Fail-fast:** on the Proxy Tester tab, a proxy whose first request fails at
+  the connection level (timeout / refused / tunnel failure) is marked dead
+  immediately instead of retrying every run — so dead proxies no longer hold a
+  worker for `runs × timeout` seconds. A proxy that gets an HTTP response (even
+  a `403`) reached the target and is still tested every run.
+- A live **counter** on the Proxy Tester tab shows progress as results stream
+  in — e.g. `Tested 137/223 (61%) - 130 live, 7 dead`.
 - **Median** latency is reported (not mean) so one slow sample doesn't skew the
   numbers.
 - Per-request timeout defaults to 15s.
