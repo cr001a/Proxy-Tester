@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.66"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.67"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1150,6 +1150,21 @@ def split_creds(value):
     return value, ""
 
 
+def _cred_warning(value):
+    """A short warning if a provider 'username:password' entry looks malformed
+    (missing the colon, or a space in the username where an underscore likely
+    belongs), else ''. Shown inline in Settings as you type."""
+    v = (value or "").strip()
+    if not v:
+        return ""
+    if ":" not in v:
+        return "⚠ add a ':' between username and password"
+    user = v.split(":", 1)[0]
+    if " " in user:
+        return "⚠ username has a space - did you mean '_'?"
+    return ""
+
+
 def load_provider_creds(key, legacy=None):
     """A provider's (user, pass). Prefers the combined 'user:pass' stored under
     `key`; falls back to legacy (user_key, pass_key) settings for migration."""
@@ -1468,13 +1483,6 @@ def generate_resi_batch(provider, region_type, regions, lifetime_min, count,
     user, pw = load_provider_creds(spec["key"], spec.get("legacy"))
     if not user or not pw:
         return [], f"Add {provider} username:password on the Settings tab first."
-    # A space inside a proxy username is never valid - it's almost always a typo
-    # (e.g. a space where an underscore should be) that would auth-fail (407).
-    # Catch it here with a clear message instead of emitting a broken proxy.
-    if " " in user:
-        return [], (f"{provider} username contains a space: '{user}'. That's "
-                    "almost certainly meant to be an underscore - fix it in the "
-                    "Settings credential box.")
     if not rotating:
         err = resi_lifetime_error(provider, lifetime_min)
         if err:
@@ -3361,8 +3369,10 @@ def open_generate_dialog(parent, text_widget):
         ttk.Label(pf, text="Check any number of carriers:").pack(
             anchor="w", pady=(0, 4))
         for a, aname, cat in PROXYHAUS_ASNS:
-            ttk.Checkbutton(pf, text=f"{aname}  (AS{a})",
-                            variable=asn_vars[a]).pack(anchor="w", pady=1)
+            ttk.Checkbutton(
+                pf, text=f"{aname}  (AS{a})", variable=asn_vars[a],
+                command=lambda: asn_btn.config(text=asn_btn_label())).pack(
+                anchor="w", pady=1)
         ttk.Button(pf, text="Done", style="Accent.TButton",
                    command=pop.destroy).pack(anchor="w", pady=(8, 0))
         pop.bind("<Escape>", lambda _e: pop.destroy())
@@ -4211,6 +4221,14 @@ class SettingsTab(ttk.Frame):
             e = ttk.Entry(host, textvariable=var, width=46)
             e.grid(row=r, column=1, sticky="w", pady=3, padx=(10, 0))
             e.bind("<FocusOut>", lambda _e: self._persist(), add="+")
+            # Inline validation for the username:password format - flag a missing
+            # colon or a space in the username right here, where creds are typed,
+            # rather than at generate time.
+            warn = ttk.Label(host, text="", style="Warn.TLabel")
+            warn.grid(row=r, column=2, sticky="w", padx=(10, 0))
+            var.trace_add("write",
+                          lambda *_: warn.config(text=_cred_warning(var.get())))
+            warn.config(text=_cred_warning(var.get()))
             r += 1
 
         cred_row("Oxylabs Mobile (username:password)", self.oxy_mobile)
