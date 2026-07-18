@@ -86,7 +86,10 @@ Oxylabs 1440 min (24 h), IPRoyal 59 min / 168 h, Proxy-Haus 120 min, Bright Data
 inherent (~30 min, no token). If any provider's lifetime exceeds its cap it warns
 and generates nothing. Set **count per provider** and **location** once for the
 whole batch. Proxy-Haus adds a **click-to-pick ASN menu** (choose any number of
-carriers). Lifetime accepts `30`, `30m`, or `2h`.
+carriers): it always emits **at least one proxy per selected ASN**, and when the
+count exceeds the number of ASNs it **splits the count evenly across them**
+(e.g. 5 ASNs / count 10 → 2 each; count 12 → 3,3,2,2,2). Lifetime accepts `30`,
+`30m`, or `2h`.
 
 The **ASN Tester** tab also generates per-ASN proxies (static or rotating) for
 the selected provider. Adding a provider is a small change in `RESI_PROVIDERS` /

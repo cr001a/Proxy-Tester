@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.68"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.69"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1489,11 +1489,22 @@ def generate_resi_batch(provider, region_type, regions, lifetime_min, count,
             return [], err
     make_sessid = spec.get("sessid", _resi_sessid)
     targets = regions if (region_type in ("State", "City") and regions) else [""]
-    asn_list = asns if (spec.get("supports_asn") and asns) else [None]
+    if spec.get("supports_asn") and asns:
+        # ASN providers (proxy-haus): guarantee at least one proxy per selected
+        # ASN, and split `count` as evenly as possible across them when count >
+        # the number of ASNs. e.g. 5 ASNs / count 10 => 2 each; count 12 => three
+        # ASNs get 3 and two get 2; count 1 => still one per ASN.
+        n = len(asns)
+        total = max(count, n)
+        base, extra = divmod(total, n)
+        asn_seq = []
+        for idx, a in enumerate(asns):
+            asn_seq.extend([a] * (base + (1 if idx < extra else 0)))
+    else:
+        asn_seq = [None] * count
     lines = []
-    for i in range(count):
+    for i, asn in enumerate(asn_seq):
         tgt = targets[i % len(targets)]
-        asn = asn_list[i % len(asn_list)]
         state = tgt if region_type == "State" else ""
         city = tgt if region_type == "City" else ""
         lines.append(spec["build"](user, pw, state, city, lifetime_min,
