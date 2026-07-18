@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 40   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.57"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.58"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -2210,7 +2210,7 @@ class ProxyTab(ttk.Frame):
         self.proxy_text.bind("<<Modified>>", self._update_proxy_count)
 
         self.url = tk.StringVar(value="https://ipinfo.io/json")
-        self.runs = tk.StringVar(value="3")
+        self.runs = tk.StringVar(value="1")
 
         ttk.Label(form, text="Test URL").grid(row=1, column=1, sticky="w")
         ttk.Entry(form, textvariable=self.url, width=40).grid(
@@ -2254,7 +2254,7 @@ class ProxyTab(ttk.Frame):
         # tunnel = the transport leg of a real HTTPS session, but no HTTP
         # request is sent, so PerimeterX/Akamai never see it). Off = direct
         # no-proxy baseline from this machine.
-        self.ping_via_proxy = tk.BooleanVar(value=False)
+        self.ping_via_proxy = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             ping_bar, text="through proxies (PX-safe CONNECT)",
             variable=self.ping_via_proxy).pack(side="left", padx=(10, 0))
@@ -2300,7 +2300,7 @@ class ProxyTab(ttk.Frame):
         self.proxy_text.delete("1.0", "end")
         self.proxy_text.insert("1.0", d.get("proxies", ""))
         self.url.set(d.get("url", "https://ipinfo.io/json"))
-        self.runs.set(d.get("runs", "3"))
+        self.runs.set(d.get("runs", "1"))
 
     def on_run(self):
         if self.running:
