@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 40   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.58"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.59"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -3838,7 +3838,7 @@ class SettingsTab(ttk.Frame):
             row=r, column=0, sticky="w", pady=4)
         wkr = ttk.Entry(host, textvariable=self.workers, width=6)
         wkr.grid(row=r, column=1, sticky="w", pady=4, padx=(10, 0))
-        wkr.bind("<FocusOut>", lambda _e: self._persist(), add="+")
+        wkr.bind("<FocusOut>", lambda _e: self.on_save(), add="+")
         r += 1
 
         # Auto-save: any edit persists after a short debounce, so a forgotten
@@ -3853,11 +3853,12 @@ class SettingsTab(ttk.Frame):
                                              sticky="w")
         r += 1
 
-        ttk.Button(host, text="Save now", style="Accent.TButton",
-                   command=self.on_save).grid(row=r, column=0, sticky="w",
-                                              pady=(16, 4))
-        self.status_lbl = ttk.Label(host, text="", style="Muted.TLabel")
-        self.status_lbl.grid(row=r, column=1, sticky="w", pady=(16, 4))
+        # Settings auto-save (debounced on every edit), so there's no Save
+        # button - this label just confirms the last write.
+        self.status_lbl = ttk.Label(host, text="Settings save automatically",
+                                     style="Muted.TLabel")
+        self.status_lbl.grid(row=r, column=0, columnspan=2, sticky="w",
+                             pady=(16, 4))
 
     def _schedule_autosave(self, *_):
         """Debounce rapid edits into a single write ~0.6s after typing stops."""
