@@ -199,13 +199,23 @@ This tab is a **plain connectivity/latency tester** — it reports reachability,
 speed, and HTTP status only. No site-specific bot-protection scoring.
 
 **Site ping.** The Proxy Tester tab also has a **Site ping** control that
-measures your *direct* (no-proxy) network latency to a site's edge — pick a
-preset retailer (Walmart, Target, Best Buy, Nike, Foot Locker, Adidas, Amazon,
-GameStop, Pokémon Center, Costco, Newegg, Shopify), **All presets** to compare
-them all, or **Custom (Test URL)** to ping whatever host is in the Test URL box.
-It's a raw TCP-connect round-trip (not an HTTP request), so bot-protection
-`403`s never skew the number — you get clean min / median / max latency to the
-edge. Results append to the table prefixed with `PING`.
+measures latency to a site's edge — pick a preset retailer (Walmart, Target,
+Best Buy, Nike, Foot Locker, Adidas, Amazon, GameStop, Pokémon Center, Costco,
+Newegg, Shopify), **All presets** to compare them all, or **Custom (Test URL)**
+to ping whatever host is in the Test URL box. By default it's a raw TCP-connect
+round-trip from *your* machine (not an HTTP request), so bot-protection `403`s
+never skew the number — you get clean min / median / max latency to the edge.
+
+Tick **through proxies (PX-safe CONNECT)** to instead ping the chosen site
+**through every proxy in the list**. Each proxy opens an HTTP `CONNECT` tunnel
+to the retailer edge — the exact transport handshake that begins every real
+HTTPS session through that proxy — and the round-trip to `200 Connection
+established` is timed. **No HTTP request is ever sent**, so PerimeterX / Akamai
+never engage and no IPs get touched: it's a fast, safe per-proxy latency screen
+against the actual target. The `HTTP code` column shows each proxy's CONNECT
+status (`200` reachable, `407` auth, `502`/`504` upstream). Pick a single site
+(not *All presets*) for this mode. Results append to the table prefixed with
+`PING`. Click any column header to sort.
 
 ---
 

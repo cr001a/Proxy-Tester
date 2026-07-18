@@ -18,6 +18,7 @@ Package with:
     pyinstaller --onefile --windowed --name ProxyTester proxy_tester.py
 """
 
+import base64
 import csv
 import json
 import os
@@ -54,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 20   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.55"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.56"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -475,6 +476,95 @@ def ping_site(name, target, runs, timeout=DEFAULT_TIMEOUT, stop_event=None):
     return {"name": name, "host": f"{host}:{port}", "status": "OK",
             "median": statistics.median(lat), "min": min(lat), "max": max(lat),
             "success": len(lat), "runs": ran}
+
+
+def proxy_connect_ping(proxy, host, port, timeout=DEFAULT_TIMEOUT):
+    """Time an HTTP CONNECT tunnel through `proxy` to host:port - the exact
+    transport handshake every real HTTPS session through this proxy performs
+    before any TLS or HTTP. Returns (ms, code, err): ms = round-trip until the
+    proxy answers '200 Connection established' (None on failure); code = the
+    CONNECT status the proxy returned (200 ok, 407 auth, 502/504 upstream, ...);
+    err = short reason on failure. NO HTTP request is ever sent to the target,
+    so its bot defences (PerimeterX, Akamai) never engage - a pure, PX-safe
+    latency probe of the proxy's path to the retailer edge."""
+    p_host = proxy["host"]
+    try:
+        p_port = int(proxy["port"])
+    except (TypeError, ValueError, KeyError):
+        return None, None, "bad proxy port"
+    req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+    if proxy.get("user") and proxy.get("pw") is not None:
+        token = base64.b64encode(
+            f"{proxy['user']}:{proxy['pw']}".encode("utf-8")).decode("ascii")
+        req += f"Proxy-Authorization: Basic {token}\r\n"
+    req += "\r\n"
+    start = time.perf_counter()
+    sock = None
+    try:
+        sock = socket.create_connection((p_host, p_port), timeout=timeout)
+        sock.settimeout(timeout)
+        sock.sendall(req.encode("ascii"))
+        # Read only up to the end of the status line - that's the moment the
+        # tunnel is (or isn't) established; we don't send anything through it.
+        buf = b""
+        while b"\r\n" not in buf and len(buf) < 4096:
+            chunk = sock.recv(256)
+            if not chunk:
+                break
+            buf += chunk
+        ms = (time.perf_counter() - start) * 1000.0
+        line = buf.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+        parts = line.split(None, 2)          # "HTTP/1.1 200 Connection ..."
+        code = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else None
+        if code == 200:
+            return ms, 200, None
+        return None, code, (f"HTTP {code}" if code else "bad response")
+    except socket.timeout:
+        return None, None, "timeout"
+    except Exception:
+        return None, None, "network"
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+
+def ping_site_via_proxy(proxy, name, target, runs, timeout=DEFAULT_TIMEOUT,
+                        stop_event=None):
+    """Ping `target` through `proxy` `runs` times via CONNECT tunnels and
+    aggregate min/median/max latency - the per-proxy transport latency to the
+    retailer edge, with no HTTP request sent (PX-safe)."""
+    host, port = _host_port_from_target(target)
+    if proxy.get("user") and proxy.get("pw") is not None:
+        display = f"{proxy['host']}:{proxy['port']}:{proxy['user']}:****"
+    else:
+        display = f"{proxy['host']}:{proxy['port']}"
+    lat = []
+    last_code = None
+    err = ""
+    ran = 0
+    for _ in range(max(1, runs)):
+        if stop_event is not None and stop_event.is_set():
+            break
+        ran += 1
+        ms, code, e = proxy_connect_ping(proxy, host, port, timeout)
+        if code is not None:
+            last_code = code
+        if ms is not None:
+            lat.append(ms)
+        elif e:
+            err = e
+    base = {"_pping": True, "proxy": display, "name": name,
+            "target": f"{host}:{port}",
+            "code": last_code, "success": len(lat), "runs": ran or runs}
+    if lat:
+        base.update(status="OK", median=statistics.median(lat),
+                    min=min(lat), max=max(lat))
+    else:
+        base.update(status=(err or "failed"), median=None, min=None, max=None)
+    return base
 
 
 # --------------------------------------------------------------------------- #
@@ -2136,11 +2226,11 @@ class ProxyTab(ttk.Frame):
         self.status_lbl = ttk.Label(btns, text="Idle", style="Muted.TLabel")
         self.status_lbl.pack(side="left", padx=12)
 
-        # Site ping: measure direct (no-proxy) latency to a retailer's edge.
+        # Site ping: latency to a retailer's edge - either direct (from this
+        # machine) or through each pasted proxy via a CONNECT tunnel.
         ping_bar = ttk.Frame(self)
         ping_bar.pack(fill="x", pady=(0, 2))
-        ttk.Label(ping_bar,
-                  text="Site ping (direct latency, no proxy):").pack(side="left")
+        ttk.Label(ping_bar, text="Site ping:").pack(side="left")
         self.ping_site_var = tk.StringVar(value="Walmart")
         ttk.Combobox(
             ping_bar, textvariable=self.ping_site_var, state="readonly",
@@ -2150,6 +2240,14 @@ class ProxyTab(ttk.Frame):
         self.ping_btn = ttk.Button(ping_bar, text="Ping site",
                                    command=self.on_ping_site)
         self.ping_btn.pack(side="left")
+        # When on, ping the target through every proxy in the list (CONNECT
+        # tunnel = the transport leg of a real HTTPS session, but no HTTP
+        # request is sent, so PerimeterX/Akamai never see it). Off = direct
+        # no-proxy baseline from this machine.
+        self.ping_via_proxy = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            ping_bar, text="through proxies (PX-safe CONNECT)",
+            variable=self.ping_via_proxy).pack(side="left", padx=(10, 0))
 
         self.tree = ttk.Treeview(self, columns=self.COLUMNS,
                                  show="headings", height=12)
@@ -2285,6 +2383,16 @@ class ProxyTab(ttk.Frame):
                 "", rng, "direct (no proxy)",
             ), tags=(status_tag(r["status"]),))
             return
+        if r.get("_pping"):
+            rng = ("-" if r["min"] is None
+                   else f"min {r['min']:.0f} / max {r['max']:.0f} ms")
+            self.tree.insert("", "end", values=(
+                f"PING  {r['proxy']}", r["status"],
+                str(r["code"]) if r["code"] is not None else "-",
+                _fmt_ms(r["median"]), f"{r['success']}/{r['runs']}",
+                "", rng, f"via proxy -> {r['name']} ({r['target']})",
+            ), tags=(status_tag(r["status"]),))
+            return
         self.tree.insert("", "end", values=(
             r["proxy"], r["status"], r["code"], _fmt_ms(r["median"]),
             f"{r['success']}/{r['runs']}", r["exit_ip"],
@@ -2333,14 +2441,44 @@ class ProxyTab(ttk.Frame):
         except ValueError:
             runs = 5
 
+        via_proxy = self.ping_via_proxy.get()
+        proxies = None
+        if via_proxy:
+            # Through-proxies pings ONE target from every proxy; a preset
+            # sweep would be proxies x sites, so require a single site.
+            if len(targets) != 1:
+                messagebox.showerror(
+                    "ProxyTester",
+                    "Pick one site (not 'All presets') to ping through "
+                    "proxies.")
+                return
+            proxies = [p for p in
+                       (parse_proxy_line(ln) for ln
+                        in self.proxy_text.get("1.0", "end").splitlines())
+                       if p]
+            if not proxies:
+                messagebox.showerror(
+                    "ProxyTester",
+                    "Paste proxies above to ping the site through them.")
+                return
+
         self.running = True
         self.stop_event.clear()
         self.run_btn.config(state="disabled")
         self.ping_btn.config(text="Stop", style="Stop.TButton",
                              command=self.on_stop)
-        self.status_lbl.config(text=f"Pinging {len(targets)} site(s)...")
-        threading.Thread(target=self._ping_worker, args=(targets, runs),
-                         daemon=True).start()
+        self._ping_mode = "proxy" if via_proxy else "direct"
+        if via_proxy:
+            self.status_lbl.config(
+                text=f"Pinging {targets[0][0]} through {len(proxies)} "
+                     f"proxy(ies)...")
+            threading.Thread(
+                target=self._proxy_ping_worker,
+                args=(proxies, targets[0], runs), daemon=True).start()
+        else:
+            self.status_lbl.config(text=f"Pinging {len(targets)} site(s)...")
+            threading.Thread(target=self._ping_worker, args=(targets, runs),
+                             daemon=True).start()
         self.after(100, self._drain_queue)
 
     def _ping_worker(self, targets, runs):
@@ -2355,6 +2493,21 @@ class ProxyTab(ttk.Frame):
         finally:
             self.queue.put({"_done": True})
 
+    def _proxy_ping_worker(self, proxies, target, runs):
+        name, url = target
+        try:
+            with ThreadPoolExecutor(max_workers=get_workers()) as pool:
+                futs = {pool.submit(ping_site_via_proxy, p, name, url, runs,
+                                    DEFAULT_TIMEOUT, self.stop_event): p
+                        for p in proxies}
+                for fut in futs:
+                    try:
+                        self.queue.put(fut.result())
+                    except Exception:
+                        pass
+        finally:
+            self.queue.put({"_done": True})
+
     def _finish(self):
         stopped = self.stop_event.is_set()
         self.running = False
@@ -2362,11 +2515,27 @@ class ProxyTab(ttk.Frame):
                             command=self.on_run, state="normal")
         self.ping_btn.config(text="Ping site", style="TButton",
                              command=self.on_ping_site, state="normal")
-        tested, alive = self._proxy_counts()
-        dead = tested - alive
         base = "Stopped" if stopped else "Done"
-        self.status_lbl.config(
-            text=f"{base} - {tested} tested, {alive} live, {dead} dead")
+        if getattr(self, "_ping_mode", None) == "proxy":
+            # Summarise the CONNECT-tunnel ping run over its own rows.
+            ok = bad = 0
+            for iid in self.tree.get_children():
+                vals = self.tree.item(iid, "values")
+                if not str(vals[7]).startswith("via proxy"):
+                    continue
+                if vals[1] == "OK":
+                    ok += 1
+                else:
+                    bad += 1
+            self.status_lbl.config(
+                text=f"{base} - {ok + bad} pinged, {ok} reachable, "
+                     f"{bad} failed")
+        else:
+            tested, alive = self._proxy_counts()
+            dead = tested - alive
+            self.status_lbl.config(
+                text=f"{base} - {tested} tested, {alive} live, {dead} dead")
+        self._ping_mode = None
 
     def _proxy_counts(self):
         """(tested, live) over proxy-test rows only (Site-ping rows excluded)."""
