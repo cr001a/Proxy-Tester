@@ -97,8 +97,7 @@ Provider logins live on the **Settings** tab, one box per provider as
 `username:password`:
 
 - **Oxylabs Mobile** and **Proxy-Haus** — auto-fill the ASN Tester's
-  Username/Password when their provider is selected (Proxy-Haus username is the
-  package, e.g. `pkg-hausresi`).
+  Username/Password when their provider is selected.
 - **Oxylabs Residential**, **IPRoyal**, **Smartproxy**, **Proxy-Haus** — feed
   the **Generate batch** dialog; a provider only appears there once its box is
   filled in.

@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.63"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.64"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1194,8 +1194,8 @@ def _oxylabs_username(user, asn, sessid=None, sesstime=None):
 
 
 def _proxyhaus_asn_username(user, asn, sessid=None, sesstime=None):
-    # Proxy-Haus. The account username is the package (e.g. pkg-hausresi); the
-    # carrier is pinned with -asn-<n>. sessid => sticky (-session-<tok>-ttl-<min>,
+    # Proxy-Haus. The account username is the package name; the carrier is
+    # pinned with -asn-<n>. sessid => sticky (-session-<tok>-ttl-<min>,
     # ttl defaults to 10 for a fresh sample).
     name = f"{user}-country-us-asn-{asn}"
     if sessid:
@@ -4101,8 +4101,7 @@ class SettingsTab(ttk.Frame):
         ttk.Label(host,
                   text="One box per provider, as username:password. Oxylabs "
                        "Mobile fills the ASN Tester login; the residential "
-                       "providers feed 'Generate batch'. Proxy-Haus username is "
-                       "the package (e.g. pkg-hausresi).",
+                       "providers feed 'Generate batch'.",
                   style="Muted.TLabel").grid(row=r, column=0, columnspan=2,
                                              sticky="w", pady=(0, 8))
         r += 1
@@ -4127,8 +4126,7 @@ class SettingsTab(ttk.Frame):
         cred_row("Oxylabs Residential (username:password)", self.oxy_resi)
         cred_row("IPRoyal (username:password)", self.ipr)
         cred_row("Smartproxy (username:password)", self.smartproxy)
-        cred_row("Proxy-Haus (username:password, user is pkg-hausresi)",
-                 self.proxyhaus)
+        cred_row("Proxy-Haus (username:password)", self.proxyhaus)
 
         ttk.Separator(host, orient="horizontal").grid(
             row=r, column=0, columnspan=2, sticky="ew", pady=14)
