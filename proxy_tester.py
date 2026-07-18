@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 40   # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.59"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.60"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -608,25 +608,48 @@ def http_get_json(url, timeout=DEFAULT_TIMEOUT, extra_headers=None):
     return http_get_json_ex(url, timeout, extra_headers)[0]
 
 
-def spamhaus_listed(ip):
-    """Spamhaus ZEN DNSBL check (free, no key). True=listed, False=clean,
-    None=couldn't tell. Real listings answer 127.0.0.2-127.0.0.11; a
-    127.255.255.x answer means the query was refused (e.g. a public/cloud DNS
-    resolver) - that's 'unknown', NOT listed. Treating those as listed is what
-    made every row flip between listed/clean run to run."""
+# Spamhaus ZEN answer codes -> which sublist the IP is on. These mean very
+# different things for a residential proxy: XBL = a compromised/exploited host
+# (botnet - a real 'dirty IP' signal); SBL = a known spam source; PBL = a
+# dynamic/residential policy range, which describes virtually EVERY consumer IP
+# and is NOT an abuse signal for web bot-detection. The Trust score weights them
+# accordingly (see _trust_score) instead of docking a flat penalty for any hit.
+_SPAMHAUS_ZONES = {
+    "127.0.0.2": "SBL", "127.0.0.3": "SBL", "127.0.0.9": "SBL",
+    "127.0.0.4": "XBL", "127.0.0.5": "XBL", "127.0.0.6": "XBL",
+    "127.0.0.7": "XBL", "127.0.0.10": "PBL", "127.0.0.11": "PBL",
+}
+
+
+def spamhaus_lookup(ip):
+    """Spamhaus ZEN DNSBL check (free, no key). Returns a dict:
+      blacklisted    : True listed / False clean / None couldn't tell
+      blacklist_kind : 'XBL' (botnet) / 'SBL' (spam) / 'PBL' (residential policy)
+                       or a '+'-joined combo, worst-first; '' when not listed.
+    A 127.255.255.x answer means a public/cloud resolver refused the query
+    ('unknown', NOT a listing) - treating those as listed is what made rows flip
+    listed/clean run to run."""
     parts = ip.split(".")
     if len(parts) != 4 or not all(p.isdigit() for p in parts):
-        return None
+        return {"blacklisted": None, "blacklist_kind": ""}
     query = ".".join(reversed(parts)) + ".zen.spamhaus.org"
     try:
         answers = socket.gethostbyname_ex(query)[2]
     except socket.gaierror:
-        return False                # NXDOMAIN => not on the list
+        return {"blacklisted": False, "blacklist_kind": ""}   # NXDOMAIN => clean
     except OSError:
-        return None
+        return {"blacklisted": None, "blacklist_kind": ""}
+    kinds = []
+    for a in answers:
+        z = _SPAMHAUS_ZONES.get(a)
+        if z and z not in kinds:
+            kinds.append(z)
+    if kinds:
+        kinds.sort(key=lambda k: {"XBL": 0, "SBL": 1, "PBL": 2}.get(k, 9))
+        return {"blacklisted": True, "blacklist_kind": "+".join(kinds)}
     if any(a.startswith("127.0.0.") for a in answers):
-        return True                 # a genuine listing code
-    return None                     # 127.255.255.x => resolver refused, unknown
+        return {"blacklisted": True, "blacklist_kind": ""}    # listed, zone n/a
+    return {"blacklisted": None, "blacklist_kind": ""}        # resolver refused
 
 
 def ipqs_lookup(ip, api_key, timeout=DEFAULT_TIMEOUT):
@@ -687,7 +710,19 @@ def _trust_score(q):
     if q.get("tor"):
         score -= 30
     if q.get("blacklisted") is True:
-        score -= 20
+        # Weight by which Spamhaus sublist. XBL = compromised/botnet host
+        # (genuinely burnt) tanks it; SBL = spam source is heavy; PBL =
+        # dynamic/residential policy range is benign for web bot-detection but
+        # still drops it out of a perfect green score. Unknown zone: moderate.
+        kind = (q.get("blacklist_kind") or "").upper()
+        if "XBL" in kind:
+            score -= 55
+        elif "SBL" in kind:
+            score -= 40
+        elif "PBL" in kind:
+            score -= 15
+        else:
+            score -= 25
     lat = q.get("latency_ms")
     if isinstance(lat, (int, float)) and lat > 2500:
         score -= 5
@@ -931,7 +966,7 @@ def score_ip(ip, provider, api_key, timeout=DEFAULT_TIMEOUT, breaker=None):
     EVERY configured provider concurrently and fuses them (skipping any the
     breaker has disabled); a single provider runs just that one."""
     if provider == AGGREGATE_PROVIDER:
-        tasks = [("_spamhaus", lambda: {"blacklisted": spamhaus_listed(ip)})]
+        tasks = [("_spamhaus", lambda: spamhaus_lookup(ip))]
         for name, lookup, key in _configured_lookups():
             if breaker and not breaker.active(name):
                 continue
@@ -950,7 +985,7 @@ def score_ip(ip, provider, api_key, timeout=DEFAULT_TIMEOUT, breaker=None):
                                    r.get("_error", ""))
                 results.append(r)
         return _merge_signals(results)
-    q = {"blacklisted": spamhaus_listed(ip)}
+    q = spamhaus_lookup(ip)
     key_setting, lookup = QUALITY_PROVIDERS.get(provider, ("", None))
     if lookup and (api_key or not key_setting):
         q.update(lookup(ip, api_key, timeout) or {})
@@ -973,6 +1008,7 @@ def build_quality_row(disc, q, has_key):
     # Provider-supplied detail (e.g. IPinfo's residential-proxy service name).
     flags += [f for f in (q.get("flag_extra") or []) if f and f not in flags]
     bl = q.get("blacklisted")
+    kind = q.get("blacklist_kind") or ""
     fs = q.get("fraud_score")
     err = q.get("_error")
     return {
@@ -983,7 +1019,9 @@ def build_quality_row(disc, q, has_key):
         "type": (q.get("connection_type", "")
                  or (err if err else ("-" if has_key else "no key"))),
         "flags": ",".join(flags),
-        "blacklist": "listed" if bl is True else ("clean" if bl is False else "-"),
+        # Show which sublist (XBL/SBL/PBL) when known, else generic 'listed'.
+        "blacklist": (kind or "listed") if bl is True else (
+            "clean" if bl is False else "-"),
         "ping": disc["ping"],
         "trust": _trust_score(q),
         "status": "OK",
@@ -3514,6 +3552,11 @@ class QualityTab(ttk.Frame):
         if r.get("status") != "OK" or r.get("trust") is None:
             return "bad"
         t = r["trust"]
+        # Any Spamhaus listing (XBL/SBL/PBL) is never shown green - a flagged IP
+        # caps at a caution colour even if its number is otherwise high.
+        listed = r.get("blacklist") not in (None, "", "clean", "-")
+        if listed:
+            return "warn" if t >= 50 else "bad"
         if t >= 75:
             return "ok"
         return "warn" if t >= 50 else "bad"

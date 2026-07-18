@@ -25,7 +25,11 @@ Four tabs:
    [IPQualityScore](https://www.ipqualityscore.com/) — for fraud/risk score,
    connection type (residential · mobile · datacenter · residential-proxy) and
    abuse/bot/VPN/Tor flags, plus a free **Spamhaus** blocklist check (no key)
-   and latency. Unique
+   and latency. The Spamhaus result is broken out by sublist — **XBL**
+   (compromised/botnet host, a real dirty-IP signal, heavily penalized),
+   **SBL** (spam source, penalized), and **PBL** (dynamic/residential policy
+   range, which describes almost every consumer IP and is only lightly
+   penalized) — and any listing keeps a row out of the green Trust band. Unique
    exit IPs are **deduped** so you only spend one lookup per IP. An optional
    **Speed gate** runs a **two-stage funnel**: exit-IP resolution already times
    each proxy against the *neutral* `ipinfo.io/json` endpoint (**no retailer is
