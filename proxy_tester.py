@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.61"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.62"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1222,8 +1222,23 @@ def _resi_sessid(n=10):
     return "".join(random.choice(alphabet) for _ in range(n))
 
 
-def _build_oxylabs_resi(user, pw, state, city, lifetime, sessid):
-    # pr.oxylabs.io: params live in the username; country/state/city + sticky.
+def _sessid_lower(n=8):
+    alphabet = string.ascii_lowercase + string.digits
+    return "".join(random.choice(alphabet) for _ in range(n))
+
+
+def _sessid_num(n=8):
+    return "".join(random.choice(string.digits) for _ in range(n))
+
+
+# Each builder shares one signature so the generator can call them uniformly:
+#   (user, pw, state, city, lifetime_min, sessid, asn)
+# lifetime_min is ALWAYS minutes (the generator's single shared unit); each
+# builder renders it in the provider's own format. sessid=None => rotating (new
+# IP per request); a sessid => sticky. asn is proxy-haus only.
+def _build_oxylabs_resi(user, pw, state, city, lifetime, sessid, asn=None):
+    # pr.oxylabs.io: params live in the username; sticky via -sessid-/-sesstime-
+    # (minutes, max 1440 = 24h).
     u = f"customer-{user}-cc-us"
     if state:
         u += f"-st-us_{state}"
@@ -1232,12 +1247,20 @@ def _build_oxylabs_resi(user, pw, state, city, lifetime, sessid):
     if sessid:
         u += f"-sessid-{sessid}"
         if lifetime:
-            u += f"-sesstime-{lifetime}"          # minutes
+            u += f"-sesstime-{lifetime}"
     return f"pr.oxylabs.io:7777:{u}:{pw}"
 
 
-def _build_iproyal_resi(user, pw, state, city, lifetime, sessid):
-    # geo.iproyal.com: params live in the password; sticky via session+lifetime.
+def _iproyal_lifetime(minutes):
+    # IPRoyal encodes lifetime as '<=59m' or whole '<=168h'. Render minutes in
+    # whichever fits: 59 or fewer stays minutes; more rounds to whole hours.
+    if minutes <= 59:
+        return f"{minutes}m"
+    return f"{min(168, max(1, round(minutes / 60)))}h"
+
+
+def _build_iproyal_resi(user, pw, state, city, lifetime, sessid, asn=None):
+    # geo.iproyal.com: params live in the password; '_streaming-1' always last.
     p = f"{pw}_country-us"
     if state:
         p += f"_state-{state}"
@@ -1246,22 +1269,62 @@ def _build_iproyal_resi(user, pw, state, city, lifetime, sessid):
     if sessid:
         p += f"_session-{sessid}"
         if lifetime:
-            p += f"_lifetime-{lifetime}m"
+            p += f"_lifetime-{_iproyal_lifetime(lifetime)}"
+    p += "_streaming-1"
     return f"geo.iproyal.com:12321:{user}:{p}"
+
+
+def _build_smartproxy_resi(user, pw, state, city, lifetime, sessid, asn=None):
+    # gate.smartproxy.vip: params live in the username; sticky via -session-
+    # (numeric token). No lifetime token - the IP holds inherently (~30m max).
+    u = f"{user}-country-US"
+    if sessid:
+        u += f"-session-{sessid}"
+    return f"gate.smartproxy.vip:7000:{u}:{pw}"
+
+
+def _build_proxyhaus_resi(user, pw, state, city, lifetime, sessid, asn=None):
+    # us-gw.proxy-haus.com: params in the username; optional -asn-<n>, sticky via
+    # -session-<tok>-ttl-<minutes> (ttl up to 120).
+    u = f"{user}-country-us"
+    if asn:
+        u += f"-asn-{asn}"
+    if sessid:
+        u += f"-session-{sessid}-ttl-{lifetime or 10}"
+    return f"us-gw.proxy-haus.com:7777:{u}:{pw}"
 
 
 # Residential providers for the batch generator. `key` -> a combined
 # 'user:pass' setting; `legacy` -> the old split keys, kept for migration.
+# `max_min` is the hardcoded sticky-lifetime cap in MINUTES, ENFORCED (a request
+# over it is refused, not silently clamped); None = provider has no lifetime
+# token (Smartproxy). `sessid` builds a session token in the provider's own
+# style. `supports_asn` = proxy-haus.
 RESI_PROVIDERS = {
     "Oxylabs Residential": {
         "key": "oxylabs_resi",
         "legacy": ("oxylabs_resi_user", "oxylabs_resi_pass"),
         "build": _build_oxylabs_resi,
+        "max_min": 1440, "sessid": lambda: _sessid_num(10),
     },
     "IPRoyal": {
         "key": "iproyal",
         "legacy": ("iproyal_user", "iproyal_pass"),
         "build": _build_iproyal_resi,
+        "max_min": 168 * 60, "sessid": lambda: _resi_sessid(8),
+    },
+    "Smartproxy": {
+        "key": "smartproxy",
+        "legacy": None,
+        "build": _build_smartproxy_resi,
+        "max_min": None, "sessid": lambda: _sessid_num(8),
+    },
+    "Proxy-Haus": {
+        "key": "proxyhaus",
+        "legacy": None,
+        "build": _build_proxyhaus_resi,
+        "max_min": 120, "sessid": lambda: _sessid_lower(8),
+        "supports_asn": True,
     },
 }
 
@@ -1310,27 +1373,80 @@ US_CITIES = [(_canon(n), n) for n in sorted(_US_CITY_NAMES)]
 REGION_OPTIONS = {"State": US_STATES, "City": US_CITIES}
 
 
-def generate_resi_batch(provider, region_type, regions, lifetime, count,
-                        rotating=False):
-    """Build `count` residential proxy lines, spread round-robin across the
-    selected `regions` (canonical state/city names). region_type is
-    'Country'/'State'/'City'. Each line gets a unique session token unless
-    rotating. Credentials load from settings. Returns (lines, error_or_None)."""
+def _fmt_minutes(m):
+    """Human label for a minute count: '45m', '2h', '90m' -> '90m'."""
+    if m % 60 == 0 and m >= 60:
+        return f"{m // 60}h"
+    return f"{m}m"
+
+
+def resi_lifetime_error(provider, lifetime_min):
+    """Return an error if `lifetime_min` (minutes) exceeds the provider's
+    hardcoded sticky maximum, else None. Refused, never silently clamped."""
+    spec = RESI_PROVIDERS.get(provider)
+    if not spec or not lifetime_min:
+        return None
+    mx = spec.get("max_min")
+    if mx and lifetime_min > mx:
+        return (f"{provider} sticky lifetime maxes out at {_fmt_minutes(mx)}. "
+                f"You entered {_fmt_minutes(lifetime_min)} - lower it and "
+                "try again.")
+    return None
+
+
+def generate_resi_batch(provider, region_type, regions, lifetime_min, count,
+                        rotating=False, asns=None):
+    """Build `count` residential proxy lines for one provider, spread round-robin
+    across the selected `regions` (state/city) and, for proxy-haus, `asns`.
+    lifetime_min is minutes. Each line gets a unique session token unless
+    rotating. Returns (lines, error_or_None)."""
     spec = RESI_PROVIDERS.get(provider)
     if not spec:
         return [], f"Unknown provider: {provider}"
     user, pw = load_provider_creds(spec["key"], spec.get("legacy"))
     if not user or not pw:
         return [], f"Add {provider} username:password on the Settings tab first."
+    if not rotating:
+        err = resi_lifetime_error(provider, lifetime_min)
+        if err:
+            return [], err
+    make_sessid = spec.get("sessid", _resi_sessid)
     targets = regions if (region_type in ("State", "City") and regions) else [""]
+    asn_list = asns if (spec.get("supports_asn") and asns) else [None]
     lines = []
     for i in range(count):
         tgt = targets[i % len(targets)]
+        asn = asn_list[i % len(asn_list)]
         state = tgt if region_type == "State" else ""
         city = tgt if region_type == "City" else ""
-        lines.append(spec["build"](user, pw, state, city, lifetime,
-                                   None if rotating else _resi_sessid()))
+        lines.append(spec["build"](user, pw, state, city, lifetime_min,
+                                   None if rotating else make_sessid(), asn))
     return lines, None
+
+
+def generate_resi_multi(providers, region_type, regions, lifetime_min, count,
+                        rotating=False, asns=None):
+    """Generate `count` lines for EACH selected provider and concatenate them.
+    Validates every provider's sticky limit up front: if any is exceeded,
+    nothing is generated and the offending providers are named. Returns
+    (lines, error_or_None)."""
+    if not providers:
+        return [], "Select at least one provider."
+    if not rotating and lifetime_min:
+        bad = [p for p in providers if resi_lifetime_error(p, lifetime_min)]
+        if bad:
+            caps = ", ".join(
+                f"{p} {_fmt_minutes(RESI_PROVIDERS[p]['max_min'])}" for p in bad)
+            return [], (f"Sticky lifetime {_fmt_minutes(lifetime_min)} exceeds: "
+                        f"{caps}. Lower it (or switch those off) and try again.")
+    all_lines = []
+    for p in providers:
+        lines, err = generate_resi_batch(p, region_type, regions, lifetime_min,
+                                         count, rotating, asns)
+        if err:
+            return [], err
+        all_lines.extend(lines)
+    return all_lines, None
 
 
 # Hardcoded ASN catalog, classified by network type (researched via
@@ -2980,14 +3096,16 @@ class ConverterTab(ttk.Frame):
 
 
 def open_generate_dialog(parent, text_widget):
-    """Batch generator: build N residential proxy lines by spec and drop them
-    into `text_widget`. Optional - if unused, the text box works as before."""
+    """Batch generator: build proxy lines for one or more residential providers
+    at once and drop them into `text_widget`. Shared settings (lifetime, count,
+    location) apply to every checked provider; the only provider-specific input
+    is the optional Proxy-Haus ASN list."""
     configured = configured_resi_providers()
     if not configured:
         messagebox.showinfo(
             "Generate batch",
-            "Add a provider's username/password on the Settings tab first "
-            "(Oxylabs Residential or IPRoyal).")
+            "Add a provider's username:password on the Settings tab first "
+            "(Oxylabs Residential, IPRoyal, Smartproxy, or Proxy-Haus).")
         return
     top = tk.Toplevel(parent)
     top.title("Generate residential batch")
@@ -2995,32 +3113,43 @@ def open_generate_dialog(parent, text_widget):
     top.transient(parent.winfo_toplevel())
     top.resizable(False, False)
 
-    provider = tk.StringVar(value=configured[0])
+    # All configured providers start checked - the common case is "generate my
+    # standard batch from every provider at once".
+    provider_vars = {name: tk.BooleanVar(value=True) for name in configured}
     region_type = tk.StringVar(value="Country")
     lifetime = tk.StringVar(value="30")
+    unit = tk.StringVar(value="m")
     count = tk.StringVar(value="500")
+    ph_asns = tk.StringVar(value="")
     rotating = tk.BooleanVar(value=False)
     append = tk.BooleanVar(value=False)
     region_vars = {}          # canonical -> BooleanVar (rebuilt per region type)
 
     frm = ttk.Frame(top, padding=(16, 14))
     frm.pack(fill="both", expand=True)
-
     row = 0
 
-    def add(label, widget):
-        nonlocal row
-        ttk.Label(frm, text=label).grid(row=row, column=0, sticky="w", pady=4)
-        widget.grid(row=row, column=1, sticky="w", padx=(8, 0), pady=4)
-        row += 1
+    ttk.Label(frm, text="Providers (check to include)").grid(
+        row=row, column=0, columnspan=2, sticky="w", pady=(0, 2))
+    row += 1
+    prov_box = ttk.Frame(frm)
+    prov_box.grid(row=row, column=0, columnspan=2, sticky="w")
+    row += 1
+    for name in configured:
+        ttk.Checkbutton(prov_box, text=name, variable=provider_vars[name],
+                        command=lambda: refresh_cap()).pack(side="left",
+                                                            padx=(0, 12))
 
-    add("Provider", ttk.Combobox(frm, textvariable=provider, values=configured,
-                                 width=22, state="readonly"))
-    add("Country", ttk.Label(frm, text="United States (fixed)",
-                             style="Muted.TLabel"))
-    add("Region type", ttk.Combobox(frm, textvariable=region_type, width=12,
-                                    state="readonly",
-                                    values=["Country", "State", "City"]))
+    ttk.Label(frm, text="Country: United States (fixed)",
+              style="Muted.TLabel").grid(row=row, column=0, columnspan=2,
+                                         sticky="w", pady=(6, 2))
+    row += 1
+    ttk.Label(frm, text="Region type").grid(row=row, column=0, sticky="w",
+                                            pady=4)
+    ttk.Combobox(frm, textvariable=region_type, width=12, state="readonly",
+                 values=["Country", "State", "City"]).grid(
+        row=row, column=1, sticky="w", padx=(8, 0), pady=4)
+    row += 1
 
     # Scrollable checkbox list of regions - repopulated when region type changes.
     list_lbl = ttk.Label(frm, text="Regions (check one or more)")
@@ -3030,7 +3159,7 @@ def open_generate_dialog(parent, text_widget):
     holder.grid(row=row, column=0, columnspan=2, sticky="w")
     row += 1
     canvas = tk.Canvas(holder, bg=SURFACE, highlightthickness=1,
-                       highlightbackground=SURFACE2, width=300, height=200)
+                       highlightbackground=SURFACE2, width=300, height=170)
     vsb = ttk.Scrollbar(holder, orient="vertical", command=canvas.yview)
     inner = ttk.Frame(canvas)
     inner.bind("<Configure>",
@@ -3066,10 +3195,42 @@ def open_generate_dialog(parent, text_widget):
     opt = ttk.Frame(frm)
     opt.grid(row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
     row += 1
-    ttk.Label(opt, text="Sticky lifetime (min)").pack(side="left")
-    ttk.Entry(opt, textvariable=lifetime, width=6).pack(side="left", padx=(6, 16))
-    ttk.Label(opt, text="Count (total)").pack(side="left")
-    ttk.Entry(opt, textvariable=count, width=8).pack(side="left", padx=(6, 0))
+    ttk.Label(opt, text="Sticky lifetime").pack(side="left")
+    ttk.Entry(opt, textvariable=lifetime, width=6).pack(side="left", padx=(6, 4))
+    ttk.Combobox(opt, textvariable=unit, width=4, state="readonly",
+                 values=["min", "hr"]).pack(side="left", padx=(0, 8))
+    life_hint = ttk.Label(opt, text="", style="Muted.TLabel")
+    life_hint.pack(side="left")
+
+    cnt = ttk.Frame(frm)
+    cnt.grid(row=row, column=0, columnspan=2, sticky="w", pady=(2, 0))
+    row += 1
+    ttk.Label(cnt, text="Count (per provider)").pack(side="left")
+    ttk.Entry(cnt, textvariable=count, width=8).pack(side="left", padx=(6, 0))
+
+    asn_row = ttk.Frame(frm)
+    asn_row.grid(row=row, column=0, columnspan=2, sticky="w", pady=(2, 0))
+    row += 1
+    ttk.Label(asn_row, text="Proxy-Haus ASN(s)").pack(side="left")
+    ttk.Entry(asn_row, textvariable=ph_asns, width=24).pack(side="left",
+                                                            padx=(6, 6))
+    ttk.Label(asn_row, text="comma-sep, optional (Proxy-Haus only)",
+              style="Muted.TLabel").pack(side="left")
+
+    def refresh_cap(*_):
+        """Show the binding sticky cap = the smallest max among CHECKED providers
+        that encode a lifetime, so the user can pick one value that's valid for
+        all of them."""
+        checked = [n for n, v in provider_vars.items() if v.get()]
+        caps = [(RESI_PROVIDERS[n]["max_min"], n) for n in checked
+                if RESI_PROVIDERS[n].get("max_min")]
+        if not caps:
+            life_hint.config(text="(no lifetime cap for the checked providers)")
+            return
+        mx, who = min(caps)
+        life_hint.config(text=f"max {_fmt_minutes(mx)} ({who})")
+
+    refresh_cap()
 
     ttk.Checkbutton(frm, text="Rotating (new IP per request, no sticky session)",
                     variable=rotating).grid(row=row, column=0, columnspan=2,
@@ -3081,6 +3242,10 @@ def open_generate_dialog(parent, text_widget):
     row += 1
 
     def gen():
+        providers = [n for n, v in provider_vars.items() if v.get()]
+        if not providers:
+            messagebox.showerror("Generate batch", "Check at least one provider.")
+            return
         try:
             n = max(1, int(count.get().strip()))
         except ValueError:
@@ -3099,10 +3264,13 @@ def open_generate_dialog(parent, text_widget):
         if raw and not rotating.get():
             try:
                 lt = max(1, int(raw))
+                if unit.get() == "hr":
+                    lt *= 60                      # normalise to minutes
             except ValueError:
                 lt = None
-        lines, err = generate_resi_batch(provider.get(), rtype, regions, lt, n,
-                                         rotating.get())
+        asns = [a.strip() for a in re.split(r"[\s,]+", ph_asns.get()) if a.strip()]
+        lines, err = generate_resi_multi(providers, rtype, regions, lt, n,
+                                         rotating.get(), asns)
         if err:
             messagebox.showerror("Generate batch", err)
             return
@@ -3854,8 +4022,9 @@ class SettingsTab(ttk.Frame):
         r += 1
         ttk.Label(host,
                   text="One box per provider, as username:password. Oxylabs "
-                       "Mobile fills the ASN Tester login; Residential / IPRoyal "
-                       "feed 'Generate batch'.",
+                       "Mobile fills the ASN Tester login; the residential "
+                       "providers feed 'Generate batch'. Proxy-Haus username is "
+                       "the package (e.g. pkg-hausresi).",
                   style="Muted.TLabel").grid(row=r, column=0, columnspan=2,
                                              sticky="w", pady=(0, 8))
         r += 1
@@ -3865,6 +4034,8 @@ class SettingsTab(ttk.Frame):
             "oxylabs_resi", ("oxylabs_resi_user", "oxylabs_resi_pass")))
         self.ipr = tk.StringVar(value=provider_creds_display(
             "iproyal", ("iproyal_user", "iproyal_pass")))
+        self.smartproxy = tk.StringVar(value=provider_creds_display("smartproxy"))
+        self.proxyhaus = tk.StringVar(value=provider_creds_display("proxyhaus"))
 
         def cred_row(label, var):
             nonlocal r
@@ -3877,6 +4048,9 @@ class SettingsTab(ttk.Frame):
         cred_row("Oxylabs Mobile (username:password)", self.oxy_mobile)
         cred_row("Oxylabs Residential (username:password)", self.oxy_resi)
         cred_row("IPRoyal (username:password)", self.ipr)
+        cred_row("Smartproxy (username:password)", self.smartproxy)
+        cred_row("Proxy-Haus (username:password, user is pkg-hausresi)",
+                 self.proxyhaus)
 
         ttk.Separator(host, orient="horizontal").grid(
             row=r, column=0, columnspan=2, sticky="ew", pady=14)
@@ -3894,7 +4068,8 @@ class SettingsTab(ttk.Frame):
         # Auto-save: any edit persists after a short debounce, so a forgotten
         # click on 'Save settings' can never silently drop a key again.
         for _v in (self.ipqs, self.pcheck, self.ipinfo, self.oxy_mobile,
-                   self.oxy_resi, self.ipr, self.workers):
+                   self.oxy_resi, self.ipr, self.smartproxy, self.proxyhaus,
+                   self.workers):
             _v.trace_add("write", self._schedule_autosave)
         ttk.Label(host,
                   text="Higher = faster on big lists (network-bound). Default "
@@ -3930,6 +4105,8 @@ class SettingsTab(ttk.Frame):
         save_setting("oxylabs_mobile", self.oxy_mobile.get().strip())
         save_setting("oxylabs_resi", self.oxy_resi.get().strip())
         save_setting("iproyal", self.ipr.get().strip())
+        save_setting("smartproxy", self.smartproxy.get().strip())
+        save_setting("proxyhaus", self.proxyhaus.get().strip())
         try:
             w = max(1, min(MAX_WORKERS_CAP, int(self.workers.get().strip())))
         except (TypeError, ValueError):
