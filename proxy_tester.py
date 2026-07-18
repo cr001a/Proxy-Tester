@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.64"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.65"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1298,13 +1298,14 @@ def _build_iproyal_resi(user, pw, state, city, lifetime, sessid, asn=None):
     return f"geo.iproyal.com:12321:{user}:{p}"
 
 
-def _build_smartproxy_resi(user, pw, state, city, lifetime, sessid, asn=None):
-    # gate.smartproxy.vip: params live in the username; sticky via -session-
-    # (numeric token). No lifetime token - the IP holds inherently (~30m max).
-    u = f"{user}-country-US"
+def _build_brightdata_resi(user, pw, state, city, lifetime, sessid, asn=None):
+    # zproxy.lum-superproxy.com: params live in the username; sticky via
+    # -session- (numeric token). No lifetime token - the IP holds inherently
+    # (~30m max). The account username already carries the zone.
+    u = f"{user}-dns-remote-country-US"
     if sessid:
         u += f"-session-{sessid}"
-    return f"gate.smartproxy.vip:7000:{u}:{pw}"
+    return f"zproxy.lum-superproxy.com:32223:{u}:{pw}"
 
 
 def _build_proxyhaus_resi(user, pw, state, city, lifetime, sessid, asn=None):
@@ -1322,7 +1323,7 @@ def _build_proxyhaus_resi(user, pw, state, city, lifetime, sessid, asn=None):
 # 'user:pass' setting; `legacy` -> the old split keys, kept for migration.
 # `max_min` is the hardcoded sticky-lifetime cap in MINUTES, ENFORCED (a request
 # over it is refused, not silently clamped); None = provider has no lifetime
-# token (Smartproxy). `sessid` builds a session token in the provider's own
+# token (Bright Data). `sessid` builds a session token in the provider's own
 # style. `supports_asn` = proxy-haus.
 RESI_PROVIDERS = {
     "Oxylabs Residential": {
@@ -1337,10 +1338,10 @@ RESI_PROVIDERS = {
         "build": _build_iproyal_resi,
         "max_min": 168 * 60, "sessid": lambda: _resi_sessid(8),
     },
-    "Smartproxy": {
-        "key": "smartproxy",
+    "Bright Data": {
+        "key": "brightdata",
         "legacy": None,
-        "build": _build_smartproxy_resi,
+        "build": _build_brightdata_resi,
         "max_min": None, "sessid": lambda: _sessid_num(8),
     },
     "Proxy-Haus": {
@@ -1404,6 +1405,16 @@ def _fmt_minutes(m):
     return f"{m}m"
 
 
+def _parse_life(s):
+    """Parse a sticky-lifetime entry to minutes. Accepts '30', '30m', '2h',
+    '90 min'. Returns None if blank/unparseable ('h' anywhere means hours)."""
+    s = (s or "").strip().lower()
+    num = re.sub(r"[^0-9]", "", s)
+    if not num:
+        return None
+    return max(1, int(num) * (60 if "h" in s else 1))
+
+
 def resi_lifetime_error(provider, lifetime_min):
     """Return an error if `lifetime_min` (minutes) exceeds the provider's
     hardcoded sticky maximum, else None. Refused, never silently clamped."""
@@ -1448,24 +1459,18 @@ def generate_resi_batch(provider, region_type, regions, lifetime_min, count,
     return lines, None
 
 
-def generate_resi_multi(providers, region_type, regions, lifetime_min, count,
+def generate_resi_multi(providers, region_type, regions, lifetimes, count,
                         rotating=False, asns=None):
     """Generate `count` lines for EACH selected provider and concatenate them.
-    Validates every provider's sticky limit up front: if any is exceeded,
-    nothing is generated and the offending providers are named. Returns
-    (lines, error_or_None)."""
+    `lifetimes` is a {provider: minutes} map so each provider can have its own
+    sticky time. Any provider whose time exceeds its cap aborts the whole run
+    with a naming error. Returns (lines, error_or_None)."""
     if not providers:
         return [], "Select at least one provider."
-    if not rotating and lifetime_min:
-        bad = [p for p in providers if resi_lifetime_error(p, lifetime_min)]
-        if bad:
-            caps = ", ".join(
-                f"{p} {_fmt_minutes(RESI_PROVIDERS[p]['max_min'])}" for p in bad)
-            return [], (f"Sticky lifetime {_fmt_minutes(lifetime_min)} exceeds: "
-                        f"{caps}. Lower it (or switch those off) and try again.")
     all_lines = []
     for p in providers:
-        lines, err = generate_resi_batch(p, region_type, regions, lifetime_min,
+        lt = None if rotating else (lifetimes or {}).get(p)
+        lines, err = generate_resi_batch(p, region_type, regions, lt,
                                          count, rotating, asns)
         if err:
             return [], err
@@ -3175,15 +3180,15 @@ class ConverterTab(ttk.Frame):
 
 def open_generate_dialog(parent, text_widget):
     """Batch generator: build proxy lines for one or more residential providers
-    at once and drop them into `text_widget`. Shared settings (lifetime, count,
-    location) apply to every checked provider; the only provider-specific input
-    is the optional Proxy-Haus ASN list."""
+    at once and drop them into `text_widget`. Each checked provider gets its OWN
+    sticky lifetime (with its max called out); shared settings are count and
+    location. Proxy-Haus adds a click-to-pick ASN menu."""
     configured = configured_resi_providers()
     if not configured:
         messagebox.showinfo(
             "Generate batch",
             "Add a provider's username:password on the Settings tab first "
-            "(Oxylabs Residential, IPRoyal, Smartproxy, or Proxy-Haus).")
+            "(Oxylabs Residential, IPRoyal, Bright Data, or Proxy-Haus).")
         return
     top = tk.Toplevel(parent)
     top.title("Generate residential batch")
@@ -3191,36 +3196,59 @@ def open_generate_dialog(parent, text_widget):
     top.transient(parent.winfo_toplevel())
     top.resizable(False, False)
 
-    # All configured providers start checked - the common case is "generate my
-    # standard batch from every provider at once".
     provider_vars = {name: tk.BooleanVar(value=True) for name in configured}
+    life_vars = {}            # provider -> StringVar (only providers with a cap)
     region_type = tk.StringVar(value="Country")
-    lifetime = tk.StringVar(value="30")
-    unit = tk.StringVar(value="m")
     count = tk.StringVar(value="500")
-    ph_asns = tk.StringVar(value="")
     rotating = tk.BooleanVar(value=False)
     append = tk.BooleanVar(value=False)
     region_vars = {}          # canonical -> BooleanVar (rebuilt per region type)
+    asn_vars = {a: tk.BooleanVar(value=False) for a, _, _ in PROXYHAUS_ASNS}
 
     frm = ttk.Frame(top, padding=(16, 14))
     frm.pack(fill="both", expand=True)
     row = 0
 
-    ttk.Label(frm, text="Providers (check to include)").grid(
-        row=row, column=0, columnspan=2, sticky="w", pady=(0, 2))
+    ttk.Label(frm, text="Providers (check to include; set each one's sticky "
+                        "lifetime)").grid(row=row, column=0, columnspan=2,
+                                          sticky="w", pady=(0, 4))
     row += 1
     prov_box = ttk.Frame(frm)
     prov_box.grid(row=row, column=0, columnspan=2, sticky="w")
     row += 1
-    for name in configured:
+    prov_life_frames = {}
+    for i, name in enumerate(configured):
+        spec = RESI_PROVIDERS[name]
         ttk.Checkbutton(prov_box, text=name, variable=provider_vars[name],
-                        command=lambda: refresh_cap()).pack(side="left",
-                                                            padx=(0, 12))
+                        command=lambda: refresh_ui()).grid(
+            row=i, column=0, sticky="w", pady=2, padx=(0, 10))
+        lf = ttk.Frame(prov_box)
+        lf.grid(row=i, column=1, sticky="w")
+        prov_life_frames[name] = lf
+        mx = spec.get("max_min")
+        if mx:
+            lv = tk.StringVar(value="30m")
+            life_vars[name] = lv
+            ttk.Label(lf, text="sticky").pack(side="left")
+            ttk.Entry(lf, textvariable=lv, width=8).pack(side="left", padx=(4, 4))
+            ttk.Label(lf, text=f"(max {_fmt_minutes(mx)})",
+                      style="Muted.TLabel").pack(side="left")
+        else:
+            ttk.Label(lf, text="(no lifetime token; sticky IP holds ~30m)",
+                      style="Muted.TLabel").pack(side="left")
+
+    def set_all_max():
+        for pname, lv in life_vars.items():
+            lv.set(_fmt_minutes(RESI_PROVIDERS[pname]["max_min"]))
+
+    mrow = ttk.Frame(frm)
+    mrow.grid(row=row, column=0, columnspan=2, sticky="w", pady=(2, 0))
+    row += 1
+    ttk.Button(mrow, text="Set all to max", command=set_all_max).pack(side="left")
 
     ttk.Label(frm, text="Country: United States (fixed)",
               style="Muted.TLabel").grid(row=row, column=0, columnspan=2,
-                                         sticky="w", pady=(6, 2))
+                                         sticky="w", pady=(8, 2))
     row += 1
     ttk.Label(frm, text="Region type").grid(row=row, column=0, sticky="w",
                                             pady=4)
@@ -3237,7 +3265,7 @@ def open_generate_dialog(parent, text_widget):
     holder.grid(row=row, column=0, columnspan=2, sticky="w")
     row += 1
     canvas = tk.Canvas(holder, bg=SURFACE, highlightthickness=1,
-                       highlightbackground=SURFACE2, width=300, height=170)
+                       highlightbackground=SURFACE2, width=300, height=150)
     vsb = ttk.Scrollbar(holder, orient="vertical", command=canvas.yview)
     inner = ttk.Frame(canvas)
     inner.bind("<Configure>",
@@ -3270,54 +3298,53 @@ def open_generate_dialog(parent, text_widget):
     region_type.trace_add("write", rebuild_regions)
     rebuild_regions()
 
-    opt = ttk.Frame(frm)
-    opt.grid(row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
-    row += 1
-    ttk.Label(opt, text="Sticky lifetime").pack(side="left")
-    ttk.Entry(opt, textvariable=lifetime, width=6).pack(side="left", padx=(6, 4))
-    ttk.Combobox(opt, textvariable=unit, width=4, state="readonly",
-                 values=["min", "hr"]).pack(side="left", padx=(0, 8))
-    life_hint = ttk.Label(opt, text="", style="Muted.TLabel")
-    life_hint.pack(side="left")
-
     cnt = ttk.Frame(frm)
-    cnt.grid(row=row, column=0, columnspan=2, sticky="w", pady=(2, 0))
+    cnt.grid(row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
     row += 1
     ttk.Label(cnt, text="Count (per provider)").pack(side="left")
     ttk.Entry(cnt, textvariable=count, width=8).pack(side="left", padx=(6, 0))
 
+    # Proxy-Haus ASN picker: a dropdown of checkable carriers (pick any number).
     asn_row = ttk.Frame(frm)
-    asn_row.grid(row=row, column=0, columnspan=2, sticky="w", pady=(2, 0))
+    asn_row.grid(row=row, column=0, columnspan=2, sticky="w", pady=(4, 0))
     row += 1
-    ttk.Label(asn_row, text="Proxy-Haus ASN(s)").pack(side="left")
-    ttk.Entry(asn_row, textvariable=ph_asns, width=24).pack(side="left",
-                                                            padx=(6, 6))
-    ttk.Label(asn_row, text="comma-sep, optional (Proxy-Haus only)",
+    ttk.Label(asn_row, text="Proxy-Haus ASNs").pack(side="left")
+    asn_mb = ttk.Menubutton(asn_row, text="Choose ASNs  ▾")
+    asn_menu = tk.Menu(asn_mb, tearoff=0, bg=MANTLE, fg=TEXT,
+                       activebackground=MAUVE, activeforeground=BASE,
+                       selectcolor=MAUVE)
+    asn_mb["menu"] = asn_menu
+    for a, aname, cat in PROXYHAUS_ASNS:
+        asn_menu.add_checkbutton(label=f"{aname}  ({a})", variable=asn_vars[a])
+    asn_mb.pack(side="left", padx=(6, 6))
+    ttk.Label(asn_row, text="click any number; optional",
               style="Muted.TLabel").pack(side="left")
 
-    def refresh_cap(*_):
-        """Show the binding sticky cap = the smallest max among CHECKED providers
-        that encode a lifetime, so the user can pick one value that's valid for
-        all of them."""
-        checked = [n for n, v in provider_vars.items() if v.get()]
-        caps = [(RESI_PROVIDERS[n]["max_min"], n) for n in checked
-                if RESI_PROVIDERS[n].get("max_min")]
-        if not caps:
-            life_hint.config(text="(no lifetime cap for the checked providers)")
-            return
-        mx, who = min(caps)
-        life_hint.config(text=f"max {_fmt_minutes(mx)} ({who})")
-
-    refresh_cap()
-
-    ttk.Checkbutton(frm, text="Rotating (new IP per request, no sticky session)",
-                    variable=rotating).grid(row=row, column=0, columnspan=2,
-                                            sticky="w", pady=(6, 0))
+    rot_cb = ttk.Checkbutton(
+        frm, text="Rotating (new IP per request, no sticky session)",
+        variable=rotating)
+    rot_cb.grid(row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
     row += 1
     ttk.Checkbutton(frm, text="Append to existing list (instead of replacing)",
                     variable=append).grid(row=row, column=0, columnspan=2,
                                           sticky="w")
     row += 1
+
+    def refresh_ui(*_):
+        """Show a provider's lifetime box only while it's checked; show the ASN
+        picker only while Proxy-Haus is checked."""
+        for pname, lf in prov_life_frames.items():
+            if provider_vars[pname].get():
+                lf.grid()
+            else:
+                lf.grid_remove()
+        ph = provider_vars.get("Proxy-Haus")
+        if ph and ph.get():
+            asn_row.grid()
+        else:
+            asn_row.grid_remove()
+
+    refresh_ui()
 
     def gen():
         providers = [n for n, v in provider_vars.items() if v.get()]
@@ -3337,17 +3364,10 @@ def open_generate_dialog(parent, text_widget):
                 f"Check at least one {rtype.lower()}, or set Region type to "
                 "Country.")
             return
-        lt = None
-        raw = lifetime.get().strip()
-        if raw and not rotating.get():
-            try:
-                lt = max(1, int(raw))
-                if unit.get() == "hr":
-                    lt *= 60                      # normalise to minutes
-            except ValueError:
-                lt = None
-        asns = [a.strip() for a in re.split(r"[\s,]+", ph_asns.get()) if a.strip()]
-        lines, err = generate_resi_multi(providers, rtype, regions, lt, n,
+        lifetimes = {name: _parse_life(life_vars[name].get())
+                     for name in providers if name in life_vars}
+        asns = [a for a, v in asn_vars.items() if v.get()]
+        lines, err = generate_resi_multi(providers, rtype, regions, lifetimes, n,
                                          rotating.get(), asns)
         if err:
             messagebox.showerror("Generate batch", err)
@@ -4111,7 +4131,7 @@ class SettingsTab(ttk.Frame):
             "oxylabs_resi", ("oxylabs_resi_user", "oxylabs_resi_pass")))
         self.ipr = tk.StringVar(value=provider_creds_display(
             "iproyal", ("iproyal_user", "iproyal_pass")))
-        self.smartproxy = tk.StringVar(value=provider_creds_display("smartproxy"))
+        self.brightdata = tk.StringVar(value=provider_creds_display("brightdata"))
         self.proxyhaus = tk.StringVar(value=provider_creds_display("proxyhaus"))
 
         def cred_row(label, var):
@@ -4125,7 +4145,7 @@ class SettingsTab(ttk.Frame):
         cred_row("Oxylabs Mobile (username:password)", self.oxy_mobile)
         cred_row("Oxylabs Residential (username:password)", self.oxy_resi)
         cred_row("IPRoyal (username:password)", self.ipr)
-        cred_row("Smartproxy (username:password)", self.smartproxy)
+        cred_row("Bright Data (username:password)", self.brightdata)
         cred_row("Proxy-Haus (username:password)", self.proxyhaus)
 
         ttk.Separator(host, orient="horizontal").grid(
@@ -4144,7 +4164,7 @@ class SettingsTab(ttk.Frame):
         # Auto-save: any edit persists after a short debounce, so a forgotten
         # click on 'Save settings' can never silently drop a key again.
         for _v in (self.ipqs, self.pcheck, self.ipinfo, self.oxy_mobile,
-                   self.oxy_resi, self.ipr, self.smartproxy, self.proxyhaus,
+                   self.oxy_resi, self.ipr, self.brightdata, self.proxyhaus,
                    self.workers):
             _v.trace_add("write", self._schedule_autosave)
         ttk.Label(host,
@@ -4181,7 +4201,7 @@ class SettingsTab(ttk.Frame):
         save_setting("oxylabs_mobile", self.oxy_mobile.get().strip())
         save_setting("oxylabs_resi", self.oxy_resi.get().strip())
         save_setting("iproyal", self.ipr.get().strip())
-        save_setting("smartproxy", self.smartproxy.get().strip())
+        save_setting("brightdata", self.brightdata.get().strip())
         save_setting("proxyhaus", self.proxyhaus.get().strip())
         try:
             w = max(1, min(MAX_WORKERS_CAP, int(self.workers.get().strip())))

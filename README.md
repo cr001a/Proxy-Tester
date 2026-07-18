@@ -78,14 +78,15 @@ under **Strict only**. No API key needed; pinned ASNs persist in
 
 **Generate batch** (Proxy Tester / IP Quality tabs) builds sticky or rotating
 residential proxies for **one or more providers at once** —
-**Oxylabs Residential**, **IPRoyal**, **Smartproxy**, and **Proxy-Haus**. Check
-the providers you want, set your shared **sticky lifetime**, **count per
-provider**, and **location** once, and it generates a combined list. Each
-provider's exact session-string format is built for you, and each provider's
-**sticky-lifetime cap is hardcoded and enforced** — Oxylabs 1440 min, IPRoyal
-59 min / 168 h, Proxy-Haus 120 min, Smartproxy inherent (~30 min, no token). If
-your lifetime exceeds a checked provider's cap it warns and generates nothing.
-Proxy-Haus can additionally target carrier **ASNs** via an optional field.
+**Oxylabs Residential**, **IPRoyal**, **Bright Data**, and **Proxy-Haus**. Check
+the providers you want; each checked provider gets **its own sticky-lifetime
+box** (with its max shown), and a **Set all to max** button fills them all to
+their caps at once. The **sticky-lifetime cap is hardcoded and enforced** —
+Oxylabs 1440 min (24 h), IPRoyal 59 min / 168 h, Proxy-Haus 120 min, Bright Data
+inherent (~30 min, no token). If any provider's lifetime exceeds its cap it warns
+and generates nothing. Set **count per provider** and **location** once for the
+whole batch. Proxy-Haus adds a **click-to-pick ASN menu** (choose any number of
+carriers). Lifetime accepts `30`, `30m`, or `2h`.
 
 The **ASN Tester** tab also generates per-ASN proxies (static or rotating) for
 the selected provider. Adding a provider is a small change in `RESI_PROVIDERS` /
@@ -98,7 +99,7 @@ Provider logins live on the **Settings** tab, one box per provider as
 
 - **Oxylabs Mobile** and **Proxy-Haus** — auto-fill the ASN Tester's
   Username/Password when their provider is selected.
-- **Oxylabs Residential**, **IPRoyal**, **Smartproxy**, **Proxy-Haus** — feed
+- **Oxylabs Residential**, **IPRoyal**, **Bright Data**, **Proxy-Haus** — feed
   the **Generate batch** dialog; a provider only appears there once its box is
   filled in.
 
