@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.65"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.66"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1325,18 +1325,25 @@ def _build_proxyhaus_resi(user, pw, state, city, lifetime, sessid, asn=None):
 # over it is refused, not silently clamped); None = provider has no lifetime
 # token (Bright Data). `sessid` builds a session token in the provider's own
 # style. `supports_asn` = proxy-haus.
+# `max_min` is the hardcoded sticky cap in MINUTES. `min_max`/`hr_max` are the
+# largest values each provider accepts in its minute-format vs whole-hour format
+# (IPRoyal, e.g., only takes 1-59 in minutes but 1-168 in hours); `life_rule` is
+# the human summary shown/enforced. Providers with max_min=None (Bright Data)
+# have no lifetime token at all.
 RESI_PROVIDERS = {
     "Oxylabs Residential": {
         "key": "oxylabs_resi",
         "legacy": ("oxylabs_resi_user", "oxylabs_resi_pass"),
         "build": _build_oxylabs_resi,
-        "max_min": 1440, "sessid": lambda: _sessid_num(10),
+        "max_min": 1440, "min_max": 1440, "hr_max": 24,
+        "life_rule": "1-1440m or 1-24h", "sessid": lambda: _sessid_num(10),
     },
     "IPRoyal": {
         "key": "iproyal",
         "legacy": ("iproyal_user", "iproyal_pass"),
         "build": _build_iproyal_resi,
-        "max_min": 168 * 60, "sessid": lambda: _resi_sessid(8),
+        "max_min": 168 * 60, "min_max": 59, "hr_max": 168,
+        "life_rule": "1-59m or 1-168h", "sessid": lambda: _resi_sessid(8),
     },
     "Bright Data": {
         "key": "brightdata",
@@ -1348,10 +1355,40 @@ RESI_PROVIDERS = {
         "key": "proxyhaus",
         "legacy": None,
         "build": _build_proxyhaus_resi,
-        "max_min": 120, "sessid": lambda: _sessid_lower(8),
+        "max_min": 120, "min_max": 120, "hr_max": 2,
+        "life_rule": "1-120m or 1-2h", "sessid": lambda: _sessid_lower(8),
         "supports_asn": True,
     },
 }
+
+
+def validate_resi_life(provider, raw):
+    """Parse a per-provider sticky-lifetime entry and enforce that provider's
+    real format rules. Returns (minutes, error). Rejects decimals, wrong units,
+    and out-of-range values (so 0.5h, 90m on IPRoyal, or 169h never generate)."""
+    spec = RESI_PROVIDERS.get(provider, {})
+    if spec.get("max_min") is None:
+        return None, None                 # no lifetime token (Bright Data)
+    rule = spec.get("life_rule", "")
+    s = (raw or "").strip().lower().replace(" ", "")
+    m = re.fullmatch(r"(\d+)(m|min|mins|minutes|h|hr|hrs|hour|hours)?", s)
+    if not m:
+        return None, (f"{provider}: '{raw or '(blank)'}' isn't valid - enter a "
+                      f"whole number of minutes or hours, e.g. 30m or 2h "
+                      f"({rule}).")
+    val = int(m.group(1))
+    is_hr = (m.group(2) or "m").startswith("h")
+    if val < 1:
+        return None, f"{provider}: lifetime must be at least 1 ({rule})."
+    if is_hr:
+        if val > spec["hr_max"]:
+            return None, f"{provider}: max is {spec['hr_max']}h ({rule})."
+        return val * 60, None
+    if val > spec["min_max"]:
+        return None, (f"{provider}: {val}m is over the {spec['min_max']}m "
+                      f"minute-format limit - use whole hours above that "
+                      f"({rule}).")
+    return val, None
 
 
 def configured_resi_providers():
@@ -1405,16 +1442,6 @@ def _fmt_minutes(m):
     return f"{m}m"
 
 
-def _parse_life(s):
-    """Parse a sticky-lifetime entry to minutes. Accepts '30', '30m', '2h',
-    '90 min'. Returns None if blank/unparseable ('h' anywhere means hours)."""
-    s = (s or "").strip().lower()
-    num = re.sub(r"[^0-9]", "", s)
-    if not num:
-        return None
-    return max(1, int(num) * (60 if "h" in s else 1))
-
-
 def resi_lifetime_error(provider, lifetime_min):
     """Return an error if `lifetime_min` (minutes) exceeds the provider's
     hardcoded sticky maximum, else None. Refused, never silently clamped."""
@@ -1441,6 +1468,13 @@ def generate_resi_batch(provider, region_type, regions, lifetime_min, count,
     user, pw = load_provider_creds(spec["key"], spec.get("legacy"))
     if not user or not pw:
         return [], f"Add {provider} username:password on the Settings tab first."
+    # A space inside a proxy username is never valid - it's almost always a typo
+    # (e.g. a space where an underscore should be) that would auth-fail (407).
+    # Catch it here with a clear message instead of emitting a broken proxy.
+    if " " in user:
+        return [], (f"{provider} username contains a space: '{user}'. That's "
+                    "almost certainly meant to be an underscore - fix it in the "
+                    "Settings credential box.")
     if not rotating:
         err = resi_lifetime_error(provider, lifetime_min)
         if err:
@@ -3231,7 +3265,7 @@ def open_generate_dialog(parent, text_widget):
             life_vars[name] = lv
             ttk.Label(lf, text="sticky").pack(side="left")
             ttk.Entry(lf, textvariable=lv, width=8).pack(side="left", padx=(4, 4))
-            ttk.Label(lf, text=f"(max {_fmt_minutes(mx)})",
+            ttk.Label(lf, text=f"({spec.get('life_rule', '')})",
                       style="Muted.TLabel").pack(side="left")
         else:
             ttk.Label(lf, text="(no lifetime token; sticky IP holds ~30m)",
@@ -3304,20 +3338,46 @@ def open_generate_dialog(parent, text_widget):
     ttk.Label(cnt, text="Count (per provider)").pack(side="left")
     ttk.Entry(cnt, textvariable=count, width=8).pack(side="left", padx=(6, 0))
 
-    # Proxy-Haus ASN picker: a dropdown of checkable carriers (pick any number).
+    # Proxy-Haus ASN picker: a button that opens a small STAY-OPEN popup of
+    # checkable carriers (a native menu closes on each click, which the multi-
+    # select here needs to avoid). The button label shows how many are picked.
     asn_row = ttk.Frame(frm)
     asn_row.grid(row=row, column=0, columnspan=2, sticky="w", pady=(4, 0))
     row += 1
     ttk.Label(asn_row, text="Proxy-Haus ASNs").pack(side="left")
-    asn_mb = ttk.Menubutton(asn_row, text="Choose ASNs  ▾")
-    asn_menu = tk.Menu(asn_mb, tearoff=0, bg=MANTLE, fg=TEXT,
-                       activebackground=MAUVE, activeforeground=BASE,
-                       selectcolor=MAUVE)
-    asn_mb["menu"] = asn_menu
-    for a, aname, cat in PROXYHAUS_ASNS:
-        asn_menu.add_checkbutton(label=f"{aname}  ({a})", variable=asn_vars[a])
-    asn_mb.pack(side="left", padx=(6, 6))
-    ttk.Label(asn_row, text="click any number; optional",
+
+    def asn_btn_label():
+        n = sum(1 for v in asn_vars.values() if v.get())
+        return f"{n} selected  ▾" if n else "Choose ASNs  ▾"
+
+    def open_asn_popup():
+        pop = tk.Toplevel(top)
+        pop.title("Proxy-Haus ASNs")
+        pop.configure(bg=BASE)
+        pop.transient(top)
+        pop.resizable(False, False)
+        pf = ttk.Frame(pop, padding=10)
+        pf.pack(fill="both", expand=True)
+        ttk.Label(pf, text="Check any number of carriers:").pack(
+            anchor="w", pady=(0, 4))
+        for a, aname, cat in PROXYHAUS_ASNS:
+            ttk.Checkbutton(pf, text=f"{aname}  (AS{a})",
+                            variable=asn_vars[a]).pack(anchor="w", pady=1)
+        ttk.Button(pf, text="Done", style="Accent.TButton",
+                   command=pop.destroy).pack(anchor="w", pady=(8, 0))
+        pop.bind("<Escape>", lambda _e: pop.destroy())
+        pop.protocol("WM_DELETE_WINDOW", pop.destroy)
+        pop.update_idletasks()
+        pop.geometry(f"+{asn_btn.winfo_rootx()}"
+                     f"+{asn_btn.winfo_rooty() + asn_btn.winfo_height() + 2}")
+        pop.grab_set()
+        # Refresh the count on the trigger button once the popup is dismissed.
+        pop.bind("<Destroy>", lambda e: asn_btn.config(text=asn_btn_label())
+                 if e.widget is pop else None)
+
+    asn_btn = ttk.Button(asn_row, text="Choose ASNs  ▾", command=open_asn_popup)
+    asn_btn.pack(side="left", padx=(6, 6))
+    ttk.Label(asn_row, text="pick any number; optional",
               style="Muted.TLabel").pack(side="left")
 
     rot_cb = ttk.Checkbutton(
@@ -3364,8 +3424,19 @@ def open_generate_dialog(parent, text_widget):
                 f"Check at least one {rtype.lower()}, or set Region type to "
                 "Country.")
             return
-        lifetimes = {name: _parse_life(life_vars[name].get())
-                     for name in providers if name in life_vars}
+        # Validate each provider's sticky lifetime against its real format rules
+        # BEFORE generating - reject and name the first bad one (unless rotating,
+        # where lifetime is irrelevant).
+        lifetimes = {}
+        if not rotating.get():
+            for name in providers:
+                if name not in life_vars:
+                    continue
+                mins, lerr = validate_resi_life(name, life_vars[name].get())
+                if lerr:
+                    messagebox.showerror("Generate batch", lerr)
+                    return
+                lifetimes[name] = mins
         asns = [a for a, v in asn_vars.items() if v.get()]
         lines, err = generate_resi_multi(providers, rtype, regions, lifetimes, n,
                                          rotating.get(), asns)
