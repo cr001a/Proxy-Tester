@@ -52,10 +52,10 @@ except ImportError:  # logo is optional
 
 DEFAULT_TIMEOUT = 15   # seconds, per request
 MAX_WORKERS = 6        # legacy default (kept for reference)
-DEFAULT_WORKERS = 40   # parallel workers; overridable on the Settings tab
+DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.60"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.61"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -842,8 +842,8 @@ AGGREGATE_PROVIDER = "All providers (fused)"
 # - score_ip handles it by running all the keyed providers below.
 QUALITY_PROVIDERS = {
     AGGREGATE_PROVIDER: ("", None),
-    "IPinfo": ("ipinfo_token", ipinfo_lookup),
     "proxycheck.io": ("proxycheck_api_key", proxycheck_lookup),
+    "IPinfo": ("ipinfo_token", ipinfo_lookup),
     "IPQualityScore": ("ipqs_api_key", ipqs_lookup),
 }
 
@@ -1124,13 +1124,20 @@ def save_setting(key, value):
         pass
 
 
+MAX_WORKERS_CAP = 500  # upper clamp. proxycheck.io load-balances one hostname
+                       # across ~14 cluster nodes (200 req/s EACH => ~2,800/s
+                       # aggregate), and IPinfo paid is unthrottled, so hundreds
+                       # of concurrent workers are absorbed without targeting
+                       # individual nodes. Threads are the real cost at this end.
+
+
 def get_workers():
     """Parallel worker count (from Settings), clamped to a sane range."""
     try:
         n = int(load_setting("concurrency", DEFAULT_WORKERS))
     except (TypeError, ValueError):
         n = DEFAULT_WORKERS
-    return max(1, min(100, n))
+    return max(1, min(MAX_WORKERS_CAP, n))
 
 
 def split_creds(value):
@@ -2397,7 +2404,7 @@ class ProxyTab(ttk.Frame):
         # Proxy testing is pure network I/O, so parallelism is the main speed
         # lever. Honour a higher Settings concurrency, but floor at 40 for big
         # lists so a large run isn't throttled by a low saved value.
-        workers = min(100, max(get_workers(), min(len(proxies), 40)))
+        workers = min(MAX_WORKERS_CAP, max(get_workers(), min(len(proxies), 40)))
         try:
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = {
@@ -2588,7 +2595,7 @@ class ProxyTab(ttk.Frame):
 
     def _proxy_ping_worker(self, proxies, target, runs):
         name, url = target
-        workers = min(100, max(get_workers(), min(len(proxies), 40)))
+        workers = min(MAX_WORKERS_CAP, max(get_workers(), min(len(proxies), 40)))
         try:
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 futs = {pool.submit(ping_site_via_proxy, p, name, url, runs,
@@ -3171,12 +3178,12 @@ class QualityTab(ttk.Frame):
         self.proxy_text.bind("<<Paste>>", self._on_paste_proxies)
         self.proxy_text.bind("<<Modified>>", self._update_proxy_count)
 
-        # Default to the aggregate: it runs every provider you've keyed (IPinfo
-        # is the anchor) and fuses them into one Trust score. Fall back to it if
-        # the saved provider no longer exists.
-        _saved_prov = load_setting("quality_provider", AGGREGATE_PROVIDER)
+        # Default to proxycheck.io - highest request rate (200/s per node) and
+        # cheap/high-volume, so it's the primary screen; IPinfo is second. Fall
+        # back to it if the saved provider no longer exists.
+        _saved_prov = load_setting("quality_provider", "proxycheck.io")
         if _saved_prov not in QUALITY_PROVIDERS:
-            _saved_prov = AGGREGATE_PROVIDER
+            _saved_prov = "proxycheck.io"
         self.provider = tk.StringVar(value=_saved_prov)
         ttk.Label(form, text="Reputation provider").grid(
             row=1, column=1, sticky="w")
@@ -3877,7 +3884,7 @@ class SettingsTab(ttk.Frame):
         ttk.Label(host, text="Performance", style="Header.TLabel").grid(
             row=r, column=0, columnspan=2, sticky="w", pady=(0, 4))
         r += 1
-        ttk.Label(host, text="Concurrency (parallel workers, 1-100)").grid(
+        ttk.Label(host, text="Concurrency (parallel workers, 1-500)").grid(
             row=r, column=0, sticky="w", pady=4)
         wkr = ttk.Entry(host, textvariable=self.workers, width=6)
         wkr.grid(row=r, column=1, sticky="w", pady=4, padx=(10, 0))
@@ -3890,8 +3897,10 @@ class SettingsTab(ttk.Frame):
                    self.oxy_resi, self.ipr, self.workers):
             _v.trace_add("write", self._schedule_autosave)
         ttk.Label(host,
-                  text="Higher = faster on big lists (network-bound). Too high "
-                       "may trip a provider's rate limit. 20-40 is a good range.",
+                  text="Higher = faster on big lists (network-bound). Default "
+                       "200; proxycheck.io's cluster absorbs ~2,800 req/s and "
+                       "IPinfo paid is unthrottled. 300-500 works; the limit is "
+                       "usually YOUR proxy provider (exit-IP stage) + threads.",
                   style="Muted.TLabel").grid(row=r, column=0, columnspan=2,
                                              sticky="w")
         r += 1
@@ -3922,7 +3931,7 @@ class SettingsTab(ttk.Frame):
         save_setting("oxylabs_resi", self.oxy_resi.get().strip())
         save_setting("iproyal", self.ipr.get().strip())
         try:
-            w = max(1, min(100, int(self.workers.get().strip())))
+            w = max(1, min(MAX_WORKERS_CAP, int(self.workers.get().strip())))
         except (TypeError, ValueError):
             w = DEFAULT_WORKERS
         save_setting("concurrency", w)
@@ -3934,7 +3943,7 @@ class SettingsTab(ttk.Frame):
     def on_save(self):
         # Manual save also normalizes the worker count shown in the box.
         try:
-            w = max(1, min(100, int(self.workers.get().strip())))
+            w = max(1, min(MAX_WORKERS_CAP, int(self.workers.get().strip())))
         except (TypeError, ValueError):
             w = DEFAULT_WORKERS
         self.workers.set(str(w))
