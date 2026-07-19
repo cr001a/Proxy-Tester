@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.69"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.70"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -199,6 +199,28 @@ def style_text(widget):
                      relief="flat", borderwidth=0, highlightthickness=1,
                      highlightbackground=SURFACE2, highlightcolor=MAUVE,
                      padx=8, pady=6, font=(MONO_FONT, 10))
+
+
+def paste_appends_to_end(text_widget, after=None):
+    """Make <<Paste>> always append the clipboard to the END of the box on a
+    fresh line (never at the cursor), so you can paste list after list without
+    them running together. `after` is an optional callback (e.g. a count
+    refresh) run once the text is in."""
+    def _handler(_event=None):
+        try:
+            clip = text_widget.clipboard_get()
+        except tk.TclError:
+            return "break"
+        cur = text_widget.get("1.0", "end-1c").rstrip("\n")
+        parts = [p for p in (cur, clip.strip("\n")) if p]
+        text_widget.delete("1.0", "end")
+        text_widget.insert("1.0", "\n".join(parts) + "\n")
+        text_widget.mark_set("insert", "end-1c")
+        text_widget.see("end")
+        if after:
+            after()
+        return "break"
+    text_widget.bind("<<Paste>>", _handler)
 
 
 def reveal_on_focus(entry):
@@ -2051,6 +2073,7 @@ class AsnTab(ttk.Frame):
         self.asn_text = tk.Text(asn_frame, width=34, height=4)
         style_text(self.asn_text)
         self.asn_text.pack(fill="x")
+        paste_appends_to_end(self.asn_text)
 
         # Look them up (provider + type) and pin them into the list above so
         # they persist and show even under 'Strict only'.
@@ -2505,6 +2528,10 @@ class ProxyTab(ttk.Frame):
         style_text(self.proxy_text)
         self.proxy_text.grid(row=1, column=0, rowspan=4, sticky="nw", padx=(0, 24))
         self.proxy_text.bind("<<Modified>>", self._update_proxy_count)
+        # Paste appends to the end on a fresh line, so a new list never merges
+        # onto the last proxy.
+        paste_appends_to_end(self.proxy_text,
+                             lambda: self._update_proxy_count(force=True))
 
         self.url = tk.StringVar(value="https://ipinfo.io/json")
         self.runs = tk.StringVar(value="1")
@@ -2903,9 +2930,9 @@ class ProxyTab(ttk.Frame):
             return None
         return (p["host"], str(p["port"]), p.get("user") or "")
 
-    def _update_proxy_count(self, _e=None):
+    def _update_proxy_count(self, _e=None, force=False):
         """Live count of non-empty proxy lines, shown in the box's header."""
-        if not self.proxy_text.edit_modified():
+        if not force and not self.proxy_text.edit_modified():
             return
         n = sum(1 for ln in self.proxy_text.get("1.0", "end").splitlines()
                 if ln.strip())
@@ -3169,6 +3196,7 @@ class ConverterTab(ttk.Frame):
         self.src = tk.Text(self, width=52, height=18)
         style_text(self.src)
         self.src.grid(row=1, column=0, sticky="nsew")
+        paste_appends_to_end(self.src)
 
         mid = ttk.Frame(self)
         mid.grid(row=1, column=1, sticky="ns", padx=14)
