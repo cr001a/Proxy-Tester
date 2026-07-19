@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.70"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.71"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -3576,13 +3576,18 @@ class QualityTab(ttk.Frame):
         ttk.Combobox(form, textvariable=self.provider,
                      values=list(QUALITY_PROVIDERS.keys()), width=22,
                      state="readonly").grid(row=1, column=2, sticky="w", pady=3)
-        ttk.Label(
+        self._prov_help = ttk.Label(
             form,
             text="'All providers (fused)' runs every keyed provider (IPinfo + "
                  "any others) concurrently and merges them - most pessimistic "
                  "signal wins. API keys live in Settings. Unique exit IPs are "
                  "scored once (deduped).",
-            style="Muted.TLabel").grid(row=2, column=1, columnspan=2, sticky="w")
+            style="Muted.TLabel", justify="left")
+        self._prov_help.grid(row=2, column=1, columnspan=2, sticky="w")
+        # Reflow this help text to the window width instead of letting it run
+        # off the right edge when the window is narrow.
+        self.bind("<Configure>", lambda e: self._prov_help.config(
+            wraplength=max(280, e.width - 40)), add="+")
 
         # Speed gate (two-stage funnel): filter on the NEUTRAL exit-IP-discovery
         # latency (proxy -> ipinfo.io/json, which we measure anyway) - so slow
