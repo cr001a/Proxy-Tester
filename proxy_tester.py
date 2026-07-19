@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.71"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.72"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1356,6 +1356,15 @@ def _build_proxyhaus_resi(user, pw, state, city, lifetime, sessid, asn=None):
     return f"us-gw.proxy-haus.com:7777:{u}:{pw}"
 
 
+def _build_rayobyte_resi(user, pw, state, city, lifetime, sessid, asn=None):
+    # la.residential.rayobyte.com: params live in the PASSWORD. Rayobyte has no
+    # rotating mode - it's ALWAYS a hardsession (sticky), so a token is always
+    # emitted (varying it per line gives fresh IPs). Duration in minutes, max 60.
+    sid = sessid or _sessid_lower(8)
+    p = f"{pw}-country-US-hardsession-{sid}-duration-{lifetime or 60}"
+    return f"la.residential.rayobyte.com:8000:{user}:{p}"
+
+
 # Residential providers for the batch generator. `key` -> a combined
 # 'user:pass' setting; `legacy` -> the old split keys, kept for migration.
 # `max_min` is the hardcoded sticky-lifetime cap in MINUTES, ENFORCED (a request
@@ -1395,6 +1404,15 @@ RESI_PROVIDERS = {
         "max_min": 120, "min_max": 120, "hr_max": 2,
         "life_rule": "1-120m or 1-2h", "sessid": lambda: _sessid_lower(8),
         "supports_asn": True,
+    },
+    "Rayobyte": {
+        "key": "rayobyte",
+        "legacy": None,
+        "build": _build_rayobyte_resi,
+        "max_min": 60, "min_max": 60, "hr_max": 1,
+        "life_rule": "1-60m (always sticky)", "sessid": lambda: _sessid_lower(8),
+        # No rotating mode - always emit a hardsession, even in rotating runs.
+        "always_session": True,
     },
 }
 
@@ -1524,13 +1542,17 @@ def generate_resi_batch(provider, region_type, regions, lifetime_min, count,
             asn_seq.extend([a] * (base + (1 if idx < extra else 0)))
     else:
         asn_seq = [None] * count
+    # `always_session` providers (Rayobyte) have no rotating mode, so they still
+    # get a fresh session token even when the run is rotating.
+    force_session = spec.get("always_session")
     lines = []
     for i, asn in enumerate(asn_seq):
         tgt = targets[i % len(targets)]
         state = tgt if region_type == "State" else ""
         city = tgt if region_type == "City" else ""
+        sid = make_sessid() if (force_session or not rotating) else None
         lines.append(spec["build"](user, pw, state, city, lifetime_min,
-                                   None if rotating else make_sessid(), asn))
+                                   sid, asn))
     return lines, None
 
 
@@ -4258,6 +4280,7 @@ class SettingsTab(ttk.Frame):
             "iproyal", ("iproyal_user", "iproyal_pass")))
         self.brightdata = tk.StringVar(value=provider_creds_display("brightdata"))
         self.proxyhaus = tk.StringVar(value=provider_creds_display("proxyhaus"))
+        self.rayobyte = tk.StringVar(value=provider_creds_display("rayobyte"))
 
         def cred_row(label, var):
             nonlocal r
@@ -4285,6 +4308,7 @@ class SettingsTab(ttk.Frame):
         cred_row("IPRoyal (username:password)", self.ipr)
         cred_row("Bright Data (username:password)", self.brightdata)
         cred_row("Proxy-Haus (username:password)", self.proxyhaus)
+        cred_row("Rayobyte (username:password)", self.rayobyte)
 
         ttk.Separator(host, orient="horizontal").grid(
             row=r, column=0, columnspan=2, sticky="ew", pady=14)
@@ -4303,7 +4327,7 @@ class SettingsTab(ttk.Frame):
         # click on 'Save settings' can never silently drop a key again.
         for _v in (self.ipqs, self.pcheck, self.ipinfo, self.oxy_mobile,
                    self.oxy_resi, self.ipr, self.brightdata, self.proxyhaus,
-                   self.workers):
+                   self.rayobyte, self.workers):
             _v.trace_add("write", self._schedule_autosave)
         ttk.Label(host,
                   text="Higher = faster on big lists (network-bound). Default "
@@ -4341,6 +4365,7 @@ class SettingsTab(ttk.Frame):
         save_setting("iproyal", self.ipr.get().strip())
         save_setting("brightdata", self.brightdata.get().strip())
         save_setting("proxyhaus", self.proxyhaus.get().strip())
+        save_setting("rayobyte", self.rayobyte.get().strip())
         try:
             w = max(1, min(MAX_WORKERS_CAP, int(self.workers.get().strip())))
         except (TypeError, ValueError):
