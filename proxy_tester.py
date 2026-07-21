@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.72"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.73"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -2629,11 +2629,52 @@ class ProxyTab(ttk.Frame):
         tag_tree(self.tree)
         enable_drag_select(self.tree)
         self.tree.pack(fill="both", expand=True, pady=(8, 0))
+        # Ctrl+C copies the selected proxies (full host:port:user:pass), Ctrl+A
+        # selects every row - matching the IP Quality tab.
+        self.tree.bind("<Control-c>", self._copy_selected)
+        self.tree.bind("<Control-C>", self._copy_selected)
+        self.tree.bind("<Control-a>", self._select_all_rows)
+        self.tree.bind("<Control-A>", self._select_all_rows)
 
         vsb = ttk.Scrollbar(self.tree, orient="vertical",
                             command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
+
+    def _select_all_rows(self, _event=None):
+        rows = self.tree.get_children()
+        if rows:
+            self.tree.selection_set(rows)
+        return "break"
+
+    def _copy_selected(self, _event=None):
+        """Copy the highlighted proxies to the clipboard as full
+        host:port:user:pass - mapping each result row back to its original input
+        line (which carries the real password), so the copy is usable, not the
+        masked display. Site-ping rows are skipped."""
+        sel = self.tree.selection()
+        if not sel:
+            return "break"
+        full_by_ident = {}
+        for ln in self.proxy_text.get("1.0", "end").splitlines():
+            if ln.strip():
+                ident = self._proxy_ident(ln)
+                if ident and ident not in full_by_ident:
+                    full_by_ident[ident] = ln.strip()
+        lines = []
+        for iid in sel:
+            vals = self.tree.item(iid, "values")
+            if str(vals[0]).startswith("PING"):
+                continue
+            lines.append(full_by_ident.get(self._proxy_ident(vals[0]),
+                                           str(vals[0])))
+        if not lines:
+            return "break"
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(lines))
+        self.update_idletasks()
+        self.status_lbl.config(text=f"Copied {len(lines)} proxy(ies)")
+        return "break"
 
     # --- profile state ---
     def get_state(self):
@@ -3320,11 +3361,13 @@ def open_generate_dialog(parent, text_widget):
     prov_box.grid(row=row, column=0, columnspan=2, sticky="w")
     row += 1
     prov_life_frames = {}
+    prov_cb_widgets = {}
     for i, name in enumerate(configured):
         spec = RESI_PROVIDERS[name]
-        ttk.Checkbutton(prov_box, text=name, variable=provider_vars[name],
-                        command=lambda: refresh_ui()).grid(
-            row=i, column=0, sticky="w", pady=2, padx=(0, 10))
+        cb = ttk.Checkbutton(prov_box, text=name, variable=provider_vars[name],
+                             command=lambda: refresh_ui())
+        cb.grid(row=i, column=0, sticky="w", pady=2, padx=(0, 10))
+        prov_cb_widgets[name] = cb
         lf = ttk.Frame(prov_box)
         lf.grid(row=i, column=1, sticky="w")
         prov_life_frames[name] = lf
@@ -3340,14 +3383,25 @@ def open_generate_dialog(parent, text_widget):
             ttk.Label(lf, text="(no lifetime token; sticky IP holds ~30m)",
                       style="Muted.TLabel").pack(side="left")
 
-    def set_all_max():
+    def set_all_to(target_min):
+        # Each provider gets the value closest to `target_min` that it allows -
+        # i.e. min(target, its cap), so a 3h target lands Proxy-Haus on 2h and
+        # Rayobyte on 1h while Oxylabs/IPRoyal take the full 3h.
         for pname, lv in life_vars.items():
-            lv.set(_fmt_minutes(RESI_PROVIDERS[pname]["max_min"]))
+            cap = RESI_PROVIDERS[pname]["max_min"]
+            lv.set(_fmt_minutes(min(target_min, cap)))
 
     mrow = ttk.Frame(frm)
     mrow.grid(row=row, column=0, columnspan=2, sticky="w", pady=(2, 0))
     row += 1
-    ttk.Button(mrow, text="Set all to max", command=set_all_max).pack(side="left")
+    ttk.Button(mrow, text="Set all to max",
+               command=lambda: set_all_to(10 ** 9)).pack(side="left")
+    ttk.Button(mrow, text="1hr",
+               command=lambda: set_all_to(60)).pack(side="left", padx=(6, 0))
+    ttk.Button(mrow, text="3hr",
+               command=lambda: set_all_to(180)).pack(side="left", padx=(6, 0))
+    ttk.Label(mrow, text="(closest each provider allows)",
+              style="Muted.TLabel").pack(side="left", padx=(8, 0))
 
     ttk.Label(frm, text="Country: United States (fixed)",
               style="Muted.TLabel").grid(row=row, column=0, columnspan=2,
@@ -3453,7 +3507,7 @@ def open_generate_dialog(parent, text_widget):
 
     rot_cb = ttk.Checkbutton(
         frm, text="Rotating (new IP per request, no sticky session)",
-        variable=rotating)
+        variable=rotating, command=lambda: refresh_ui())
     rot_cb.grid(row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
     row += 1
     ttk.Checkbutton(frm, text="Append to existing list (instead of replacing)",
@@ -3462,9 +3516,18 @@ def open_generate_dialog(parent, text_widget):
     row += 1
 
     def refresh_ui(*_):
-        """Show a provider's lifetime box only while it's checked; show the ASN
-        picker only while Proxy-Haus is checked."""
+        """Hide providers that don't support the current mode (Rayobyte has no
+        rotating), show a provider's lifetime box only while it's checked, and
+        show the ASN picker only while Proxy-Haus is checked."""
+        rot = rotating.get()
         for pname, lf in prov_life_frames.items():
+            # A provider that is always-sticky can't do a rotating run.
+            unsupported = rot and RESI_PROVIDERS[pname].get("always_session")
+            if unsupported:
+                prov_cb_widgets[pname].grid_remove()
+                lf.grid_remove()
+                continue
+            prov_cb_widgets[pname].grid()
             if provider_vars[pname].get():
                 lf.grid()
             else:
@@ -3478,7 +3541,11 @@ def open_generate_dialog(parent, text_widget):
     refresh_ui()
 
     def gen():
-        providers = [n for n, v in provider_vars.items() if v.get()]
+        # In rotating mode, drop always-sticky providers (Rayobyte) - they're
+        # hidden in the UI too, so this just mirrors that.
+        providers = [n for n, v in provider_vars.items() if v.get()
+                     and not (rotating.get()
+                              and RESI_PROVIDERS[n].get("always_session"))]
         if not providers:
             messagebox.showerror("Generate batch", "Check at least one provider.")
             return
