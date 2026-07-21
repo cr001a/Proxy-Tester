@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.73"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.74"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -3461,49 +3461,16 @@ def open_generate_dialog(parent, text_widget):
     ttk.Label(cnt, text="Count (per provider)").pack(side="left")
     ttk.Entry(cnt, textvariable=count, width=8).pack(side="left", padx=(6, 0))
 
-    # Proxy-Haus ASN picker: a button that opens a small STAY-OPEN popup of
-    # checkable carriers (a native menu closes on each click, which the multi-
-    # select here needs to avoid). The button label shows how many are picked.
+    # Proxy-Haus ASN picker: inline checkboxes - always-visible, always-on
+    # multi-select (no popup/menu that could drop the selection). Pick any
+    # number; shown only while Proxy-Haus is checked.
     asn_row = ttk.Frame(frm)
     asn_row.grid(row=row, column=0, columnspan=2, sticky="w", pady=(4, 0))
     row += 1
-    ttk.Label(asn_row, text="Proxy-Haus ASNs").pack(side="left")
-
-    def asn_btn_label():
-        n = sum(1 for v in asn_vars.values() if v.get())
-        return f"{n} selected  ▾" if n else "Choose ASNs  ▾"
-
-    def open_asn_popup():
-        pop = tk.Toplevel(top)
-        pop.title("Proxy-Haus ASNs")
-        pop.configure(bg=BASE)
-        pop.transient(top)
-        pop.resizable(False, False)
-        pf = ttk.Frame(pop, padding=10)
-        pf.pack(fill="both", expand=True)
-        ttk.Label(pf, text="Check any number of carriers:").pack(
-            anchor="w", pady=(0, 4))
-        for a, aname, cat in PROXYHAUS_ASNS:
-            ttk.Checkbutton(
-                pf, text=f"{aname}  (AS{a})", variable=asn_vars[a],
-                command=lambda: asn_btn.config(text=asn_btn_label())).pack(
-                anchor="w", pady=1)
-        ttk.Button(pf, text="Done", style="Accent.TButton",
-                   command=pop.destroy).pack(anchor="w", pady=(8, 0))
-        pop.bind("<Escape>", lambda _e: pop.destroy())
-        pop.protocol("WM_DELETE_WINDOW", pop.destroy)
-        pop.update_idletasks()
-        pop.geometry(f"+{asn_btn.winfo_rootx()}"
-                     f"+{asn_btn.winfo_rooty() + asn_btn.winfo_height() + 2}")
-        pop.grab_set()
-        # Refresh the count on the trigger button once the popup is dismissed.
-        pop.bind("<Destroy>", lambda e: asn_btn.config(text=asn_btn_label())
-                 if e.widget is pop else None)
-
-    asn_btn = ttk.Button(asn_row, text="Choose ASNs  ▾", command=open_asn_popup)
-    asn_btn.pack(side="left", padx=(6, 6))
-    ttk.Label(asn_row, text="pick any number; optional",
-              style="Muted.TLabel").pack(side="left")
+    ttk.Label(asn_row, text="Proxy-Haus ASNs:").pack(side="left", padx=(0, 8))
+    for a, aname, cat in PROXYHAUS_ASNS:
+        ttk.Checkbutton(asn_row, text=f"{aname} {a}",
+                        variable=asn_vars[a]).pack(side="left", padx=(0, 8))
 
     rot_cb = ttk.Checkbutton(
         frm, text="Rotating (new IP per request, no sticky session)",
