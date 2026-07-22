@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.75"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.76"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -568,8 +568,10 @@ def ping_site_via_proxy(proxy, name, target, runs, timeout=DEFAULT_TIMEOUT,
     host, port = _host_port_from_target(target)
     if proxy.get("user") and proxy.get("pw") is not None:
         display = f"{proxy['host']}:{proxy['port']}:{proxy['user']}:****"
+        full = f"{proxy['host']}:{proxy['port']}:{proxy['user']}:{proxy['pw']}"
     else:
         display = f"{proxy['host']}:{proxy['port']}"
+        full = display
     lat = []
     last_code = None
     err = ""
@@ -585,7 +587,7 @@ def ping_site_via_proxy(proxy, name, target, runs, timeout=DEFAULT_TIMEOUT,
             lat.append(ms)
         elif e:
             err = e
-    base = {"_pping": True, "proxy": display, "name": name,
+    base = {"_pping": True, "proxy": display, "full": full, "name": name,
             "target": f"{host}:{port}",
             "code": last_code, "success": len(lat), "runs": ran or runs}
     if lat:
@@ -1896,9 +1898,11 @@ def test_proxy(proxy, url, runs, timeout, stop_event=None):
     if user and pw is not None:
         proxy_url = build_proxy_url(host, port, user, pw)
         display = f"{host}:{port}:{user}:****"
+        full = f"{host}:{port}:{user}:{pw}"
     else:
         proxy_url = build_proxy_url(host, port)
         display = f"{host}:{port}"
+        full = display
 
     latencies = []
     successes = 0
@@ -1953,6 +1957,7 @@ def test_proxy(proxy, url, runs, timeout, stop_event=None):
 
     return {
         "proxy": display,
+        "full": full,
         "status": status,
         "code": str(last_code) if last_code is not None else "-",
         "median": statistics.median(latencies) if latencies else None,
@@ -2544,6 +2549,7 @@ class ProxyTab(ttk.Frame):
         self.running = False
         self.stop_event = threading.Event()
         self._sort_dir = {}       # column -> current sort direction
+        self._row_full = {}       # tree item id -> full host:port:user:pass
         self._build()
 
     def _build(self):
@@ -2586,6 +2592,15 @@ class ProxyTab(ttk.Frame):
         self.cull_btn = ttk.Button(btns, text="Cull dead",
                                    command=self.on_cull_dead)
         self.cull_btn.pack(side="left", padx=(0, 8))
+        # Speed filter: cull proxies whose median latency is over the threshold
+        # (works on Run results and proxied Site-ping results alike).
+        self.slow_btn = ttk.Button(btns, text="Cull slow >",
+                                   command=self.on_cull_slow)
+        self.slow_btn.pack(side="left", padx=(0, 2))
+        self.slow_ms = tk.StringVar(value="1000")
+        ttk.Entry(btns, textvariable=self.slow_ms, width=6).pack(side="left")
+        ttk.Label(btns, text="ms", style="Muted.TLabel").pack(side="left",
+                                                              padx=(2, 8))
         self.status_lbl = ttk.Label(btns, text="Idle", style="Muted.TLabel")
         self.status_lbl.pack(side="left", padx=12)
 
@@ -2656,25 +2671,14 @@ class ProxyTab(ttk.Frame):
 
     def _copy_selected(self, _event=None):
         """Copy the highlighted proxies to the clipboard as full
-        host:port:user:pass - mapping each result row back to its original input
-        line (which carries the real password), so the copy is usable, not the
-        masked display. Site-ping rows are skipped."""
+        host:port:user:pass - taken from the exact per-row proxy stored when the
+        row was created (so the real password/session is preserved, not the
+        masked display). Rows without a proxy (direct Site-ping) are skipped."""
         sel = self.tree.selection()
         if not sel:
             return "break"
-        full_by_ident = {}
-        for ln in self.proxy_text.get("1.0", "end").splitlines():
-            if ln.strip():
-                ident = self._proxy_ident(ln)
-                if ident and ident not in full_by_ident:
-                    full_by_ident[ident] = ln.strip()
-        lines = []
-        for iid in sel:
-            vals = self.tree.item(iid, "values")
-            if str(vals[0]).startswith("PING"):
-                continue
-            lines.append(full_by_ident.get(self._proxy_ident(vals[0]),
-                                           str(vals[0])))
+        lines = [self._row_full[iid] for iid in sel
+                 if self._row_full.get(iid)]
         if not lines:
             return "break"
         self.clipboard_clear()
@@ -2726,6 +2730,7 @@ class ProxyTab(ttk.Frame):
             self.status_lbl.config(text=f"Skipped {bad} unparseable line(s)")
 
         self.tree.delete(*self.tree.get_children())
+        self._row_full = {}
         self.running = True
         self.stop_event.clear()
         self.run_btn.config(text="Stop", style="Stop.TButton",
@@ -2817,18 +2822,20 @@ class ProxyTab(ttk.Frame):
             ident = self._proxy_ident(r["proxy"])
             exit_ip, org, location = getattr(self, "_loc_map", {}).get(
                 ident, ("", "", f"via proxy -> {r['name']} ({r['target']})"))
-            self.tree.insert("", "end", values=(
+            item = self.tree.insert("", "end", values=(
                 f"PING  {r['proxy']}", r["status"],
                 str(r["code"]) if r["code"] is not None else "-",
                 _fmt_ms(r["median"]), f"{r['success']}/{r['runs']}",
                 exit_ip, org, location,
             ), tags=(status_tag(r["status"]),))
+            self._row_full[item] = r.get("full", "")
             return
-        self.tree.insert("", "end", values=(
+        item = self.tree.insert("", "end", values=(
             r["proxy"], r["status"], r["code"], _fmt_ms(r["median"]),
             f"{r['success']}/{r['runs']}", r["exit_ip"],
             r.get("org", ""), r.get("location", ""),
         ), tags=(status_tag(r["status"]),))
+        self._row_full[item] = r.get("full", "")
 
     def _sort_by(self, col):
         """Sort the visible rows by a column (numeric when possible),
@@ -2907,6 +2914,7 @@ class ProxyTab(ttk.Frame):
                     self._loc_map[ident] = (vals[5], vals[6], vals[7])
         # A fresh ping starts with a clean table (results replace the Run).
         self.tree.delete(*self.tree.get_children())
+        self._row_full = {}
 
         self.running = True
         self.stop_event.clear()
@@ -3010,32 +3018,73 @@ class ProxyTab(ttk.Frame):
             text=f"Proxies (host:port:user:pass, one per line) - {n} in list")
         self.proxy_text.edit_modified(False)
 
-    def on_cull_dead(self):
-        """Drop dead (non-OK) proxies: remove their result rows AND rewrite the
-        input list to keep only the live ones (full creds preserved). Site-ping
-        rows are left untouched."""
-        live, dead_iids = set(), []
+    @staticmethod
+    def _full_key(line):
+        """Canonical host:port:user:pass key for a proxy line - includes the
+        password, so proxies that differ only by a session token IN the password
+        (IPRoyal, Rayobyte) are told apart. None if unparseable."""
+        p = parse_proxy_line(str(line))
+        if not p:
+            return None
+        if p.get("user") and p.get("pw") is not None:
+            return f"{p['host']}:{p['port']}:{p['user']}:{p['pw']}"
+        return f"{p['host']}:{p['port']}"
+
+    def _cull(self, want_removed, label):
+        """Shared cull: `want_removed(vals)` decides if a result row's proxy
+        should be dropped. Removes those rows AND the exact matching input lines
+        (matched by full key, so session-in-password proxies cull correctly).
+        Rows without a real proxy (direct Site-ping) are ignored."""
+        remove_keys, remove_iids = set(), []
+        candidates = 0
         for iid in self.tree.get_children():
+            full = self._row_full.get(iid)
+            if not full:
+                continue                       # direct-ping / non-proxy row
+            candidates += 1
             vals = self.tree.item(iid, "values")
-            if str(vals[0]).startswith("PING"):
-                continue
-            if vals[1] == "OK":
-                ident = self._proxy_ident(vals[0])
-                if ident:
-                    live.add(ident)
-            else:
-                dead_iids.append(iid)
-        if not dead_iids:
-            self.status_lbl.config(text="No dead proxies to cull")
+            if want_removed(vals):
+                k = self._full_key(full)
+                if k:
+                    remove_keys.add(k)
+                remove_iids.append(iid)
+        if not candidates:
+            self.status_lbl.config(text="Run or Ping proxies first")
             return
-        for iid in dead_iids:
+        if not remove_iids:
+            self.status_lbl.config(text=f"No {label} proxies to cull")
+            return
+        for iid in remove_iids:
             self.tree.delete(iid)
+            self._row_full.pop(iid, None)
         kept = [ln for ln in self.proxy_text.get("1.0", "end").splitlines()
-                if ln.strip() and self._proxy_ident(ln) in live]
+                if ln.strip() and self._full_key(ln) not in remove_keys]
         self.proxy_text.delete("1.0", "end")
         self.proxy_text.insert("1.0", "\n".join(kept))
+        self._update_proxy_count(force=True)
         self.status_lbl.config(
-            text=f"Culled {len(dead_iids)} dead; kept {len(kept)} live")
+            text=f"Culled {len(remove_iids)} {label}; kept {len(kept)}")
+
+    def on_cull_dead(self):
+        """Drop dead (non-OK) proxies - from Run results OR proxied Site-ping
+        results - and their input lines."""
+        self._cull(lambda vals: vals[1] != "OK", "dead")
+
+    def on_cull_slow(self):
+        """Drop proxies whose median latency is over the ms threshold (keeps
+        rows with no median - those are dead, handled by Cull dead)."""
+        try:
+            thr = max(1, int(self.slow_ms.get().strip()))
+        except (TypeError, ValueError):
+            self.status_lbl.config(text="Enter a valid ms threshold")
+            return
+
+        def is_slow(vals):
+            try:
+                return float(vals[3]) > thr
+            except (TypeError, ValueError):
+                return False                   # no median -> not "slow"
+        self._cull(is_slow, f"slow (>{thr}ms)")
 
     def on_shuffle(self):
         """Randomly reorder the pasted proxy lines in place."""
