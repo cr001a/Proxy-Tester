@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.74"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.75"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -202,21 +202,28 @@ def style_text(widget):
 
 
 def paste_appends_to_end(text_widget, after=None):
-    """Make <<Paste>> always append the clipboard to the END of the box on a
-    fresh line (never at the cursor), so you can paste list after list without
-    them running together. `after` is an optional callback (e.g. a count
-    refresh) run once the text is in."""
+    """<<Paste>> handler with two modes:
+      - text is SELECTED  -> replace the selection (typical paste; so Ctrl+A then
+        paste swaps the whole list);
+      - nothing selected  -> append the clipboard to the END on a fresh line, so
+        you can paste list after list without them running together.
+    `after` is an optional callback (e.g. a count refresh) run once text is in."""
     def _handler(_event=None):
         try:
             clip = text_widget.clipboard_get()
         except tk.TclError:
             return "break"
-        cur = text_widget.get("1.0", "end-1c").rstrip("\n")
-        parts = [p for p in (cur, clip.strip("\n")) if p]
-        text_widget.delete("1.0", "end")
-        text_widget.insert("1.0", "\n".join(parts) + "\n")
-        text_widget.mark_set("insert", "end-1c")
-        text_widget.see("end")
+        if text_widget.tag_ranges("sel"):
+            # Replace the highlighted text with the clipboard, at the selection.
+            text_widget.delete("sel.first", "sel.last")
+            text_widget.insert("insert", clip)
+        else:
+            cur = text_widget.get("1.0", "end-1c").rstrip("\n")
+            parts = [p for p in (cur, clip.strip("\n")) if p]
+            text_widget.delete("1.0", "end")
+            text_widget.insert("1.0", "\n".join(parts) + "\n")
+            text_widget.mark_set("insert", "end-1c")
+        text_widget.see("insert")
         if after:
             after()
         return "break"
@@ -3617,7 +3624,8 @@ class QualityTab(ttk.Frame):
         style_text(self.proxy_text)
         self.proxy_text.grid(row=1, column=0, rowspan=4, sticky="nw",
                              padx=(0, 24))
-        self.proxy_text.bind("<<Paste>>", self._on_paste_proxies)
+        paste_appends_to_end(self.proxy_text,
+                             lambda: self._update_proxy_count(force=True))
         self.proxy_text.bind("<<Modified>>", self._update_proxy_count)
 
         # Default to proxycheck.io - highest request rate (200/s per node) and
@@ -3737,23 +3745,6 @@ class QualityTab(ttk.Frame):
                             command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
-
-    def _on_paste_proxies(self, _event=None):
-        """Paste always appends to the END of the list (never mid-cursor) and
-        leaves the caret on a fresh blank line, so you can immediately paste the
-        next batch without it running onto the last proxy."""
-        try:
-            clip = self.proxy_text.clipboard_get()
-        except tk.TclError:
-            return "break"
-        cur = self.proxy_text.get("1.0", "end-1c").rstrip("\n")
-        parts = [p for p in (cur, clip.strip("\n")) if p]
-        self.proxy_text.delete("1.0", "end")
-        self.proxy_text.insert("1.0", "\n".join(parts) + "\n")
-        self.proxy_text.mark_set("insert", "end-1c")
-        self.proxy_text.see("end")
-        self._update_proxy_count(force=True)
-        return "break"
 
     def _update_proxy_count(self, _e=None, force=False):
         """Live count of non-empty proxy lines, shown in the box's header."""
