@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.77"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.78"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1169,6 +1169,26 @@ def get_workers():
     except (TypeError, ValueError):
         n = DEFAULT_WORKERS
     return max(1, min(MAX_WORKERS_CAP, n))
+
+
+DEFAULT_SCORE_WORKERS = 100   # reputation-lookup concurrency (IP Quality stage 2)
+MAX_SCORE_WORKERS = 200
+
+
+def get_score_workers():
+    """Concurrency for the IP-Quality REPUTATION-lookup stage (stage 2), kept
+    separate from - and lower than - the proxy-test concurrency. These are
+    direct API calls (IPinfo/proxycheck) from this machine; running hundreds at
+    once exhausts local sockets and connection-fails IPinfo (which itself has no
+    concurrency cap - the ceiling is our own box). ~100 keeps every lookup
+    succeeding, so no provider drops out of the fused score. Stage 1 (resolving
+    exit IPs THROUGH the proxies) still uses the full `get_workers()`, so big
+    lists stay fast - only this fast, fragile stage is throttled."""
+    try:
+        n = int(load_setting("score_concurrency", DEFAULT_SCORE_WORKERS))
+    except (TypeError, ValueError):
+        n = DEFAULT_SCORE_WORKERS
+    return max(1, min(MAX_SCORE_WORKERS, n))
 
 
 def split_creds(value):
@@ -3958,7 +3978,10 @@ class QualityTab(ttk.Frame):
                        if provider == AGGREGATE_PROVIDER else None)
             scores = {}
             if not self.stop_event.is_set():
-                with ThreadPoolExecutor(max_workers=workers) as pool:
+                # Stage 2 uses its OWN (lower) concurrency - these are direct
+                # reputation-API calls; too many at once connection-fails IPinfo.
+                score_workers = min(get_score_workers(), max(1, unique_n))
+                with ThreadPoolExecutor(max_workers=score_workers) as pool:
                     futs = {pool.submit(score_ip, ip, provider, api_key,
                                         DEFAULT_TIMEOUT, breaker): ip
                             for ip in unique}
@@ -4342,6 +4365,7 @@ class SettingsTab(ttk.Frame):
         self.pcheck = tk.StringVar(value=load_setting("proxycheck_api_key", ""))
         self.ipinfo = tk.StringVar(value=load_setting("ipinfo_token", ""))
         self.workers = tk.StringVar(value=str(get_workers()))
+        self.score_workers = tk.StringVar(value=str(get_score_workers()))
 
         def key_row(label, var):
             nonlocal r
@@ -4420,13 +4444,6 @@ class SettingsTab(ttk.Frame):
         wkr.grid(row=r, column=1, sticky="w", pady=4, padx=(10, 0))
         wkr.bind("<FocusOut>", lambda _e: self.on_save(), add="+")
         r += 1
-
-        # Auto-save: any edit persists after a short debounce, so a forgotten
-        # click on 'Save settings' can never silently drop a key again.
-        for _v in (self.ipqs, self.pcheck, self.ipinfo, self.oxy_mobile,
-                   self.oxy_resi, self.ipr, self.brightdata, self.proxyhaus,
-                   self.rayobyte, self.workers):
-            _v.trace_add("write", self._schedule_autosave)
         ttk.Label(host,
                   text="Higher = faster on big lists (network-bound). Default "
                        "200; proxycheck.io's cluster absorbs ~2,800 req/s and "
@@ -4435,6 +4452,32 @@ class SettingsTab(ttk.Frame):
                   style="Muted.TLabel").grid(row=r, column=0, columnspan=2,
                                              sticky="w")
         r += 1
+
+        ttk.Label(host,
+                  text="Reputation-lookup concurrency (IP Quality, 1-200)").grid(
+            row=r, column=0, sticky="w", pady=4)
+        swkr = ttk.Entry(host, textvariable=self.score_workers, width=6)
+        swkr.grid(row=r, column=1, sticky="w", pady=4, padx=(10, 0))
+        swkr.bind("<FocusOut>", lambda _e: self.on_save(), add="+")
+        r += 1
+        ttk.Label(host,
+                  text="Stage 2 of IP Quality only - the direct reputation-API "
+                       "calls (IPinfo/proxycheck) from THIS machine on the "
+                       "deduped exit IPs. Kept lower than the main concurrency "
+                       "because hundreds at once exhaust local sockets and "
+                       "connection-fail IPinfo. Default 100. Exit-IP resolution "
+                       "(stage 1, through your proxies) still uses the full "
+                       "concurrency above - so precision isn't traded for speed.",
+                  style="Muted.TLabel").grid(row=r, column=0, columnspan=2,
+                                             sticky="w")
+        r += 1
+
+        # Auto-save: any edit persists after a short debounce, so a forgotten
+        # click on 'Save settings' can never silently drop a key again.
+        for _v in (self.ipqs, self.pcheck, self.ipinfo, self.oxy_mobile,
+                   self.oxy_resi, self.ipr, self.brightdata, self.proxyhaus,
+                   self.rayobyte, self.workers, self.score_workers):
+            _v.trace_add("write", self._schedule_autosave)
 
         # Settings auto-save (debounced on every edit), so there's no Save
         # button - this label just confirms the last write.
@@ -4469,6 +4512,12 @@ class SettingsTab(ttk.Frame):
         except (TypeError, ValueError):
             w = DEFAULT_WORKERS
         save_setting("concurrency", w)
+        try:
+            sw = max(1, min(MAX_SCORE_WORKERS,
+                            int(self.score_workers.get().strip())))
+        except (TypeError, ValueError):
+            sw = DEFAULT_SCORE_WORKERS
+        save_setting("score_concurrency", sw)
         if announce:
             self.status_lbl.config(text="Saved.")
         if self._on_saved:
@@ -4481,6 +4530,12 @@ class SettingsTab(ttk.Frame):
         except (TypeError, ValueError):
             w = DEFAULT_WORKERS
         self.workers.set(str(w))
+        try:
+            sw = max(1, min(MAX_SCORE_WORKERS,
+                            int(self.score_workers.get().strip())))
+        except (TypeError, ValueError):
+            sw = DEFAULT_SCORE_WORKERS
+        self.score_workers.set(str(sw))
         self._persist(announce=True)
 
 
