@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.76"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.77"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -3071,20 +3071,44 @@ class ProxyTab(ttk.Frame):
         self._cull(lambda vals: vals[1] != "OK", "dead")
 
     def on_cull_slow(self):
-        """Drop proxies whose median latency is over the ms threshold (keeps
-        rows with no median - those are dead, handled by Cull dead)."""
+        """Speed filter (REVERSIBLE): rebuild the proxy list from the intact
+        results table, keeping only proxies whose median latency is <= the ms
+        threshold. Because it re-derives from the full results each time (never
+        deleting result rows), raising the threshold brings previously-excluded
+        proxies back. Proxies with no median (dead) are kept for Cull dead."""
         try:
             thr = max(1, int(self.slow_ms.get().strip()))
         except (TypeError, ValueError):
             self.status_lbl.config(text="Enter a valid ms threshold")
             return
-
-        def is_slow(vals):
+        kept, seen, excluded, candidates = [], set(), 0, 0
+        for iid in self.tree.get_children():
+            full = self._row_full.get(iid)
+            if not full:
+                continue                       # direct-ping / non-proxy row
+            candidates += 1
+            vals = self.tree.item(iid, "values")
             try:
-                return float(vals[3]) > thr
+                ms = float(vals[3])
             except (TypeError, ValueError):
-                return False                   # no median -> not "slow"
-        self._cull(is_slow, f"slow (>{thr}ms)")
+                ms = None                      # dead row - keep (Cull dead's job)
+            if ms is not None and ms > thr:
+                excluded += 1
+                continue
+            key = self._full_key(full)
+            if key in seen:
+                continue
+            seen.add(key)
+            kept.append(full)
+        if not candidates:
+            self.status_lbl.config(text="Run or Ping proxies first")
+            return
+        self.proxy_text.delete("1.0", "end")
+        self.proxy_text.insert("1.0", "\n".join(kept))
+        self._update_proxy_count(force=True)
+        self.status_lbl.config(
+            text=f"Speed filter <={thr}ms: kept {len(kept)}, {excluded} slower "
+                 "excluded")
 
     def on_shuffle(self):
         """Randomly reorder the pasted proxy lines in place."""
