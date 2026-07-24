@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.78"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.79"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -4328,9 +4328,11 @@ class SettingsTab(ttk.Frame):
             "<Configure>",
             lambda e: self._canvas.configure(
                 scrollregion=self._canvas.bbox("all")))
-        self._canvas.bind(
-            "<Configure>",
-            lambda e: self._canvas.itemconfigure(self._win, width=e.width))
+        # Stretch the inner frame to the viewport AND reflow the help
+        # paragraphs to that width, so long text wraps instead of running off
+        # the right edge of the window.
+        self._wrap_labels = []
+        self._canvas.bind("<Configure>", self._on_canvas_configure)
         # Mousewheel only while the pointer is over this tab.
         self._canvas.bind("<Enter>", lambda e: self._canvas.bind_all(
             "<MouseWheel>", self._on_wheel))
@@ -4341,24 +4343,35 @@ class SettingsTab(ttk.Frame):
     def _on_wheel(self, event):
         self._canvas.yview_scroll(int(-event.delta / 120), "units")
 
+    def _on_canvas_configure(self, e):
+        self._canvas.itemconfigure(self._win, width=e.width)
+        # inner frame has padding=20 each side; leave a little slack so text
+        # never touches the scrollbar.
+        wl = max(200, e.width - 56)
+        for lbl in self._wrap_labels:
+            lbl.configure(wraplength=wl)
+
+    def _help(self, text, r, pady=(0, 0)):
+        """A muted help paragraph that reflows to the window width."""
+        lbl = ttk.Label(self.inner, text=text, style="Muted.TLabel",
+                        justify="left")
+        lbl.grid(row=r, column=0, columnspan=2, sticky="w", pady=pady)
+        self._wrap_labels.append(lbl)
+        return lbl
+
     def _build(self):
         host = self.inner
         r = 0
-        ttk.Label(host,
-                  text="Changes save automatically as you type - no need to "
-                       "click anything.",
-                  style="Muted.TLabel").grid(row=r, column=0, columnspan=2,
-                                             sticky="w", pady=(0, 14))
+        self._help("Changes save automatically as you type - no need to "
+                   "click anything.", r, pady=(0, 14))
         r += 1
         ttk.Label(host, text="IP reputation API keys",
                   style="Header.TLabel").grid(row=r, column=0, columnspan=2,
                                               sticky="w", pady=(0, 4))
         r += 1
-        ttk.Label(host,
-                  text="Used by the IP Quality tab. Only the public exit IP is "
-                       "ever sent to these - never your proxy credentials.",
-                  style="Muted.TLabel").grid(row=r, column=0, columnspan=2,
-                                             sticky="w", pady=(0, 12))
+        self._help("Used by the IP Quality tab. Only the public exit IP is "
+                   "ever sent to these - never your proxy credentials.",
+                   r, pady=(0, 12))
         r += 1
 
         self.ipqs = tk.StringVar(value=load_setting("ipqs_api_key", ""))
@@ -4387,12 +4400,9 @@ class SettingsTab(ttk.Frame):
                   style="Header.TLabel").grid(row=r, column=0, columnspan=2,
                                               sticky="w", pady=(0, 4))
         r += 1
-        ttk.Label(host,
-                  text="One box per provider, as username:password. Oxylabs "
-                       "Mobile fills the ASN Tester login; the residential "
-                       "providers feed 'Generate batch'.",
-                  style="Muted.TLabel").grid(row=r, column=0, columnspan=2,
-                                             sticky="w", pady=(0, 8))
+        self._help("One box per provider, as username:password. Oxylabs "
+                   "Mobile fills the ASN Tester login; the residential "
+                   "providers feed 'Generate batch'.", r, pady=(0, 8))
         r += 1
         self.oxy_mobile = tk.StringVar(
             value=provider_creds_display("oxylabs_mobile"))
@@ -4444,13 +4454,10 @@ class SettingsTab(ttk.Frame):
         wkr.grid(row=r, column=1, sticky="w", pady=4, padx=(10, 0))
         wkr.bind("<FocusOut>", lambda _e: self.on_save(), add="+")
         r += 1
-        ttk.Label(host,
-                  text="Higher = faster on big lists (network-bound). Default "
-                       "200; proxycheck.io's cluster absorbs ~2,800 req/s and "
-                       "IPinfo paid is unthrottled. 300-500 works; the limit is "
-                       "usually YOUR proxy provider (exit-IP stage) + threads.",
-                  style="Muted.TLabel").grid(row=r, column=0, columnspan=2,
-                                             sticky="w")
+        self._help("Higher = faster on big lists (network-bound). Default "
+                   "200; proxycheck.io's cluster absorbs ~2,800 req/s and "
+                   "IPinfo paid is unthrottled. 300-500 works; the limit is "
+                   "usually YOUR proxy provider (exit-IP stage) + threads.", r)
         r += 1
 
         ttk.Label(host,
@@ -4460,16 +4467,13 @@ class SettingsTab(ttk.Frame):
         swkr.grid(row=r, column=1, sticky="w", pady=4, padx=(10, 0))
         swkr.bind("<FocusOut>", lambda _e: self.on_save(), add="+")
         r += 1
-        ttk.Label(host,
-                  text="Stage 2 of IP Quality only - the direct reputation-API "
-                       "calls (IPinfo/proxycheck) from THIS machine on the "
-                       "deduped exit IPs. Kept lower than the main concurrency "
-                       "because hundreds at once exhaust local sockets and "
-                       "connection-fail IPinfo. Default 100. Exit-IP resolution "
-                       "(stage 1, through your proxies) still uses the full "
-                       "concurrency above - so precision isn't traded for speed.",
-                  style="Muted.TLabel").grid(row=r, column=0, columnspan=2,
-                                             sticky="w")
+        self._help("Stage 2 of IP Quality only - the direct reputation-API "
+                   "calls (IPinfo/proxycheck) from THIS machine on the "
+                   "deduped exit IPs. Kept lower than the main concurrency "
+                   "because hundreds at once exhaust local sockets and "
+                   "connection-fail IPinfo. Default 100. Exit-IP resolution "
+                   "(stage 1, through your proxies) still uses the full "
+                   "concurrency above - so precision isn't traded for speed.", r)
         r += 1
 
         # Auto-save: any edit persists after a short debounce, so a forgotten
