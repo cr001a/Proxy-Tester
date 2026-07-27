@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.80"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.81"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1021,6 +1021,90 @@ def score_ip(ip, provider, api_key, timeout=DEFAULT_TIMEOUT, breaker=None):
     if lookup and (api_key or not key_setting):
         q.update(lookup(ip, api_key, timeout) or {})
     return q
+
+
+# --- Pool overlap (white-label / shared-pool detection) ----------------------
+# Different proxy brands often resell the SAME underlying pool. When two of your
+# providers hand back the SAME exit IP, you are renting one IP twice - paying
+# twice, and burning it twice as fast against a target that tracks IP history.
+# We already resolve every exit IP in stage 1, so this costs nothing extra.
+PROVIDER_HOSTS = (
+    ("proxy-haus", "Proxy-Haus"),
+    ("oxylabs", "Oxylabs"),
+    ("rayobyte", "Rayobyte"),
+    ("iproyal", "IPRoyal"),
+    ("lum-superproxy", "Bright Data"),
+    ("luminati", "Bright Data"),
+    ("superproxy", "Bright Data"),
+    ("smartproxy", "Smartproxy"),
+    ("decodo", "Decodo"),
+    ("netnut", "NetNut"),
+    ("packetstream", "PacketStream"),
+    ("geonode", "Geonode"),
+    ("massive", "Massive"),
+    ("soax", "SOAX"),
+    ("nodemaven", "NodeMaven"),
+    ("liveproxies", "Live Proxies"),
+    ("live-proxies", "Live Proxies"),
+    ("hellworld", "Hell World"),
+)
+
+
+def provider_of_host(host):
+    """Best-effort provider label for a proxy host, used to group exits by pool.
+    Unknown hosts fall back to their registrable-looking domain so a provider we
+    don't have a name for still groups with itself."""
+    h = (host or "").strip().lower()
+    for needle, label in PROVIDER_HOSTS:
+        if needle in h:
+            return label
+    parts = [p for p in h.split(".") if p]
+    if len(parts) >= 2:
+        return ".".join(parts[-2:])
+    return h or "unknown"
+
+
+def compute_pool_overlap(discoveries):
+    """Group resolved exit IPs by provider and find the IPs served by MORE THAN
+    ONE provider - the signature of two brands reselling the same pool.
+
+    Returns a dict. `shared` is empty when there is nothing to report (only one
+    provider in the list, or no collisions), which is the silent/normal case."""
+    by_ip, per_provider = {}, {}
+    for d in discoveries:
+        ip = d.get("exit_ip")
+        if not ip:
+            continue
+        prov = provider_of_host((d.get("proxy") or "").split(":")[0])
+        by_ip.setdefault(ip, set()).add(prov)
+        per_provider.setdefault(prov, set()).add(ip)
+    shared = {ip: sorted(ps) for ip, ps in by_ip.items() if len(ps) > 1}
+    pairs = {}
+    for ps in shared.values():
+        for i in range(len(ps)):
+            for j in range(i + 1, len(ps)):
+                key = (ps[i], ps[j])
+                pairs[key] = pairs.get(key, 0) + 1
+    return {
+        "shared": shared,
+        "pairs": pairs,
+        "per_provider": {p: len(ips) for p, ips in per_provider.items()},
+        "providers": sorted(per_provider),
+        "unique_ips": len(by_ip),
+    }
+
+
+def overlap_summary(ov):
+    """One-line human summary of an overlap result, or '' when there's nothing
+    to say (single provider, or no shared IPs)."""
+    shared, uniq = ov.get("shared") or {}, ov.get("unique_ips") or 0
+    if not shared or len(ov.get("providers") or []) < 2:
+        return ""
+    pct = (100.0 * len(shared) / uniq) if uniq else 0.0
+    top = sorted(ov["pairs"].items(), key=lambda kv: -kv[1])[:3]
+    detail = "; ".join(f"{a} + {b}: {n}" for (a, b), n in top)
+    return (f"Pool overlap: {len(shared)} of {uniq} exit IPs ({pct:.1f}%) came "
+            f"back from 2+ providers - {detail}")
 
 
 def build_quality_row(disc, q, has_key):
@@ -3820,6 +3904,20 @@ class QualityTab(ttk.Frame):
             "<Configure>",
             lambda e: self.status_lbl.config(wraplength=max(200, e.width - 8)))
 
+        # Pool-overlap banner: hidden entirely unless two providers in the list
+        # actually returned the same exit IP. Silence = no overlap found.
+        self._overlap = None
+        self.overlap_row = ttk.Frame(self)
+        self.overlap_lbl = ttk.Label(self.overlap_row, text="",
+                                     style="Warn.TLabel", anchor="w",
+                                     justify="left")
+        self.overlap_lbl.pack(side="left", fill="x", expand=True)
+        ttk.Button(self.overlap_row, text="Details",
+                   command=self._show_overlap).pack(side="right", padx=(8, 0))
+        self.overlap_row.bind(
+            "<Configure>",
+            lambda e: self.overlap_lbl.config(wraplength=max(200, e.width - 90)))
+
         self.tree = ttk.Treeview(self, columns=self.COLUMNS,
                                  show="headings", height=12)
         layout = {
@@ -3954,6 +4052,7 @@ class QualityTab(ttk.Frame):
         resolved = unique_n = gated_out = 0
         provider_err, err_ct = "", 0
         prov_status = []
+        overlap = None
         try:
             # --- Stage 1: resolve exit IPs (neutral endpoint, free) ---
             discoveries = []
@@ -4029,18 +4128,30 @@ class QualityTab(ttk.Frame):
                         continue
                     if not load_setting(ks, "").strip():
                         prov_status.append(f"{name}: skipped (no key)")
+            # Same-pool detection: costs nothing (we already have every exit
+            # IP), and only ever surfaces when two providers collide.
+            overlap = compute_pool_overlap(discoveries)
+            shared_map = overlap["shared"]
             has_key = bool(api_key) or provider == AGGREGATE_PROVIDER
             for d in discoveries:
                 if d.get("_slow"):
-                    self.queue.put(self._slow_row(d, gate_ms))
+                    row = self._slow_row(d, gate_ms)
                 else:
-                    self.queue.put(build_quality_row(
-                        d, scores.get(d["exit_ip"], {}), has_key))
+                    row = build_quality_row(
+                        d, scores.get(d["exit_ip"], {}), has_key)
+                sh = shared_map.get(d.get("exit_ip") or "")
+                if sh:
+                    # Flag the row itself so a shared IP is visible in the
+                    # table, not just in the summary.
+                    row["shared"] = sh
+                    row["flags"] = (f"{len(sh)} pools "
+                                    + (row.get("flags") or "")).strip()
+                self.queue.put(row)
         finally:
             self.queue.put({"_done": True, "resolved": resolved,
                             "unique": unique_n, "provider_err": provider_err,
                             "err_ct": err_ct, "gated_out": gated_out,
-                            "prov_status": prov_status})
+                            "prov_status": prov_status, "overlap": overlap})
 
     def _drain_queue(self):
         try:
@@ -4104,9 +4215,72 @@ class QualityTab(ttk.Frame):
         self._summary = ("Stopped" if stopped
                          else f"Done - {scored} scored{dedup}{gate_note}"
                               f"{err_note}{prov_note}")
+        # Same-pool warning: shown ONLY when two providers actually collided.
+        self._overlap = info.get("overlap")
+        note = overlap_summary(self._overlap or {})
+        if note:
+            self.overlap_lbl.config(text=note)
+            self.overlap_row.pack(fill="x", pady=(2, 4), before=self.tree)
+        else:
+            self.overlap_row.pack_forget()
         self._trust_buckets = set()       # a fresh run clears prior filters
         self._type_filter = set()
         self._render_rows()
+
+    def _show_overlap(self):
+        """Full breakdown of which providers are handing back the same IPs."""
+        ov = self._overlap or {}
+        shared = ov.get("shared") or {}
+        if not shared:
+            messagebox.showinfo("Pool overlap", "No shared exit IPs found.")
+            return
+        per = ov.get("per_provider", {})
+        uniq = ov.get("unique_ips", 0)
+        lines = [
+            f"{len(shared)} of {uniq} unique exit IPs came back from more than "
+            f"one provider.",
+            "",
+            "An IP that two providers both serve is ONE IP you are renting "
+            "twice - so it also gets used (and burned) twice as fast.",
+            "",
+            "Unique exit IPs seen per provider:",
+        ]
+        for p in sorted(per, key=lambda k: -per[k]):
+            lines.append(f"   {p}: {per[p]}")
+        lines += ["", "Shared between:"]
+        for (a, b), n in sorted(ov.get("pairs", {}).items(),
+                                key=lambda kv: -kv[1]):
+            # Percentage is of the SMALLER pool - that's the one being diluted.
+            base = min(per.get(a, 0), per.get(b, 0)) or 1
+            lines.append(f"   {a} + {b}: {n} IPs "
+                         f"({100.0 * n / base:.1f}% of the smaller pool)")
+        lines += ["", f"Shared exit IPs ({len(shared)}):"]
+        for ip in sorted(shared):
+            lines.append(f"   {ip}   <- {', '.join(shared[ip])}")
+        text = "\n".join(lines)
+
+        top = tk.Toplevel(self)
+        top.title("Pool overlap - providers sharing exit IPs")
+        top.configure(bg=BASE)
+        center_over_parent(top, self, 720, 520)
+        box = tk.Text(top, wrap="none", height=24)
+        style_text(box)
+        box.pack(fill="both", expand=True, padx=12, pady=(12, 6))
+        box.insert("1.0", text)
+        box.config(state="disabled")
+        bar = ttk.Frame(top)
+        bar.pack(fill="x", padx=12, pady=(0, 12))
+
+        def copy_ips():
+            self.clipboard_clear()
+            self.clipboard_append("\n".join(sorted(shared)))
+            messagebox.showinfo("Pool overlap",
+                                f"Copied {len(shared)} shared exit IP(s).",
+                                parent=top)
+
+        ttk.Button(bar, text="Copy shared IPs",
+                   command=copy_ips).pack(side="left")
+        ttk.Button(bar, text="Close", command=top.destroy).pack(side="right")
 
     def _trust_tag(self, r):
         if r.get("status") != "OK" or r.get("trust") is None:

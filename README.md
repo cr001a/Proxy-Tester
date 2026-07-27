@@ -45,6 +45,16 @@ Four tabs:
    trust**, and **copy selected** proxies straight to the clipboard (full
    `host:port:user:pass`). API keys and worker concurrency live on the
    **Settings** tab.
+
+   **Pool-overlap detection.** Because every exit IP is resolved anyway, the tab
+   also checks whether *two different providers handed back the same exit IP* —
+   the signature of two brands reselling one underlying pool (white-labeling).
+   If it finds any, a warning bar appears above the results with the headline
+   number, and **Details** opens a full breakdown: unique exits per provider,
+   which pairs overlap and by how much (as a share of the smaller pool), and the
+   list of shared IPs with a copy button. Rows whose exit IP is shared are
+   flagged `N pools` in the **Flags** column. It costs no extra API calls and
+   stays completely hidden when there's no overlap.
 4. **Converter** — paste any provider proxy format (full URLs, Python snippets,
    `user:pass@host:port`, `host,port,user,pass`) and get copy-ready
    `host:port:user:pass` lines.
