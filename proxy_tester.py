@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.81"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.82"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1050,6 +1050,60 @@ PROVIDER_HOSTS = (
 )
 
 
+def proxy_full_key(line):
+    """Canonical host:port:user:pass key for a proxy line (password included, so
+    session-in-password proxies are told apart). None if unparseable."""
+    p = parse_proxy_line(str(line))
+    if not p:
+        return None
+    if p.get("user") and p.get("pw") is not None:
+        return f"{p['host']}:{p['port']}:{p['user']}:{p['pw']}"
+    return f"{p['host']}:{p['port']}"
+
+
+# A label line - '# F-Oxylab', '// Oxylab', or '[Oxylab]' - names every proxy
+# below it until the next label. Needed because resellers serve many different
+# products from ONE hostname, so the host alone can't tell two SKUs apart.
+_GROUP_LABEL_RE = re.compile(r"^\s*(?:#+|//)\s*(.+?)\s*$|^\s*\[\s*(.+?)\s*\]\s*$")
+
+
+def group_label_of(line):
+    """Return the group label a line declares, or None if it's not a label."""
+    s = (line or "").strip()
+    if not s or parse_proxy_line(s):        # a real proxy is never a label
+        return None
+    m = _GROUP_LABEL_RE.match(s)
+    if not m:
+        return None
+    label = (m.group(1) or m.group(2) or "").strip()
+    return label or None
+
+
+def parse_labeled_proxies(text):
+    """Split a proxy list into (parsed_proxies, {full_key: label}, bad_count).
+    Label lines ('# Oxylab') tag everything beneath them so two SKUs bought from
+    the same reseller host can still be compared against each other."""
+    proxies, labels, bad = [], {}, 0
+    current = None
+    for line in (text or "").splitlines():
+        if not line.strip():
+            continue
+        lab = group_label_of(line)
+        if lab is not None:
+            current = lab
+            continue
+        parsed = parse_proxy_line(line)
+        if not parsed:
+            bad += 1
+            continue
+        proxies.append(parsed)
+        if current:
+            key = proxy_full_key(line)
+            if key:
+                labels.setdefault(key, current)
+    return proxies, labels, bad
+
+
 def provider_of_host(host):
     """Best-effort provider label for a proxy host, used to group exits by pool.
     Unknown hosts fall back to their registrable-looking domain so a provider we
@@ -1064,18 +1118,24 @@ def provider_of_host(host):
     return h or "unknown"
 
 
-def compute_pool_overlap(discoveries):
+def compute_pool_overlap(discoveries, labels=None):
     """Group resolved exit IPs by provider and find the IPs served by MORE THAN
     ONE provider - the signature of two brands reselling the same pool.
 
+    `labels` maps a proxy's full key to an explicit group name, which WINS over
+    the hostname. That's what lets two SKUs from one reseller (same host,
+    different product) be compared against each other.
+
     Returns a dict. `shared` is empty when there is nothing to report (only one
     provider in the list, or no collisions), which is the silent/normal case."""
+    labels = labels or {}
     by_ip, per_provider = {}, {}
     for d in discoveries:
         ip = d.get("exit_ip")
         if not ip:
             continue
-        prov = provider_of_host((d.get("proxy") or "").split(":")[0])
+        prov = (labels.get(d.get("full") or "")
+                or provider_of_host((d.get("proxy") or "").split(":")[0]))
         by_ip.setdefault(ip, set()).add(prov)
         per_provider.setdefault(prov, set()).add(ip)
     shared = {ip: sorted(ps) for ip, ps in by_ip.items() if len(ps) > 1}
@@ -3960,10 +4020,12 @@ class QualityTab(ttk.Frame):
         """Live count of non-empty proxy lines, shown in the box's header."""
         if not force and not self.proxy_text.edit_modified():
             return
+        # '# Label' group headers are not proxies, so don't count them.
         n = sum(1 for ln in self.proxy_text.get("1.0", "end").splitlines()
-                if ln.strip())
+                if ln.strip() and group_label_of(ln) is None)
         self.proxy_hdr.config(
-            text=f"Proxies (host:port:user:pass, one per line) - {n} in list")
+            text=f"Proxies (host:port:user:pass, one per line; "
+                 f"'# Label' groups a block) - {n} in list")
         self.proxy_text.edit_modified(False)
 
     # --- profile state (proxies only; the API key lives in settings.json) ---
@@ -3981,15 +4043,10 @@ class QualityTab(ttk.Frame):
         save_setting("quality_provider", provider)
         key_setting = QUALITY_PROVIDERS.get(provider, ("", None))[0]
         api_key = load_setting(key_setting, "").strip() if key_setting else ""
-        proxies, bad = [], 0
-        for line in self.proxy_text.get("1.0", "end").splitlines():
-            if not line.strip():
-                continue
-            parsed = parse_proxy_line(line)
-            if parsed:
-                proxies.append(parsed)
-            else:
-                bad += 1
+        # '# Label' lines group the proxies beneath them, so two SKUs from the
+        # same reseller host can still be told apart for overlap detection.
+        proxies, self._labels, bad = parse_labeled_proxies(
+            self.proxy_text.get("1.0", "end"))
         if not proxies:
             messagebox.showerror("ProxyTester", "Enter at least one valid proxy.")
             return
@@ -4130,7 +4187,8 @@ class QualityTab(ttk.Frame):
                         prov_status.append(f"{name}: skipped (no key)")
             # Same-pool detection: costs nothing (we already have every exit
             # IP), and only ever surfaces when two providers collide.
-            overlap = compute_pool_overlap(discoveries)
+            overlap = compute_pool_overlap(discoveries,
+                                           getattr(self, "_labels", None))
             shared_map = overlap["shared"]
             has_key = bool(api_key) or provider == AGGREGATE_PROVIDER
             for d in discoveries:

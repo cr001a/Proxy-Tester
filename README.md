@@ -55,6 +55,13 @@ Four tabs:
    list of shared IPs with a copy button. Rows whose exit IP is shared are
    flagged `N pools` in the **Flags** column. It costs no extra API calls and
    stays completely hidden when there's no overlap.
+
+   Providers are normally identified by hostname, but resellers serve many
+   different products from **one** hostname. To compare two SKUs from the same
+   host, put a **group label** above each block — `# F-Oxylab`, `// Oxylab`, or
+   `[Oxylab]`. Everything under a label is treated as that group, labels win
+   over the hostname, and label lines aren't counted as proxies. This is how you
+   check whether two products are really the same pool.
 4. **Converter** — paste any provider proxy format (full URLs, Python snippets,
    `user:pass@host:port`, `host,port,user,pass`) and get copy-ready
    `host:port:user:pass` lines.
