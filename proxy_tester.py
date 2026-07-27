@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.84"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.85"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -3367,6 +3367,47 @@ def center_over_parent(top, parent, w=None, h=None):
     top.geometry(f"{w}x{h}+{x}+{y}")
 
 
+def fit_to_content(top):
+    """Grow a dialog so its content - including rows revealed AFTER it opened
+    (e.g. the Proxy-Haus block) - actually fits. Never shrinks, so a size the
+    user chose is respected; clamped to the screen and nudged up if the bottom
+    (where the action buttons live) would fall off."""
+    top.update_idletasks()
+    sw, sh = top.winfo_screenwidth(), top.winfo_screenheight()
+    w = min(max(top.winfo_reqwidth(), top.winfo_width()), sw - 40)
+    h = min(max(top.winfo_reqheight(), top.winfo_height()), sh - 80)
+    x, y = top.winfo_x(), top.winfo_y()
+    x = max(0, min(x, sw - w))
+    y = max(0, min(y, sh - h))
+    top.geometry(f"{w}x{h}+{x}+{y}")
+
+
+_GEOM_RE = re.compile(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)")
+
+
+def restore_geometry(top, parent, key):
+    """Reopen a dialog at the size/position the user left it last time, but only
+    if that still lands on THIS screen - otherwise centre it over the app."""
+    top.update_idletasks()
+    m = _GEOM_RE.fullmatch(str(load_setting(f"win_geom_{key}", "")).strip())
+    if m:
+        w, h, x, y = (int(v) for v in m.groups())
+        sw, sh = top.winfo_screenwidth(), top.winfo_screenheight()
+        if (200 <= w <= sw and 150 <= h <= sh
+                and -20 <= x <= sw - 100 and -20 <= y <= sh - 100):
+            top.geometry(f"{w}x{h}+{x}+{y}")
+            return
+    center_over_parent(top, parent)
+
+
+def persist_geometry(top, key):
+    """Remember where/how big the user left a dialog."""
+    try:
+        save_setting(f"win_geom_{key}", top.geometry())
+    except Exception:
+        pass
+
+
 def ask_generate_options(parent, asn_count):
     """Modal dialog: choose static/rotating, proxies-per-ASN, and (for static)
     sticky minutes. Returns (mode, count, sesstime) or None if cancelled.
@@ -3652,6 +3693,11 @@ def open_generate_dialog(parent, text_widget):
     top.configure(bg=BASE)
     top.transient(parent.winfo_toplevel())
     top.resizable(True, True)      # never trap the Generate/Cancel buttons
+    GEOM_KEY = "generate_batch"
+
+    def _close():
+        persist_geometry(top, GEOM_KEY)
+        top.destroy()
 
     # Nothing is pre-selected - you opt in to each provider per batch.
     provider_vars = {name: tk.BooleanVar(value=False)
@@ -3786,6 +3832,7 @@ def open_generate_dialog(parent, text_widget):
             ttk.Checkbutton(inner, text=disp, variable=v).pack(
                 anchor="w", padx=6)
         canvas.yview_moveto(0)
+        fit_to_content(top)
 
     region_type.trace_add("write", rebuild_regions)
     rebuild_regions()
@@ -3860,6 +3907,8 @@ def open_generate_dialog(parent, text_widget):
         else:
             asn_row.grid_remove()
         _fresh_changed()
+        # Rows just appeared/vanished - resize so the buttons stay reachable.
+        fit_to_content(top)
 
     refresh_ui()
 
@@ -3916,15 +3965,19 @@ def open_generate_dialog(parent, text_widget):
         text_widget.insert("1.0", text + "\n")
         text_widget.mark_set("insert", "end-1c")
         text_widget.see("end")
-        top.destroy()
+        _close()
 
     btns = ttk.Frame(frm)
     btns.grid(row=row, column=0, columnspan=2, sticky="w", pady=(12, 0))
     ttk.Button(btns, text="Generate", style="Accent.TButton",
                command=gen).pack(side="left")
-    ttk.Button(btns, text="Cancel", command=top.destroy).pack(side="left",
-                                                              padx=8)
-    center_over_parent(top, parent)
+    ttk.Button(btns, text="Cancel", command=_close).pack(side="left", padx=8)
+    # Reopen where it was last left, then make sure the content actually fits -
+    # the Proxy-Haus block appears only after you tick it, and its extra height
+    # used to push Generate/Cancel off the bottom.
+    restore_geometry(top, parent, GEOM_KEY)
+    fit_to_content(top)
+    top.protocol("WM_DELETE_WINDOW", _close)
     top.grab_set()
 
 
@@ -3970,7 +4023,9 @@ class QualityTab(ttk.Frame):
         form.pack(fill="x")
         self.proxy_hdr = ttk.Label(
             form, text="Proxies (host:port:user:pass, one per line)")
-        self.proxy_hdr.grid(row=0, column=0, sticky="w")
+        # Spans the row: as a plain column-0 cell, this (long) header set the
+        # column width and indented everything to the right of the box.
+        self.proxy_hdr.grid(row=0, column=0, columnspan=4, sticky="w")
         self.proxy_text = tk.Text(form, width=50, height=8)
         style_text(self.proxy_text)
         self.proxy_text.grid(row=1, column=0, rowspan=4, sticky="nw",
