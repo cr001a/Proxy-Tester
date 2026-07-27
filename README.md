@@ -110,9 +110,12 @@ whole batch. Proxy-Haus adds a **click-to-pick ASN menu** (choose any number of
 carriers): it always emits **at least one proxy per selected ASN**, and when the
 count exceeds the number of ASNs it **splits the count evenly across them**
 (e.g. 5 ASNs / count 10 → 2 each; count 12 → 3,3,2,2,2). Lifetime accepts `30`,
-`30m`, or `2h`. Proxy-Haus also exposes a **Fresh pool** toggle
+`30m`, or `2h`. Proxy-Haus also exposes a **Fresh** toggle
 (`-pool-experimental1`) — freshly-added, less-used US IPs — which works with or
-without an ASN and is shown only while Proxy-Haus is checked.
+without an ASN and sits with the ASN picker, shown only while Proxy-Haus is
+checked. **Fresh is a different pool with a much longer sticky cap**: ticking it
+raises Proxy-Haus from 120 min / 2 h to **3600 min / 60 h**, and the grey rule
+text next to its lifetime box updates to match as you toggle it.
 
 The **ASN Tester** tab also generates per-ASN proxies (static or rotating) for
 the selected provider. Adding a provider is a small change in `RESI_PROVIDERS` /

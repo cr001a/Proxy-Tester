@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.83"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.84"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1595,6 +1595,11 @@ RESI_PROVIDERS = {
         "max_min": 120, "min_max": 120, "hr_max": 2,
         "life_rule": "1-120m or 1-2h", "sessid": lambda: _sessid_lower(8),
         "supports_asn": True, "supports_fresh": True,
+        # The Fresh pool allows a MUCH longer sticky session than the normal
+        # pool (their generator caps Session TTL at 3600 min with Fresh on), so
+        # the cap - and the rule text - swap when Fresh is ticked.
+        "fresh_max_min": 3600, "fresh_min_max": 3600, "fresh_hr_max": 60,
+        "fresh_life_rule": "1-3600m or 1-60h (Fresh)",
     },
     "Rayobyte": {
         "key": "rayobyte",
@@ -1617,14 +1622,26 @@ RESI_PROVIDERS = {
 }
 
 
-def validate_resi_life(provider, raw):
+def resi_life_caps(provider, fresh=False):
+    """The sticky-lifetime limits in force for a provider right now, as
+    (max_min, min_max, hr_max, rule_text). Proxy-Haus's Fresh pool allows a far
+    longer session than its normal pool, so the caps swap when Fresh is on."""
+    spec = RESI_PROVIDERS.get(provider, {})
+    if fresh and spec.get("supports_fresh") and spec.get("fresh_max_min"):
+        return (spec["fresh_max_min"], spec["fresh_min_max"],
+                spec["fresh_hr_max"], spec.get("fresh_life_rule", ""))
+    return (spec.get("max_min"), spec.get("min_max"), spec.get("hr_max"),
+            spec.get("life_rule", ""))
+
+
+def validate_resi_life(provider, raw, fresh=False):
     """Parse a per-provider sticky-lifetime entry and enforce that provider's
     real format rules. Returns (minutes, error). Rejects decimals, wrong units,
     and out-of-range values (so 0.5h, 90m on IPRoyal, or 169h never generate)."""
     spec = RESI_PROVIDERS.get(provider, {})
     if spec.get("max_min") is None:
         return None, None                 # no lifetime token (Bright Data)
-    rule = spec.get("life_rule", "")
+    _mx, min_max, hr_max, rule = resi_life_caps(provider, fresh)
     s = (raw or "").strip().lower().replace(" ", "")
     m = re.fullmatch(r"(\d+)(m|min|mins|minutes|h|hr|hrs|hour|hours)?", s)
     if not m:
@@ -1636,11 +1653,11 @@ def validate_resi_life(provider, raw):
     if val < 1:
         return None, f"{provider}: lifetime must be at least 1 ({rule})."
     if is_hr:
-        if val > spec["hr_max"]:
-            return None, f"{provider}: max is {spec['hr_max']}h ({rule})."
+        if val > hr_max:
+            return None, f"{provider}: max is {hr_max}h ({rule})."
         return val * 60, None
-    if val > spec["min_max"]:
-        return None, (f"{provider}: {val}m is over the {spec['min_max']}m "
+    if val > min_max:
+        return None, (f"{provider}: {val}m is over the {min_max}m "
                       f"minute-format limit - use whole hours above that "
                       f"({rule}).")
     return val, None
@@ -1714,13 +1731,13 @@ def _fmt_minutes(m):
     return f"{m}m"
 
 
-def resi_lifetime_error(provider, lifetime_min):
+def resi_lifetime_error(provider, lifetime_min, fresh=False):
     """Return an error if `lifetime_min` (minutes) exceeds the provider's
     hardcoded sticky maximum, else None. Refused, never silently clamped."""
     spec = RESI_PROVIDERS.get(provider)
     if not spec or not lifetime_min:
         return None
-    mx = spec.get("max_min")
+    mx = resi_life_caps(provider, fresh)[0]
     if mx and lifetime_min > mx:
         return (f"{provider} sticky lifetime maxes out at {_fmt_minutes(mx)}. "
                 f"You entered {_fmt_minutes(lifetime_min)} - lower it and "
@@ -1741,7 +1758,8 @@ def generate_resi_batch(provider, region_type, regions, lifetime_min, count,
     if not user or not pw:
         return [], f"Add {provider} username:password on the Settings tab first."
     if not rotating:
-        err = resi_lifetime_error(provider, lifetime_min)
+        err = resi_lifetime_error(provider, lifetime_min,
+                                  fresh and spec.get("supports_fresh"))
         if err:
             return [], err
     make_sessid = spec.get("sessid", _resi_sessid)
@@ -3633,7 +3651,7 @@ def open_generate_dialog(parent, text_widget):
     top.title("Generate residential batch")
     top.configure(bg=BASE)
     top.transient(parent.winfo_toplevel())
-    top.resizable(False, False)
+    top.resizable(True, True)      # never trap the Generate/Cancel buttons
 
     # Nothing is pre-selected - you opt in to each provider per batch.
     provider_vars = {name: tk.BooleanVar(value=False)
@@ -3663,6 +3681,7 @@ def open_generate_dialog(parent, text_widget):
     # widens the dialog instead of making it ever taller.
     PROV_ROWS = 5
     prov_cb_widgets = {}
+    rule_lbls = {}            # provider -> the grey "(1-120m or 1-2h)" label
     for i, name in enumerate(configured):
         spec = RESI_PROVIDERS[name]
         grow, gcol = i % PROV_ROWS, i // PROV_ROWS
@@ -3684,8 +3703,10 @@ def open_generate_dialog(parent, text_widget):
             life_vars[name] = lv
             ttk.Label(lf, text="sticky").pack(side="left")
             ttk.Entry(lf, textvariable=lv, width=8).pack(side="left", padx=(4, 4))
-            ttk.Label(lf, text=f"({spec.get('life_rule', '')})",
-                      style="Muted.TLabel").pack(side="left")
+            # Kept so the rule text can change live (Proxy-Haus + Fresh).
+            rule_lbls[name] = ttk.Label(lf, text=f"({spec.get('life_rule', '')})",
+                                        style="Muted.TLabel")
+            rule_lbls[name].pack(side="left")
         else:
             # No TTL token at all (Bright Data, PacketStream) - say why.
             note = spec.get("life_note",
@@ -3698,7 +3719,7 @@ def open_generate_dialog(parent, text_widget):
         # i.e. min(target, its cap), so a 3h target lands Proxy-Haus on 2h and
         # Rayobyte on 1h while Oxylabs/IPRoyal take the full 3h.
         for pname, lv in life_vars.items():
-            cap = RESI_PROVIDERS[pname]["max_min"]
+            cap = resi_life_caps(pname, fresh.get())[0]
             lv.set(_fmt_minutes(min(target_min, cap)))
 
     mrow = ttk.Frame(frm)
@@ -3713,16 +3734,17 @@ def open_generate_dialog(parent, text_widget):
     ttk.Label(mrow, text="(closest each provider allows)",
               style="Muted.TLabel").pack(side="left", padx=(8, 0))
 
-    ttk.Label(frm, text="Country: United States (fixed)",
-              style="Muted.TLabel").grid(row=row, column=0, columnspan=2,
-                                         sticky="w", pady=(8, 2))
+    # Label + dropdown packed in ONE cell - gridding them into separate columns
+    # let the dropdown drift to the far right when column 0 stretched.
+    creg = ttk.Frame(frm)
+    creg.grid(row=row, column=0, columnspan=2, sticky="w", pady=(8, 2))
     row += 1
-    ttk.Label(frm, text="Region type").grid(row=row, column=0, sticky="w",
-                                            pady=4)
-    ttk.Combobox(frm, textvariable=region_type, width=12, state="readonly",
-                 values=["Country", "State", "City"]).grid(
-        row=row, column=1, sticky="w", padx=(8, 0), pady=4)
-    row += 1
+    ttk.Label(creg, text="Country: United States (fixed)",
+              style="Muted.TLabel").pack(side="left", padx=(0, 16))
+    ttk.Label(creg, text="Region type").pack(side="left")
+    ttk.Combobox(creg, textvariable=region_type, width=12, state="readonly",
+                 values=["Country", "State", "City"]).pack(side="left",
+                                                           padx=(8, 0))
 
     # Scrollable checkbox list of regions - repopulated when region type changes.
     list_lbl = ttk.Label(frm, text="Regions (check one or more)")
@@ -3750,11 +3772,14 @@ def open_generate_dialog(parent, text_widget):
             w.destroy()
         opts = REGION_OPTIONS.get(region_type.get())
         if not opts:
-            ttk.Label(inner, text="Country-wide (no region needed)",
-                      style="Muted.TLabel").pack(anchor="w", padx=6, pady=6)
+            # Country-wide needs no picker - hide the label AND the box so the
+            # dialog doesn't carry ~180px of dead space, which was pushing the
+            # Generate/Cancel buttons off the bottom.
             list_lbl.grid_remove()
+            holder.grid_remove()
             return
         list_lbl.grid()
+        holder.grid()
         for canon, disp in opts:
             v = tk.BooleanVar(value=False)
             region_vars[canon] = v
@@ -3774,22 +3799,32 @@ def open_generate_dialog(parent, text_widget):
     # Proxy-Haus ASN picker: inline checkboxes - always-visible, always-on
     # multi-select (no popup/menu that could drop the selection). Pick any
     # number; shown only while Proxy-Haus is checked.
+    # Everything Proxy-Haus-only lives in ONE block, shown only while Proxy-Haus
+    # is checked: the Fresh toggle (its own pool, with a longer sticky cap) and
+    # the carrier ASNs, wrapped 3-per-row so the last one never clips off.
     asn_row = ttk.Frame(frm)
     asn_row.grid(row=row, column=0, columnspan=2, sticky="w", pady=(4, 0))
     row += 1
-    ttk.Label(asn_row, text="Proxy-Haus ASNs:").pack(side="left", padx=(0, 8))
-    for a, aname, cat in PROXYHAUS_ASNS:
-        ttk.Checkbutton(asn_row, text=f"{aname} {a}",
-                        variable=asn_vars[a]).pack(side="left", padx=(0, 8))
+    head = ttk.Frame(asn_row)
+    head.pack(anchor="w")
+    ttk.Label(head, text="Proxy-Haus:").pack(side="left", padx=(0, 8))
+    ttk.Checkbutton(head, text="Fresh", variable=fresh,
+                    command=lambda: _fresh_changed()).pack(side="left")
+    grid_f = ttk.Frame(asn_row)
+    grid_f.pack(anchor="w", pady=(2, 0))
+    ttk.Label(grid_f, text="ASNs:").grid(row=0, column=0, sticky="w",
+                                         padx=(0, 8))
+    for i, (a, aname, cat) in enumerate(PROXYHAUS_ASNS):
+        ttk.Checkbutton(grid_f, text=f"{aname} {a}",
+                        variable=asn_vars[a]).grid(
+            row=i // 3, column=1 + (i % 3), sticky="w", padx=(0, 10), pady=1)
 
-    # Proxy-Haus "Fresh" pool: freshly-added, less-used US IPs. Works with or
-    # without an ASN; shown only while Proxy-Haus is checked.
-    fresh_row = ttk.Frame(frm)
-    fresh_row.grid(row=row, column=0, columnspan=2, sticky="w", pady=(4, 0))
-    row += 1
-    ttk.Checkbutton(fresh_row,
-                    text="Fresh pool (freshly-added, less-used US IPs)",
-                    variable=fresh).pack(side="left")
+    def _fresh_changed():
+        """Fresh swaps Proxy-Haus onto a pool with a much longer sticky cap, so
+        the grey rule text has to follow the toggle."""
+        lbl = rule_lbls.get("Proxy-Haus")
+        if lbl is not None:
+            lbl.config(text=f"({resi_life_caps('Proxy-Haus', fresh.get())[3]})")
 
     rot_cb = ttk.Checkbutton(
         frm, text="Rotating (new IP per request, no sticky session)",
@@ -3822,10 +3857,9 @@ def open_generate_dialog(parent, text_widget):
         ph = provider_vars.get("Proxy-Haus")
         if ph and ph.get():
             asn_row.grid()
-            fresh_row.grid()
         else:
             asn_row.grid_remove()
-            fresh_row.grid_remove()
+        _fresh_changed()
 
     refresh_ui()
 
@@ -3859,7 +3893,9 @@ def open_generate_dialog(parent, text_widget):
             for name in providers:
                 if name not in life_vars:
                     continue
-                mins, lerr = validate_resi_life(name, life_vars[name].get())
+                mins, lerr = validate_resi_life(
+                    name, life_vars[name].get(),
+                    fresh.get() and RESI_PROVIDERS[name].get("supports_fresh"))
                 if lerr:
                     messagebox.showerror("Generate batch", lerr)
                     return
