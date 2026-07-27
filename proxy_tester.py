@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.79"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.80"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1374,10 +1374,16 @@ def _build_brightdata_resi(user, pw, state, city, lifetime, sessid, asn=None):
     return f"zproxy.lum-superproxy.com:32223:{u}:{pw}"
 
 
-def _build_proxyhaus_resi(user, pw, state, city, lifetime, sessid, asn=None):
+def _build_proxyhaus_resi(user, pw, state, city, lifetime, sessid, asn=None,
+                          fresh=False):
     # us-gw.proxy-haus.com: params in the username; optional -asn-<n>, sticky via
-    # -session-<tok>-ttl-<minutes> (ttl up to 120).
-    u = f"{user}-country-us"
+    # -session-<tok>-ttl-<minutes> (ttl up to 120). `fresh` selects Proxy-Haus's
+    # "Fresh" pool (freshly-added, less-used US IPs) via -pool-experimental1,
+    # inserted right after the username - works with or without an ASN.
+    u = user
+    if fresh:
+        u += "-pool-experimental1"
+    u += "-country-us"
     if asn:
         u += f"-asn-{asn}"
     if sessid:
@@ -1432,7 +1438,7 @@ RESI_PROVIDERS = {
         "build": _build_proxyhaus_resi,
         "max_min": 120, "min_max": 120, "hr_max": 2,
         "life_rule": "1-120m or 1-2h", "sessid": lambda: _sessid_lower(8),
-        "supports_asn": True,
+        "supports_asn": True, "supports_fresh": True,
     },
     "Rayobyte": {
         "key": "rayobyte",
@@ -1541,7 +1547,7 @@ def resi_lifetime_error(provider, lifetime_min):
 
 
 def generate_resi_batch(provider, region_type, regions, lifetime_min, count,
-                        rotating=False, asns=None):
+                        rotating=False, asns=None, fresh=False):
     """Build `count` residential proxy lines for one provider, spread round-robin
     across the selected `regions` (state/city) and, for proxy-haus, `asns`.
     lifetime_min is minutes. Each line gets a unique session token unless
@@ -1580,13 +1586,14 @@ def generate_resi_batch(provider, region_type, regions, lifetime_min, count,
         state = tgt if region_type == "State" else ""
         city = tgt if region_type == "City" else ""
         sid = make_sessid() if (force_session or not rotating) else None
+        extra = {"fresh": True} if (fresh and spec.get("supports_fresh")) else {}
         lines.append(spec["build"](user, pw, state, city, lifetime_min,
-                                   sid, asn))
+                                   sid, asn, **extra))
     return lines, None
 
 
 def generate_resi_multi(providers, region_type, regions, lifetimes, count,
-                        rotating=False, asns=None):
+                        rotating=False, asns=None, fresh=False):
     """Generate `count` lines for EACH selected provider and concatenate them.
     `lifetimes` is a {provider: minutes} map so each provider can have its own
     sticky time. Any provider whose time exceeds its cap aborts the whole run
@@ -1597,7 +1604,7 @@ def generate_resi_multi(providers, region_type, regions, lifetimes, count,
     for p in providers:
         lt = None if rotating else (lifetimes or {}).get(p)
         lines, err = generate_resi_batch(p, region_type, regions, lt,
-                                         count, rotating, asns)
+                                         count, rotating, asns, fresh)
         if err:
             return [], err
         all_lines.extend(lines)
@@ -3448,6 +3455,7 @@ def open_generate_dialog(parent, text_widget):
     append = tk.BooleanVar(value=False)
     region_vars = {}          # canonical -> BooleanVar (rebuilt per region type)
     asn_vars = {a: tk.BooleanVar(value=False) for a, _, _ in PROXYHAUS_ASNS}
+    fresh = tk.BooleanVar(value=False)     # Proxy-Haus "Fresh" pool toggle
 
     frm = ttk.Frame(top, padding=(16, 14))
     frm.pack(fill="both", expand=True)
@@ -3572,6 +3580,15 @@ def open_generate_dialog(parent, text_widget):
         ttk.Checkbutton(asn_row, text=f"{aname} {a}",
                         variable=asn_vars[a]).pack(side="left", padx=(0, 8))
 
+    # Proxy-Haus "Fresh" pool: freshly-added, less-used US IPs. Works with or
+    # without an ASN; shown only while Proxy-Haus is checked.
+    fresh_row = ttk.Frame(frm)
+    fresh_row.grid(row=row, column=0, columnspan=2, sticky="w", pady=(4, 0))
+    row += 1
+    ttk.Checkbutton(fresh_row,
+                    text="Fresh pool (freshly-added, less-used US IPs)",
+                    variable=fresh).pack(side="left")
+
     rot_cb = ttk.Checkbutton(
         frm, text="Rotating (new IP per request, no sticky session)",
         variable=rotating, command=lambda: refresh_ui())
@@ -3602,8 +3619,10 @@ def open_generate_dialog(parent, text_widget):
         ph = provider_vars.get("Proxy-Haus")
         if ph and ph.get():
             asn_row.grid()
+            fresh_row.grid()
         else:
             asn_row.grid_remove()
+            fresh_row.grid_remove()
 
     refresh_ui()
 
@@ -3644,7 +3663,7 @@ def open_generate_dialog(parent, text_widget):
                 lifetimes[name] = mins
         asns = [a for a, v in asn_vars.items() if v.get()]
         lines, err = generate_resi_multi(providers, rtype, regions, lifetimes, n,
-                                         rotating.get(), asns)
+                                         rotating.get(), asns, fresh.get())
         if err:
             messagebox.showerror("Generate batch", err)
             return
