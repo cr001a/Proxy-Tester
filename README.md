@@ -95,15 +95,17 @@ under **Strict only**. No API key needed; pinned ASNs persist in
 
 **Generate batch** (Proxy Tester / IP Quality tabs) builds sticky or rotating
 residential proxies for **one or more providers at once** —
-**Oxylabs Residential**, **IPRoyal**, **Bright Data**, **Proxy-Haus**, and
-**Rayobyte**. Check
-the providers you want; each checked provider gets **its own sticky-lifetime
-box** (with its max shown), and a **Set all to max** button fills them all to
-their caps at once. The **sticky-lifetime cap is hardcoded and enforced** —
-Oxylabs 1440 min (24 h), IPRoyal 59 min / 168 h, Proxy-Haus 120 min, Rayobyte
-60 min (always sticky — no rotating mode), Bright Data inherent (~30 min, no
-token). If any provider's lifetime exceeds its cap it warns
-and generates nothing. Set **count per provider** and **location** once for the
+**Oxylabs Residential**, **IPRoyal**, **Bright Data**, **Proxy-Haus**,
+**Rayobyte**, and **PacketStream**. **Nothing is pre-selected** — you opt in to
+each provider per batch. Providers are laid out in **columns of five**, so
+adding one widens the dialog instead of lengthening it. Each checked provider
+gets **its own sticky-lifetime box** (with its max shown), and a **Set all to
+max** button fills them all to their caps at once. The **sticky-lifetime cap is
+hardcoded and enforced** — Oxylabs 1440 min (24 h), IPRoyal 59 min / 168 h,
+Proxy-Haus 120 min, Rayobyte 60 min (always sticky — no rotating mode), Bright
+Data inherent (~30 min, no token), PacketStream fixed at its own ~60 min max
+(no token exists to lower it, so it gets no lifetime box). If any provider's
+lifetime exceeds its cap it warns and generates nothing. Set **count per provider** and **location** once for the
 whole batch. Proxy-Haus adds a **click-to-pick ASN menu** (choose any number of
 carriers): it always emits **at least one proxy per selected ASN**, and when the
 count exceeds the number of ASNs it **splits the count evenly across them**
@@ -123,9 +125,13 @@ Provider logins live on the **Settings** tab, one box per provider as
 
 - **Oxylabs Mobile** and **Proxy-Haus** — auto-fill the ASN Tester's
   Username/Password when their provider is selected.
-- **Oxylabs Residential**, **IPRoyal**, **Bright Data**, **Proxy-Haus** — feed
-  the **Generate batch** dialog; a provider only appears there once its box is
-  filled in.
+- **Oxylabs Residential**, **IPRoyal**, **Bright Data**, **Proxy-Haus**,
+  **Rayobyte**, **PacketStream** — feed the **Generate batch** dialog; a
+  provider only appears there once its box is filled in.
+
+Each generator provider has an **in generator** tick-box next to its credentials.
+Untick it to hide that provider from **Generate batch** *without deleting the
+credentials* — ticking it back restores it with nothing to re-type.
 
 Settings are saved to `%APPDATA%\ProxyTester\settings.json`. Credentials
 (including passwords) are stored there in **plain text** on your own machine —

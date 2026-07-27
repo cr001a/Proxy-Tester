@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.82"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.83"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1535,6 +1535,18 @@ def _build_proxyhaus_resi(user, pw, state, city, lifetime, sessid, asn=None,
     return f"us-gw.proxy-haus.com:7777:{u}:{pw}"
 
 
+def _build_packetstream_resi(user, pw, state, city, lifetime, sessid, asn=None):
+    # proxy.packetstream.io: params live in the PASSWORD, underscore-delimited.
+    # Country is CamelCase with no space ("UnitedStates"). Sticky adds
+    # _session-<tok>; there is NO ttl/duration token - PacketStream pins the
+    # sticky lifetime at its own maximum (~60 min) and it can't be lowered, so
+    # `lifetime` is deliberately ignored here.
+    p = f"{pw}_country-UnitedStates"
+    if sessid:
+        p += f"_session-{sessid}"
+    return f"proxy.packetstream.io:31112:{user}:{p}"
+
+
 def _build_rayobyte_resi(user, pw, state, city, lifetime, sessid, asn=None):
     # la.residential.rayobyte.com: params live in the PASSWORD. Rayobyte has no
     # rotating mode - it's ALWAYS a hardsession (sticky), so a token is always
@@ -1593,6 +1605,15 @@ RESI_PROVIDERS = {
         # No rotating mode - always emit a hardsession, even in rotating runs.
         "always_session": True,
     },
+    "PacketStream": {
+        "key": "packetstream",
+        "legacy": None,
+        "build": _build_packetstream_resi,
+        # PacketStream fixes the sticky lifetime at its own max (~60 min) and
+        # offers no token to lower it - so, like Bright Data, no lifetime box.
+        "max_min": None, "sessid": lambda: _resi_sessid(8),
+        "life_note": "sticky lifetime fixed at PacketStream's max (~60m)",
+    },
 }
 
 
@@ -1625,12 +1646,29 @@ def validate_resi_life(provider, raw):
     return val, None
 
 
-def configured_resi_providers():
-    """Providers that have both a username and password saved in settings."""
+def hidden_resi_providers():
+    """Provider keys the user has switched OFF in Settings. Hiding is purely a
+    display choice - the credentials stay saved, so flipping it back on needs no
+    re-typing."""
+    v = load_setting("hidden_providers", [])
+    return set(v) if isinstance(v, (list, tuple, set)) else set()
+
+
+def set_resi_provider_hidden(key, hidden):
+    """Show/hide one provider in the batch generator, keeping its credentials."""
+    cur = hidden_resi_providers()
+    cur.discard(key) if not hidden else cur.add(key)
+    save_setting("hidden_providers", sorted(cur))
+
+
+def configured_resi_providers(include_hidden=False):
+    """Providers that have both a username and password saved in settings, minus
+    any the user has hidden in Settings (unless `include_hidden`)."""
+    hidden = set() if include_hidden else hidden_resi_providers()
     out = []
     for name, spec in RESI_PROVIDERS.items():
         u, p = load_provider_creds(spec["key"], spec.get("legacy"))
-        if u and p:
+        if u and p and spec["key"] not in hidden:
             out.append(name)
     return out
 
@@ -3580,10 +3618,16 @@ def open_generate_dialog(parent, text_widget):
     location. Proxy-Haus adds a click-to-pick ASN menu."""
     configured = configured_resi_providers()
     if not configured:
-        messagebox.showinfo(
-            "Generate batch",
-            "Add a provider's username:password on the Settings tab first "
-            "(Oxylabs Residential, IPRoyal, Bright Data, or Proxy-Haus).")
+        # Distinguish "no credentials yet" from "you hid them all".
+        hidden_n = len(configured_resi_providers(include_hidden=True))
+        msg = ("Add a provider's username:password on the Settings tab first "
+               "(Oxylabs Residential, IPRoyal, Bright Data, Proxy-Haus, "
+               "Rayobyte, or PacketStream).")
+        if hidden_n:
+            msg = (f"All {hidden_n} configured provider(s) are hidden from the "
+                   "generator. Re-tick 'in generator' next to a provider on "
+                   "the Settings tab - your credentials are still saved.")
+        messagebox.showinfo("Generate batch", msg)
         return
     top = tk.Toplevel(parent)
     top.title("Generate residential batch")
@@ -3591,7 +3635,9 @@ def open_generate_dialog(parent, text_widget):
     top.transient(parent.winfo_toplevel())
     top.resizable(False, False)
 
-    provider_vars = {name: tk.BooleanVar(value=True) for name in configured}
+    # Nothing is pre-selected - you opt in to each provider per batch.
+    provider_vars = {name: tk.BooleanVar(value=False)
+                     for name in configured}
     life_vars = {}            # provider -> StringVar (only providers with a cap)
     region_type = tk.StringVar(value="Country")
     count = tk.StringVar(value="500")
@@ -3613,15 +3659,24 @@ def open_generate_dialog(parent, text_widget):
     prov_box.grid(row=row, column=0, columnspan=2, sticky="w")
     row += 1
     prov_life_frames = {}
+    # Providers fill COLUMNS of at most PROV_ROWS each, so adding a provider
+    # widens the dialog instead of making it ever taller.
+    PROV_ROWS = 5
     prov_cb_widgets = {}
     for i, name in enumerate(configured):
         spec = RESI_PROVIDERS[name]
-        cb = ttk.Checkbutton(prov_box, text=name, variable=provider_vars[name],
+        grow, gcol = i % PROV_ROWS, i // PROV_ROWS
+        # One cell per provider holds its checkbox AND its lifetime box, so the
+        # pair hides together (Rayobyte during a rotating run) and columns stay
+        # aligned regardless of how wide a provider's lifetime hint is.
+        cell = ttk.Frame(prov_box)
+        cell.grid(row=grow, column=gcol, sticky="w", pady=2, padx=(0, 18))
+        cb = ttk.Checkbutton(cell, text=name, variable=provider_vars[name],
                              command=lambda: refresh_ui())
-        cb.grid(row=i, column=0, sticky="w", pady=2, padx=(0, 10))
-        prov_cb_widgets[name] = cb
-        lf = ttk.Frame(prov_box)
-        lf.grid(row=i, column=1, sticky="w")
+        cb.pack(side="left", padx=(0, 8))
+        prov_cb_widgets[name] = cell     # hide/show the whole cell
+        lf = ttk.Frame(cell)
+        lf.pack(side="left")
         prov_life_frames[name] = lf
         mx = spec.get("max_min")
         if mx:
@@ -3632,7 +3687,10 @@ def open_generate_dialog(parent, text_widget):
             ttk.Label(lf, text=f"({spec.get('life_rule', '')})",
                       style="Muted.TLabel").pack(side="left")
         else:
-            ttk.Label(lf, text="(no lifetime token; sticky IP holds ~30m)",
+            # No TTL token at all (Bright Data, PacketStream) - say why.
+            note = spec.get("life_note",
+                            "no lifetime token; sticky IP holds ~30m")
+            ttk.Label(lf, text=f"({note})",
                       style="Muted.TLabel").pack(side="left")
 
     def set_all_to(target_min):
@@ -3753,13 +3811,14 @@ def open_generate_dialog(parent, text_widget):
             unsupported = rot and RESI_PROVIDERS[pname].get("always_session")
             if unsupported:
                 prov_cb_widgets[pname].grid_remove()
-                lf.grid_remove()
+                lf.pack_forget()
                 continue
             prov_cb_widgets[pname].grid()
+            # lf is packed inside the provider's cell, not gridded.
             if provider_vars[pname].get():
-                lf.grid()
+                lf.pack(side="left")
             else:
-                lf.grid_remove()
+                lf.pack_forget()
         ph = provider_vars.get("Proxy-Haus")
         if ph and ph.get():
             asn_row.grid()
@@ -4664,8 +4723,15 @@ class SettingsTab(ttk.Frame):
         self.brightdata = tk.StringVar(value=provider_creds_display("brightdata"))
         self.proxyhaus = tk.StringVar(value=provider_creds_display("proxyhaus"))
         self.rayobyte = tk.StringVar(value=provider_creds_display("rayobyte"))
+        self.packetstream = tk.StringVar(
+            value=provider_creds_display("packetstream"))
 
-        def cred_row(label, var):
+        # Per-provider show/hide for the batch generator. Unchecking hides the
+        # provider from Generate batch WITHOUT touching its saved credentials,
+        # so turning it back on needs no re-typing.
+        self.show_vars = {}
+
+        def cred_row(label, var, gen_key=None):
             nonlocal r
             ttk.Label(host, text=label).grid(row=r, column=0, sticky="w", pady=3)
             # Entry + inline warning packed together in one cell so the warning
@@ -4676,6 +4742,21 @@ class SettingsTab(ttk.Frame):
             e = ttk.Entry(box, textvariable=var, width=46)
             e.pack(side="left")
             e.bind("<FocusOut>", lambda _e: self._persist(), add="+")
+            if gen_key:
+                sv = tk.BooleanVar(value=gen_key not in hidden_resi_providers())
+                self.show_vars[gen_key] = sv
+
+                def _toggle(k=gen_key, v=sv):
+                    set_resi_provider_hidden(k, not v.get())
+                    self.status_lbl.config(
+                        text=("Shown in Generate batch" if v.get()
+                              else "Hidden from Generate batch "
+                                   "(credentials kept)"))
+                    if self._on_saved:
+                        self._on_saved()
+
+                ttk.Checkbutton(box, text="in generator", variable=sv,
+                                command=_toggle).pack(side="left", padx=(10, 0))
             # Inline validation for the username:password format - flag a missing
             # colon or a space in the username right here, where creds are typed,
             # rather than at generate time.
@@ -4686,12 +4767,18 @@ class SettingsTab(ttk.Frame):
             warn.config(text=_cred_warning(var.get()))
             r += 1
 
+        # Oxylabs Mobile feeds the ASN Tester, not the batch generator, so it
+        # has no 'in generator' toggle.
         cred_row("Oxylabs Mobile (username:password)", self.oxy_mobile)
-        cred_row("Oxylabs Residential (username:password)", self.oxy_resi)
-        cred_row("IPRoyal (username:password)", self.ipr)
-        cred_row("Bright Data (username:password)", self.brightdata)
-        cred_row("Proxy-Haus (username:password)", self.proxyhaus)
-        cred_row("Rayobyte (username:password)", self.rayobyte)
+        cred_row("Oxylabs Residential (username:password)", self.oxy_resi,
+                 "oxylabs_resi")
+        cred_row("IPRoyal (username:password)", self.ipr, "iproyal")
+        cred_row("Bright Data (username:password)", self.brightdata,
+                 "brightdata")
+        cred_row("Proxy-Haus (username:password)", self.proxyhaus, "proxyhaus")
+        cred_row("Rayobyte (username:password)", self.rayobyte, "rayobyte")
+        cred_row("PacketStream (username:password)", self.packetstream,
+                 "packetstream")
 
         ttk.Separator(host, orient="horizontal").grid(
             row=r, column=0, columnspan=2, sticky="ew", pady=14)
@@ -4731,7 +4818,8 @@ class SettingsTab(ttk.Frame):
         # click on 'Save settings' can never silently drop a key again.
         for _v in (self.ipqs, self.pcheck, self.ipinfo, self.oxy_mobile,
                    self.oxy_resi, self.ipr, self.brightdata, self.proxyhaus,
-                   self.rayobyte, self.workers, self.score_workers):
+                   self.rayobyte, self.packetstream, self.workers,
+                   self.score_workers):
             _v.trace_add("write", self._schedule_autosave)
 
         # Settings auto-save (debounced on every edit), so there's no Save
@@ -4762,6 +4850,7 @@ class SettingsTab(ttk.Frame):
         save_setting("brightdata", self.brightdata.get().strip())
         save_setting("proxyhaus", self.proxyhaus.get().strip())
         save_setting("rayobyte", self.rayobyte.get().strip())
+        save_setting("packetstream", self.packetstream.get().strip())
         try:
             w = max(1, min(MAX_WORKERS_CAP, int(self.workers.get().strip())))
         except (TypeError, ValueError):
