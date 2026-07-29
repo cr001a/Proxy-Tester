@@ -231,6 +231,14 @@ see the carrier you landed on.
 Results table: `ASN | Status | Median ms | Min ms | Max ms | Success (n/N) |
 Landed on (org)`. OK rows are sorted first, by ascending median latency.
 
+**Landed on** works with **any** test URL. Only `ipinfo.io/json` returns an
+`org` field, so when you point the test at a retailer the carrier is resolved
+with one extra `ipinfo.io/json` call through the *same sticky session* — made
+only until that ASN has an answer (at most one extra request per ASN, and none
+at all on the default URL). A `4xx` from the target still counts as "the exit
+connected", so a PerimeterX `403` on Walmart still tells you which carrier you
+landed on.
+
 ## Tab 2: Proxy Tester
 
 Paste proxies one per line as `host:port:user:pass` (or `host:port` for no
@@ -284,3 +292,11 @@ status (`200` reachable, `407` auth, `502`/`504` upstream). Pick a single site
 - A dead proxy or ASN shows a status in its own row and never blocks the others
   or crashes the app.
 - **Export CSV** on each tab writes the current results table to a `.csv`.
+- **Copying:** every results table and the ASN catalog have a **right-click
+  menu** with *Copy selected* / *Select all*, alongside `Ctrl+C` / `Ctrl+A`.
+  The menu matters on remote desktops — a Mac keyboard driving a Windows box
+  over RDP sends `Cmd`, which Windows never receives as `Ctrl`, so the shortcut
+  silently does nothing. Right-clicking a row outside the current selection
+  selects it; right-clicking inside a multi-row selection keeps the whole
+  selection. ASN results copy as tab-separated rows (paste-ready for a
+  spreadsheet); proxy tables copy full `host:port:user:pass`.

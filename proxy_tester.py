@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.85"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.86"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -249,6 +249,56 @@ def status_tag(status):
             or "forbidden" in s or "restricted" in s):
         return "warn"
     return "bad"
+
+
+def attach_copy_menu(widget, copy_fn, label="Copy selected", extra=None):
+    """Right-click 'Copy' menu for a results table or list.
+
+    Ctrl+C on its own isn't enough: a Mac keyboard driving a Windows box over
+    RDP sends Cmd, which Windows never sees as Control, so the keystroke
+    silently does nothing and copying looks broken. A menu always works.
+    `extra` is an optional list of (label, callback) appended to the menu.
+    """
+    menu = tk.Menu(widget, tearoff=0)
+    menu.add_command(label=label, command=copy_fn)
+    menu.add_separator()
+
+    def _select_all():
+        if isinstance(widget, ttk.Treeview):
+            widget.selection_set(widget.get_children())
+        else:
+            widget.selection_set(0, "end")
+        widget.focus_set()
+
+    menu.add_command(label="Select all", command=_select_all)
+    for lbl, fn in (extra or []):
+        menu.add_command(label=lbl, command=fn)
+
+    def popup(event):
+        try:
+            # Right-clicking OUTSIDE the current selection moves the selection
+            # to that row; inside it, the whole multi-row selection is kept.
+            if isinstance(widget, ttk.Treeview):
+                row = widget.identify_row(event.y)
+                if row and row not in widget.selection():
+                    widget.selection_set(row)
+            else:
+                idx = widget.nearest(event.y)
+                if idx >= 0 and idx not in widget.curselection():
+                    widget.selection_clear(0, "end")
+                    widget.selection_set(idx)
+            widget.focus_set()
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    # Button-3 is right-click on Windows/X11; Button-2 covers remote sessions
+    # that remap the trackpad's secondary click. Control-Button-1 is
+    # deliberately NOT bound - that's how ctrl+click extends a selection.
+    for seq in ("<Button-3>", "<Button-2>"):
+        widget.bind(seq, popup)
+    return menu
 
 
 def tag_tree(tree):
@@ -1992,6 +2042,17 @@ def test_asn(host, port, username, password, asn, url, runs, timeout,
                 org = found_org
         else:
             labels.append(response_label(r))
+        # Any test URL other than ipinfo returns no 'org' field, which used to
+        # leave 'Landed on (org)' empty. Resolve it with ONE extra call through
+        # the SAME sticky session, and only until this ASN has an answer - so it
+        # costs at most one extra request per ASN, and none at all on the
+        # default URL. A 4xx from the target still means the exit connected.
+        code = r.get("code")
+        reached = r["ok"] or (code and 400 <= code < 500 and code != 407)
+        if not org and reached and "ipinfo.io" not in (url or "").lower():
+            probe = do_request(proxy_url, IPINFO_URL, timeout)
+            if probe["ok"]:
+                org = _parse_json_field(probe["body"], "org") or org
 
     interrupted = stop_event is not None and stop_event.is_set()
     if successes > 0:
@@ -2316,6 +2377,8 @@ class AsnTab(ttk.Frame):
 
         self.asn_list.bind("<Control-c>", self._copy_selected_asns)
         self.asn_list.bind("<Control-C>", self._copy_selected_asns)
+        attach_copy_menu(self.asn_list, self._copy_selected_asns,
+                         "Copy selected ASNs")
 
         lb_btns = ttk.Frame(asn_frame)
         lb_btns.pack(fill="x", pady=(4, 0))
@@ -2380,6 +2443,11 @@ class AsnTab(ttk.Frame):
             self.tree.column(col, width=w, minwidth=mw, stretch=st, anchor=anc)
         tag_tree(self.tree)
         enable_drag_select(self.tree)
+        self.tree.bind("<Control-c>", self._copy_rows)
+        self.tree.bind("<Control-C>", self._copy_rows)
+        self.tree.bind("<Control-a>", lambda e: (self.tree.selection_set(
+            self.tree.get_children()), "break")[1])
+        attach_copy_menu(self.tree, self._copy_rows, "Copy selected rows")
         self.tree.pack(fill="both", expand=True, pady=(8, 0))
 
         vsb = ttk.Scrollbar(self.tree, orient="vertical",
@@ -2430,6 +2498,18 @@ class AsnTab(ttk.Frame):
             if name == choice:
                 self.url.set(f"https://{host}/")
                 return
+
+    def _copy_rows(self, _event=None):
+        """Copy the selected result rows as tab-separated text (paste-ready for
+        a spreadsheet)."""
+        rows = ["\t".join(str(v) for v in self.tree.item(i, "values"))
+                for i in self.tree.selection()]
+        if rows:
+            self.clipboard_clear()
+            self.clipboard_append("\n".join(rows))
+            self.update_idletasks()
+            self.status_lbl.config(text=f"Copied {len(rows)} row(s)")
+        return "break"
 
     def _copy_selected_asns(self, _event=None):
         """Copy just the ASN numbers (not the labels), one per line."""
@@ -2884,6 +2964,8 @@ class ProxyTab(ttk.Frame):
         self.tree.bind("<Control-C>", self._copy_selected)
         self.tree.bind("<Control-a>", self._select_all_rows)
         self.tree.bind("<Control-A>", self._select_all_rows)
+        attach_copy_menu(self.tree, self._copy_selected,
+                         "Copy selected proxies")
 
         vsb = ttk.Scrollbar(self.tree, orient="vertical",
                             command=self.tree.yview)
@@ -4160,6 +4242,8 @@ class QualityTab(ttk.Frame):
         self.tree.bind("<Control-C>", lambda e: (self.on_copy_selected(), "break"))
         self.tree.bind("<Control-a>", lambda e: (self._select_all_rows(), "break"))
         self.tree.bind("<Control-A>", lambda e: (self._select_all_rows(), "break"))
+        attach_copy_menu(self.tree, self.on_copy_selected,
+                         "Copy selected proxies")
         self.tree.pack(fill="both", expand=True, pady=(8, 0))
         vsb = ttk.Scrollbar(self.tree, orient="vertical",
                             command=self.tree.yview)
