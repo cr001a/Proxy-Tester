@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.88"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.89"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -4376,7 +4376,11 @@ class QualityTab(ttk.Frame):
         status = (f"slow {ms:.0f}ms > {gate_ms}ms" if ms is not None else "slow")
         return {"proxy": d["proxy"], "full": d.get("full", d["proxy"]),
                 "exit_ip": d.get("exit_ip", ""), "fraud": "", "type": "",
-                "flags": "", "blacklist": "-", "ping": ms, "trust": None,
+                # Say WHY the score columns are empty - a blank row otherwise
+                # looks like a proxy that scored nothing, not one never asked
+                # about.
+                "flags": "not scored (speed gate)",
+                "blacklist": "-", "ping": ms, "trust": None,
                 "status": status}
 
     def _run_pool(self, proxies, provider, api_key, gate_ms=None):
@@ -4621,7 +4625,14 @@ class QualityTab(ttk.Frame):
         ttk.Button(bar, text="Close", command=top.destroy).pack(side="right")
 
     def _trust_tag(self, r):
-        if r.get("status") != "OK" or r.get("trust") is None:
+        # No Trust does NOT mean bad. A proxy that resolved fine but fell
+        # outside the speed gate was never sent to the reputation API at all -
+        # colouring it red reads as "dirty IP" when it actually means "not
+        # measured". Those are greyed; only a proxy that failed to resolve
+        # (no exit IP) is red.
+        if r.get("trust") is None:
+            return "bad" if not r.get("exit_ip") else "muted"
+        if r.get("status") != "OK":
             return "bad"
         t = r["trust"]
         # Any Spamhaus listing (XBL/SBL/PBL) is never shown green - a flagged IP
