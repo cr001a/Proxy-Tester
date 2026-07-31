@@ -145,6 +145,32 @@ fine for local use, but don't sync that file anywhere public.
 
 ---
 
+## macOS: a Dock icon
+
+There's no prebuilt Mac app (CI only builds Windows), but `make_mac_app.sh`
+wraps the source in a real `.app` bundle so it gets the logo as its icon and can
+be pinned to the Dock:
+
+```
+./make_mac_app.sh
+```
+
+It uses only tools that ship with macOS (`sips`, `iconutil`), builds
+`ProxyTester.app` next to the source, and needs no `pip install`. Drag the
+result to the Dock (or to **Applications**) and launch it like any other app.
+
+The bundle **doesn't copy the code** — it launches `proxy_tester.py` from this
+folder, so `git pull` updates the app with no rebuild. Re-run the script only if
+the logo changes or you want the bundle's version string refreshed. Keep the
+`.app` inside this folder if you can: it looks for the source next to itself
+first, and falls back to the path it was built at, so an `.app` moved to
+`/Applications` keeps working as long as the source folder stays put.
+
+If `python3` or `tkinter` is missing, the launcher says so in a dialog instead of
+failing silently.
+
+---
+
 ## Running from source
 
 Requires Python 3.8+ (tkinter ships with the standard Windows/macOS installers;

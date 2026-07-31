@@ -1,3 +1,7 @@
+# macOS app bundle (build it with ./make_mac_app.sh)
+ProxyTester.app/
+*.icns
+
 # PyInstaller build output
 build/
 dist/
