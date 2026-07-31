@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.89"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.90"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -5227,24 +5227,105 @@ def check_for_updates(parent, silent=False):
                                 f"You're on the latest version (v{APP_VERSION}).")
         return
     # The installer swaps a packaged Windows build. Running from source - which
-    # is how this runs on macOS/Linux - there is no .exe to swap, so report the
-    # new version and say how to actually get it instead of downloading a
-    # Windows zip that can't be applied.
+    # is how this runs on macOS/Linux - there is no .exe to swap, so hand over
+    # the exact command instead of downloading a Windows zip that can't be
+    # applied.
     if not (sys.platform.startswith("win") and getattr(sys, "frozen", False)):
         if not silent:
-            messagebox.showinfo(
-                "Update available",
-                f"{tag} is available - you have v{APP_VERSION}.\n\n"
-                "This copy runs from source, so update it with:\n\n"
-                "    git pull\n\n"
-                "then restart. (The in-app installer only swaps the packaged "
-                "Windows build.)")
+            show_source_update_dialog(parent, tag)
         return
     if messagebox.askyesno(
             "Update available",
             f"{tag} is available - you have v{APP_VERSION}.\n\n"
             "Download and install now?"):
         _download_and_apply(parent, dl, tag)
+
+
+def open_terminal_at(folder):
+    """Open a terminal already sitting in `folder`. Returns True on success."""
+    try:
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", "-a", "Terminal", folder])
+            return True
+        if sys.platform.startswith("win"):
+            subprocess.Popen(f'start "" cmd /k cd /d "{folder}"', shell=True)
+            return True
+        for term in ("x-terminal-emulator", "gnome-terminal", "konsole",
+                     "xfce4-terminal", "xterm"):
+            try:
+                subprocess.Popen([term], cwd=folder)
+                return True
+            except (FileNotFoundError, OSError):
+                continue
+    except Exception:
+        pass
+    return False
+
+
+def show_source_update_dialog(parent, tag):
+    """Update notice for a run-from-source copy. A plain messagebox can't be
+    selected or copied, so the exact shell command goes in a real text box -
+    pre-selected, with a Copy button - and is built from THIS install's actual
+    path so it can be pasted from any directory."""
+    folder = _install_dir()
+    is_git = os.path.isdir(os.path.join(folder, ".git"))
+    cmd = f'cd "{folder}" && git pull' if is_git else folder
+
+    top = tk.Toplevel(parent)
+    top.title("Update available")
+    top.configure(bg=BASE)
+    top.transient(parent.winfo_toplevel())
+    frm = ttk.Frame(top, padding=(16, 14))
+    frm.pack(fill="both", expand=True)
+
+    ttk.Label(frm, text=f"{tag} is available - you have v{APP_VERSION}.",
+              style="Header.TLabel").pack(anchor="w")
+    note = ttk.Label(
+        frm,
+        text=("This copy runs from source. Paste this into Terminal, then "
+              "restart the app:") if is_git else
+             ("This copy runs from source but isn't a git checkout, so "
+              "download the latest ZIP from the repo and replace this folder. "
+              "Your settings live elsewhere and won't be lost. The folder is:"),
+        style="Muted.TLabel", justify="left", wraplength=470)
+    note.pack(anchor="w", pady=(6, 8))
+
+    box = tk.Text(frm, height=2, wrap="word")
+    style_text(box)
+    box.pack(fill="x")
+    box.insert("1.0", cmd)
+    box.tag_add("sel", "1.0", "end-1c")   # arrives pre-selected
+    box.focus_set()
+
+    status = ttk.Label(frm, text="", style="Muted.TLabel")
+
+    def copy_cmd():
+        top.clipboard_clear()
+        top.clipboard_append(cmd)
+        top.update_idletasks()
+        status.config(text="Copied to clipboard")
+
+    def open_term():
+        # Copy first, so the Terminal window that appears only needs a paste.
+        copy_cmd()
+        if open_terminal_at(folder):
+            status.config(text="Copied - paste it into the Terminal window "
+                               "(Cmd+V, Enter)")
+        else:
+            status.config(text="Couldn't open a terminal - paste the command "
+                               "into one yourself")
+
+    bar = ttk.Frame(frm)
+    bar.pack(fill="x", pady=(10, 0))
+    ttk.Button(bar, text="Copy command" if is_git else "Copy folder path",
+               style="Accent.TButton", command=copy_cmd).pack(side="left")
+    ttk.Button(bar, text="Open Terminal",
+               command=open_term).pack(side="left", padx=8)
+    ttk.Button(bar, text="Close", command=top.destroy).pack(side="right")
+    status.pack(anchor="w", pady=(6, 0))
+
+    center_over_parent(top, parent, 520)
+    top.grab_set()
 
 
 def _app_root_in(base):
