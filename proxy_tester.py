@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.91"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.92"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1096,6 +1096,7 @@ PROVIDER_HOSTS = (
     ("nodemaven", "NodeMaven"),
     ("liveproxies", "Live Proxies"),
     ("live-proxies", "Live Proxies"),
+    ("fresi.hellworld", "F-Private"),      # more specific first
     ("hellworld", "Hell World"),
 )
 
@@ -1612,6 +1613,17 @@ def _build_packetstream_resi(user, pw, state, city, lifetime, sessid, asn=None):
     return f"proxy.packetstream.io:31112:{user}:{p}"
 
 
+def _build_hellworld_resi(user, pw, state, city, lifetime, sessid, asn=None):
+    # fresi.hellworld.io (Hell World's own "F-Private" pool): params live in the
+    # USERNAME. Sticky adds -session-<tok>-time-<SECONDS> - note the unit: the
+    # dashboard's "Session Duration (min)" of 10 emits time-600, so the
+    # generator's minutes are converted here. Rotating is plain -country-us.
+    u = f"{user}-country-us"
+    if sessid:
+        u += f"-session-{sessid}-time-{int(lifetime or 10) * 60}"
+    return f"fresi.hellworld.io:10000:{u}:{pw}"
+
+
 def _build_rayobyte_resi(user, pw, state, city, lifetime, sessid, asn=None):
     # la.residential.rayobyte.com: params live in the PASSWORD. Rayobyte has no
     # rotating mode - it's ALWAYS a hardsession (sticky), so a token is always
@@ -1683,6 +1695,15 @@ RESI_PROVIDERS = {
         # offers no token to lower it - so, like Bright Data, no lifetime box.
         "max_min": None, "sessid": lambda: _resi_sessid(8),
         "life_note": "sticky lifetime fixed at PacketStream's max (~60m)",
+    },
+    # Hell World's own pool. Named for the product, not the vendor - that's what
+    # it's called everywhere in their dashboard.
+    "F-Private": {
+        "key": "hellworld",
+        "legacy": None,
+        "build": _build_hellworld_resi,
+        "max_min": 120, "min_max": 120, "hr_max": 2,
+        "life_rule": "1-120m or 1-2h", "sessid": lambda: _sessid_lower(8),
     },
 }
 
@@ -4957,6 +4978,7 @@ class SettingsTab(ttk.Frame):
         self.rayobyte = tk.StringVar(value=provider_creds_display("rayobyte"))
         self.packetstream = tk.StringVar(
             value=provider_creds_display("packetstream"))
+        self.hellworld = tk.StringVar(value=provider_creds_display("hellworld"))
 
         # Per-provider show/hide for the batch generator. Unchecking hides the
         # provider from Generate batch WITHOUT touching its saved credentials,
@@ -5011,6 +5033,8 @@ class SettingsTab(ttk.Frame):
         cred_row("Rayobyte (username:password)", self.rayobyte, "rayobyte")
         cred_row("PacketStream (username:password)", self.packetstream,
                  "packetstream")
+        cred_row("Hell World F-Private (username:password)", self.hellworld,
+                 "hellworld")
 
         ttk.Separator(host, orient="horizontal").grid(
             row=r, column=0, columnspan=2, sticky="ew", pady=14)
@@ -5050,8 +5074,8 @@ class SettingsTab(ttk.Frame):
         # click on 'Save settings' can never silently drop a key again.
         for _v in (self.ipqs, self.pcheck, self.ipinfo, self.oxy_mobile,
                    self.oxy_resi, self.ipr, self.brightdata, self.proxyhaus,
-                   self.rayobyte, self.packetstream, self.workers,
-                   self.score_workers):
+                   self.rayobyte, self.packetstream, self.hellworld,
+                   self.workers, self.score_workers):
             _v.trace_add("write", self._schedule_autosave)
 
         # Settings auto-save (debounced on every edit), so there's no Save
@@ -5083,6 +5107,7 @@ class SettingsTab(ttk.Frame):
         save_setting("proxyhaus", self.proxyhaus.get().strip())
         save_setting("rayobyte", self.rayobyte.get().strip())
         save_setting("packetstream", self.packetstream.get().strip())
+        save_setting("hellworld", self.hellworld.get().strip())
         try:
             w = max(1, min(MAX_WORKERS_CAP, int(self.workers.get().strip())))
         except (TypeError, ValueError):
