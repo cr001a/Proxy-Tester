@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.86"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.87"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1257,8 +1257,23 @@ def build_quality_row(disc, q, has_key):
 # Profile persistence (JSON in the user's config dir)
 # --------------------------------------------------------------------------- #
 def _config_dir():
-    base = os.environ.get("APPDATA") or os.path.expanduser("~")
-    return os.path.join(base, "ProxyTester")
+    """Per-user config folder, in each platform's normal place."""
+    home = os.path.expanduser("~")
+    if sys.platform.startswith("win"):
+        return os.path.join(os.environ.get("APPDATA") or home, "ProxyTester")
+    if sys.platform == "darwin":
+        path = os.path.join(home, "Library", "Application Support",
+                            "ProxyTester")
+    else:
+        path = os.path.join(
+            os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config"),
+            "ProxyTester")
+    # Older builds put this straight in the home folder; keep using that if it's
+    # already there so an existing install doesn't lose its saved settings.
+    legacy = os.path.join(home, "ProxyTester")
+    if os.path.isdir(legacy) and not os.path.isdir(path):
+        return legacy
+    return path
 
 
 def _install_dir():
@@ -5168,6 +5183,20 @@ def check_for_updates(parent, silent=False):
         if not silent:
             messagebox.showinfo("Check for updates",
                                 f"You're on the latest version (v{APP_VERSION}).")
+        return
+    # The installer swaps a packaged Windows build. Running from source - which
+    # is how this runs on macOS/Linux - there is no .exe to swap, so report the
+    # new version and say how to actually get it instead of downloading a
+    # Windows zip that can't be applied.
+    if not (sys.platform.startswith("win") and getattr(sys, "frozen", False)):
+        if not silent:
+            messagebox.showinfo(
+                "Update available",
+                f"{tag} is available - you have v{APP_VERSION}.\n\n"
+                "This copy runs from source, so update it with:\n\n"
+                "    git pull\n\n"
+                "then restart. (The in-app installer only swaps the packaged "
+                "Windows build.)")
         return
     if messagebox.askyesno(
             "Update available",
