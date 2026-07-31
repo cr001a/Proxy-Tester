@@ -96,8 +96,11 @@ under **Strict only**. No API key needed; pinned ASNs persist in
 **Generate batch** (Proxy Tester / IP Quality tabs) builds sticky or rotating
 residential proxies for **one or more providers at once** —
 **Oxylabs Residential**, **IPRoyal**, **Bright Data**, **Proxy-Haus**,
-**Rayobyte**, and **PacketStream**. **Nothing is pre-selected** — you opt in to
-each provider per batch. Providers are laid out in **columns of five**, so
+**Rayobyte**, and **PacketStream**. The dialog **remembers everything between
+opens** — checked providers, each one's sticky lifetime, count, region type and
+regions, Proxy-Haus ASNs, Fresh, Rotating, Append, plus the window's size and
+position — saved whether you hit Generate, Cancel, or close it. On a first-ever
+run nothing is pre-selected; you opt in to each provider once. Providers are laid out in **columns of five**, so
 adding one widens the dialog instead of lengthening it. Each checked provider
 gets **its own sticky-lifetime box** (with its max shown), and a **Set all to
 max** button fills them all to their caps at once. The **sticky-lifetime cap is

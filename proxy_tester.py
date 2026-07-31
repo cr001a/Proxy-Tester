@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.87"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.88"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -3793,20 +3793,46 @@ def open_generate_dialog(parent, text_widget):
     GEOM_KEY = "generate_batch"
 
     def _close():
+        """Remember the window AND every selection, so reopening the dialog
+        looks exactly like it did when you left it."""
         persist_geometry(top, GEOM_KEY)
+        try:
+            save_setting("generate_batch_state", {
+                "providers": [n for n, v in provider_vars.items() if v.get()],
+                "lifetimes": {n: v.get() for n, v in life_vars.items()},
+                "count": count.get(),
+                "rotating": bool(rotating.get()),
+                "append": bool(append.get()),
+                "asns": [a for a, v in asn_vars.items() if v.get()],
+                "fresh": bool(fresh.get()),
+                "region_type": region_type.get(),
+                "regions": [c for c, v in region_vars.items() if v.get()],
+            })
+        except Exception:
+            pass          # never block closing the dialog over a saved setting
         top.destroy()
 
-    # Nothing is pre-selected - you opt in to each provider per batch.
-    provider_vars = {name: tk.BooleanVar(value=False)
+    # Every control is restored exactly as it was left last time (saved on
+    # Generate, Cancel or close). First ever run starts with nothing selected.
+    saved = load_setting("generate_batch_state", {})
+    if not isinstance(saved, dict):
+        saved = {}
+    saved_provs = set(saved.get("providers") or [])
+    saved_life = saved.get("lifetimes") or {}
+    saved_asns = set(saved.get("asns") or [])
+    provider_vars = {name: tk.BooleanVar(value=name in saved_provs)
                      for name in configured}
     life_vars = {}            # provider -> StringVar (only providers with a cap)
-    region_type = tk.StringVar(value="Country")
-    count = tk.StringVar(value="500")
-    rotating = tk.BooleanVar(value=False)
-    append = tk.BooleanVar(value=False)
+    rtype0 = saved.get("region_type")
+    region_type = tk.StringVar(
+        value=rtype0 if rtype0 in ("Country", "State", "City") else "Country")
+    count = tk.StringVar(value=str(saved.get("count") or "500"))
+    rotating = tk.BooleanVar(value=bool(saved.get("rotating")))
+    append = tk.BooleanVar(value=bool(saved.get("append")))
     region_vars = {}          # canonical -> BooleanVar (rebuilt per region type)
-    asn_vars = {a: tk.BooleanVar(value=False) for a, _, _ in PROXYHAUS_ASNS}
-    fresh = tk.BooleanVar(value=False)     # Proxy-Haus "Fresh" pool toggle
+    asn_vars = {a: tk.BooleanVar(value=a in saved_asns)
+                for a, _, _ in PROXYHAUS_ASNS}
+    fresh = tk.BooleanVar(value=bool(saved.get("fresh")))
 
     frm = ttk.Frame(top, padding=(16, 14))
     frm.pack(fill="both", expand=True)
@@ -3842,7 +3868,7 @@ def open_generate_dialog(parent, text_widget):
         prov_life_frames[name] = lf
         mx = spec.get("max_min")
         if mx:
-            lv = tk.StringVar(value="30m")
+            lv = tk.StringVar(value=str(saved_life.get(name) or "30m"))
             life_vars[name] = lv
             ttk.Label(lf, text="sticky").pack(side="left")
             ttk.Entry(lf, textvariable=lv, width=8).pack(side="left", padx=(4, 4))
@@ -3933,6 +3959,11 @@ def open_generate_dialog(parent, text_widget):
 
     region_type.trace_add("write", rebuild_regions)
     rebuild_regions()
+    # rebuild_regions() has just created the vars for the restored region type,
+    # so the saved ticks can be re-applied now.
+    for _canon in (saved.get("regions") or []):
+        if _canon in region_vars:
+            region_vars[_canon].set(True)
 
     cnt = ttk.Frame(frm)
     cnt.grid(row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
