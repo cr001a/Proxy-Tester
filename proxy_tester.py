@@ -42,6 +42,11 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote, unquote, urlsplit
 
+# macOS system Tk (8.5) prints a deprecation warning on import when running from
+# source. It's harmless and only noise in the Terminal - silence it. Must be set
+# before tkinter loads. No effect on Windows or the packaged build.
+os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
+
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -55,7 +60,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.96"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.97"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
