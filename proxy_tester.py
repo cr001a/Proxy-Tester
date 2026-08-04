@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.93"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.94"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -3506,6 +3506,38 @@ def center_over_parent(top, parent, w=None, h=None):
     top.geometry(f"{w}x{h}+{x}+{y}")
 
 
+def make_modal(top):
+    """Grab input for a modal dialog, but drop the grab while the window is
+    minimized and re-take it when restored.
+
+    A plain grab_set() left on an iconified (minimized) toplevel captures ALL of
+    the app's input for a window that can't be clicked, which freezes the whole
+    app - reported after minimizing the main window while a dialog was open. The
+    Map/Unmap handlers keep the grab tied to an actually-visible window.
+    """
+    def _regrab():
+        try:
+            if top.winfo_exists() and top.winfo_viewable():
+                top.grab_set()
+        except Exception:
+            pass
+
+    def _on_map(e):
+        if e.widget is top:
+            top.after(60, _regrab)      # after the WM finishes restoring
+
+    def _on_unmap(e):
+        if e.widget is top:
+            try:
+                top.grab_release()
+            except Exception:
+                pass
+
+    top.bind("<Map>", _on_map, add="+")
+    top.bind("<Unmap>", _on_unmap, add="+")
+    _regrab()
+
+
 def fit_to_content(top):
     """Grow a dialog so its content - including rows revealed AFTER it opened
     (e.g. the Proxy-Haus block) - actually fits. Never shrinks, so a size the
@@ -3625,7 +3657,7 @@ def ask_generate_options(parent, asn_count):
     ttk.Button(btns, text="Cancel", command=top.destroy).pack(side="left", padx=8)
 
     center_over_parent(top, parent)
-    top.grab_set()
+    make_modal(top)
     top.wait_window()
     if result:
         return result["mode"], result["count"], result["sesstime"]
@@ -4148,7 +4180,7 @@ def open_generate_dialog(parent, text_widget):
     restore_geometry(top, parent, GEOM_KEY)
     fit_to_content(top)
     top.protocol("WM_DELETE_WINDOW", _close)
-    top.grab_set()
+    make_modal(top)
 
 
 # Trust-range buckets for the Trust header filter (label, predicate on trust).
@@ -5374,7 +5406,7 @@ def show_source_update_dialog(parent, tag):
     status.pack(anchor="w", pady=(6, 0))
 
     center_over_parent(top, parent, 520)
-    top.grab_set()
+    make_modal(top)
 
 
 def _app_root_in(base):
