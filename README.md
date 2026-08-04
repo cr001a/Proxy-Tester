@@ -284,6 +284,11 @@ Exit IP`. The exit IP is parsed from the `ip` field if the response is JSON.
 This tab is a **plain connectivity/latency tester** — it reports reachability,
 speed, and HTTP status only. No site-specific bot-protection scoring.
 
+**Dedupe** removes duplicate lines from the paste box, keeping the first of each
+and the original order. It matches on the full `host:port:user:pass` (password
+included), so proxies that differ only by a session token count as distinct
+sessions and are kept; unparseable lines are never dropped.
+
 **Site ping.** The Proxy Tester tab also has a **Site ping** control that
 measures latency to a site's edge — pick a preset retailer (Walmart, Target,
 Best Buy, Nike, Foot Locker, Adidas, Amazon, GameStop, Pokémon Center, Costco,

@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.94"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.95"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -2953,6 +2953,9 @@ class ProxyTab(ttk.Frame):
         self.shuffle_btn = ttk.Button(btns, text="Shuffle list",
                                       command=self.on_shuffle)
         self.shuffle_btn.pack(side="left", padx=8)
+        self.dedupe_btn = ttk.Button(btns, text="Dedupe",
+                                     command=self.on_dedupe)
+        self.dedupe_btn.pack(side="left", padx=(0, 8))
         self.cull_btn = ttk.Button(btns, text="Cull dead",
                                    command=self.on_cull_dead)
         self.cull_btn.pack(side="left", padx=(0, 8))
@@ -3475,6 +3478,34 @@ class ProxyTab(ttk.Frame):
         self.status_lbl.config(
             text=f"Speed filter <={thr}ms: kept {len(kept)}, {excluded} slower "
                  "excluded")
+
+    def on_dedupe(self):
+        """Drop duplicate proxy lines, keeping the first occurrence and the
+        original order. Matches on the full host:port:user:pass (password
+        included), so proxies that differ only by a session token are kept -
+        they're distinct sessions, not duplicates. Unparseable lines are kept
+        as-is."""
+        seen, kept, removed = set(), [], 0
+        for ln in self.proxy_text.get("1.0", "end").splitlines():
+            if not ln.strip():
+                continue
+            key = self._full_key(ln)
+            if key is None:            # can't parse it - never silently drop it
+                kept.append(ln)
+                continue
+            if key in seen:
+                removed += 1
+                continue
+            seen.add(key)
+            kept.append(ln)
+        if not removed:
+            self.status_lbl.config(text="No duplicates found")
+            return
+        self.proxy_text.delete("1.0", "end")
+        self.proxy_text.insert("1.0", "\n".join(kept) + "\n")
+        self.proxy_text.mark_set("insert", "end-1c")
+        self.status_lbl.config(
+            text=f"Removed {removed} duplicate(s) - {len(kept)} left")
 
     def on_shuffle(self):
         """Randomly reorder the pasted proxy lines in place."""
