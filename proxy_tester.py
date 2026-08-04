@@ -60,7 +60,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.97"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.98"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -5763,6 +5763,13 @@ def main():
 
     # Keep a reference so the listening socket lives as long as the window.
     root._instance_server = _listen_for_second_instance(root)
+
+    # macOS system Tk 8.5 sometimes opens a blank/white window until something
+    # forces a repaint - nudge it. Harmless elsewhere; the real fix for old Tk
+    # is python.org Python (Tk 8.6).
+    root.update_idletasks()
+    root.lift()
+    root.after(60, lambda: (root.deiconify(), root.update()))
 
     root.mainloop()
 
