@@ -96,7 +96,8 @@ under **Strict only**. No API key needed; pinned ASNs persist in
 **Generate batch** (Proxy Tester / IP Quality tabs) builds sticky or rotating
 residential proxies for **one or more providers at once** —
 **Oxylabs Residential**, **IPRoyal**, **Bright Data**, **Proxy-Haus**,
-**Rayobyte**, **PacketStream**, and **F-Private** (Hell World's own pool). The dialog **remembers everything between
+**Rayobyte**, **PacketStream**, **F-Private** (Hell World's own pool), and
+**ThuProxy** (a NetNut reseller). The dialog **remembers everything between
 opens** — checked providers, each one's sticky lifetime, count, region type and
 regions, Proxy-Haus ASNs, Fresh, Rotating, Append, plus the window's size and
 position — saved whether you hit Generate, Cancel, or close it. On a first-ever
@@ -108,7 +109,9 @@ hardcoded and enforced** — Oxylabs 1440 min (24 h), IPRoyal 59 min / 168 h,
 Proxy-Haus 120 min, Rayobyte 60 min (always sticky — no rotating mode), Bright
 Data inherent (~30 min, no token), PacketStream fixed at its own ~60 min max
 (no token exists to lower it, so it gets no lifetime box), F-Private 120 min
-(its token is in *seconds*, so minutes are converted for you). If any provider's
+(its token is in *seconds*, so minutes are converted for you). ThuProxy has no
+duration token at all — its `sid` **is** the session and holds until you change
+it — so it gets no lifetime box either. If any provider's
 lifetime exceeds its cap it warns and generates nothing. Set **count per provider** and **location** once for the
 whole batch. Proxy-Haus adds a **click-to-pick ASN menu** (choose any number of
 carriers): it always emits **at least one proxy per selected ASN**, and when the
@@ -133,7 +136,7 @@ Provider logins live on the **Settings** tab, one box per provider as
 - **Oxylabs Mobile** and **Proxy-Haus** — auto-fill the ASN Tester's
   Username/Password when their provider is selected.
 - **Oxylabs Residential**, **IPRoyal**, **Bright Data**, **Proxy-Haus**,
-  **Rayobyte**, **PacketStream**, **Hell World F-Private** — feed the
+  **Rayobyte**, **PacketStream**, **Hell World F-Private**, **ThuProxy** — feed the
   **Generate batch** dialog; a
   provider only appears there once its box is filled in.
 

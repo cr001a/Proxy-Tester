@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.92"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.93"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1096,6 +1096,7 @@ PROVIDER_HOSTS = (
     ("nodemaven", "NodeMaven"),
     ("liveproxies", "Live Proxies"),
     ("live-proxies", "Live Proxies"),
+    ("ntnt.vip", "ThuProxy (NetNut)"),
     ("fresi.hellworld", "F-Private"),      # more specific first
     ("hellworld", "Hell World"),
 )
@@ -1624,6 +1625,17 @@ def _build_hellworld_resi(user, pw, state, city, lifetime, sessid, asn=None):
     return f"fresi.hellworld.io:10000:{u}:{pw}"
 
 
+def _build_thuproxy_resi(user, pw, state, city, lifetime, sessid, asn=None):
+    # gw.ntnt.vip (ThuProxy, reselling NetNut): params live in the USERNAME.
+    # Country is -cc-US (uppercase); sticky is -sid-<6 digits>. There is NO
+    # duration token - a session holds for as long as you keep reusing the same
+    # sid - so `lifetime` is deliberately ignored here.
+    u = f"{user}-cc-US"
+    if sessid:
+        u += f"-sid-{sessid}"
+    return f"gw.ntnt.vip:5959:{u}:{pw}"
+
+
 def _build_rayobyte_resi(user, pw, state, city, lifetime, sessid, asn=None):
     # la.residential.rayobyte.com: params live in the PASSWORD. Rayobyte has no
     # rotating mode - it's ALWAYS a hardsession (sticky), so a token is always
@@ -1704,6 +1716,15 @@ RESI_PROVIDERS = {
         "build": _build_hellworld_resi,
         "max_min": 120, "min_max": 120, "hr_max": 2,
         "life_rule": "1-120m or 1-2h", "sessid": lambda: _sessid_lower(8),
+    },
+    "ThuProxy (NetNut)": {
+        "key": "thuproxy",
+        "legacy": None,
+        "build": _build_thuproxy_resi,
+        # No duration token exists - the sid IS the session, and it holds until
+        # you use a different one. So, like Bright Data, no lifetime box.
+        "max_min": None, "sessid": lambda: _sessid_num(6),
+        "life_note": "no time token; the sid holds until you change it",
     },
 }
 
@@ -4979,6 +5000,7 @@ class SettingsTab(ttk.Frame):
         self.packetstream = tk.StringVar(
             value=provider_creds_display("packetstream"))
         self.hellworld = tk.StringVar(value=provider_creds_display("hellworld"))
+        self.thuproxy = tk.StringVar(value=provider_creds_display("thuproxy"))
 
         # Per-provider show/hide for the batch generator. Unchecking hides the
         # provider from Generate batch WITHOUT touching its saved credentials,
@@ -5035,6 +5057,7 @@ class SettingsTab(ttk.Frame):
                  "packetstream")
         cred_row("Hell World F-Private (username:password)", self.hellworld,
                  "hellworld")
+        cred_row("ThuProxy (username:password)", self.thuproxy, "thuproxy")
 
         ttk.Separator(host, orient="horizontal").grid(
             row=r, column=0, columnspan=2, sticky="ew", pady=14)
@@ -5075,7 +5098,7 @@ class SettingsTab(ttk.Frame):
         for _v in (self.ipqs, self.pcheck, self.ipinfo, self.oxy_mobile,
                    self.oxy_resi, self.ipr, self.brightdata, self.proxyhaus,
                    self.rayobyte, self.packetstream, self.hellworld,
-                   self.workers, self.score_workers):
+                   self.thuproxy, self.workers, self.score_workers):
             _v.trace_add("write", self._schedule_autosave)
 
         # Settings auto-save (debounced on every edit), so there's no Save
@@ -5108,6 +5131,7 @@ class SettingsTab(ttk.Frame):
         save_setting("rayobyte", self.rayobyte.get().strip())
         save_setting("packetstream", self.packetstream.get().strip())
         save_setting("hellworld", self.hellworld.get().strip())
+        save_setting("thuproxy", self.thuproxy.get().strip())
         try:
             w = max(1, min(MAX_WORKERS_CAP, int(self.workers.get().strip())))
         except (TypeError, ValueError):
