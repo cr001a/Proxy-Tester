@@ -34,7 +34,12 @@ Four tabs:
    **SBL** (spam source, penalized), and **PBL** (dynamic/residential policy
    range, which describes almost every consumer IP and is only lightly
    penalized) — and any listing keeps a row out of the green Trust band. Unique
-   exit IPs are **deduped** so you only spend one lookup per IP. An optional
+   exit IPs are **deduped** so you only spend one lookup per IP. For the
+   **IPinfo** provider, lookups use its **batch endpoint** (up to 1000 IPs per
+   POST), so a 10k+ run finishes in a handful of requests instead of one
+   connection per IP — the fix for the socket-exhaustion failures single-lookup
+   mode hit at scale. Any IP a batch doesn't answer falls back to a single
+   lookup, and the whole thing is a Settings toggle (on by default). An optional
    **Speed gate** runs a **two-stage funnel**: exit-IP resolution already times
    each proxy against the *neutral* `ipinfo.io/json` endpoint (**no retailer is
    ever contacted during scanning**), and the *paid* reputation lookup runs

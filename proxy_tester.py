@@ -55,7 +55,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.95"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.96"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -840,29 +840,39 @@ def proxycheck_lookup(ip, api_key, timeout=DEFAULT_TIMEOUT):
     }
 
 
-def ipinfo_lookup(ip, token, timeout=DEFAULT_TIMEOUT):
-    """Query IPinfo's api.ipinfo.io/lookup endpoint (Bearer auth) - a neutral
-    IP-data vendor. The `anonymous` object carries is_proxy/is_vpn/is_tor/
-    is_relay/is_res_proxy; `as` carries ASN type (hosting/isp/business); geo,
-    mobile, and top-level is_hosting/is_mobile round it out. We synthesize a
-    0-100 fraud score from those flags."""
-    data, err = http_get_json_ex(
-        "https://api.ipinfo.io/lookup/" + quote(ip, safe=""),
-        timeout, extra_headers={"Authorization": "Bearer " + token})
-    if err or not isinstance(data, dict):
-        return {"_error": f"IPinfo: {err or 'no data'}"}
-    anon_o = data.get("anonymous") if isinstance(data.get("anonymous"),
-                                                 dict) else {}
-    as_o = data.get("as") if isinstance(data.get("as"), dict) else {}
+def _ipinfo_parse(data):
+    """Turn one IPinfo record into our score dict. Tolerant of BOTH schemas:
+    the newer /lookup/ shape (anonymous/as/mobile, with is_res_proxy) and the
+    classic shape returned by the /batch endpoint (privacy/asn|company/carrier).
+    Either way we pull the same proxy/vpn/tor/relay/hosting/mobile signals."""
+    if not isinstance(data, dict):
+        return {"_error": "IPinfo: no data"}
+    # anonymous (new) vs privacy (classic)
+    anon_o = data.get("anonymous") if isinstance(data.get("anonymous"), dict) \
+        else (data.get("privacy") if isinstance(data.get("privacy"), dict)
+              else {})
+    # as (new) vs asn / company (classic)
+    as_o = data.get("as") if isinstance(data.get("as"), dict) else (
+        data.get("asn") if isinstance(data.get("asn"), dict) else (
+            data.get("company") if isinstance(data.get("company"), dict)
+            else {}))
     geo_o = data.get("geo") if isinstance(data.get("geo"), dict) else {}
-    mob_o = data.get("mobile") if isinstance(data.get("mobile"), dict) else {}
+    mob_o = data.get("mobile") if isinstance(data.get("mobile"), dict) else (
+        data.get("carrier") if isinstance(data.get("carrier"), dict) else {})
 
-    vpn = bool(anon_o.get("is_vpn"))
-    proxy = bool(anon_o.get("is_proxy"))
-    tor = bool(anon_o.get("is_tor"))
-    relay = bool(anon_o.get("is_relay"))
-    res_proxy = bool(anon_o.get("is_res_proxy"))
-    hosting = bool(data.get("is_hosting"))
+    def _b(*keys):
+        # First truthy value across new/classic key spellings.
+        for k in keys:
+            if anon_o.get(k):
+                return True
+        return False
+
+    vpn = _b("is_vpn", "vpn")
+    proxy = _b("is_proxy", "proxy")
+    tor = _b("is_tor", "tor")
+    relay = _b("is_relay", "relay")
+    res_proxy = _b("is_res_proxy", "res_proxy")
+    hosting = bool(data.get("is_hosting")) or _b("hosting")
     is_mobile = bool(data.get("is_mobile")) or bool(mob_o.get("carrier")
                                                     or mob_o.get("name"))
     # Some tiers include the residential-proxy service name; keep it if present.
@@ -912,6 +922,67 @@ def ipinfo_lookup(ip, token, timeout=DEFAULT_TIMEOUT):
         "country": geo_o.get("country_code") or geo_o.get("country", ""),
         "flag_extra": list(dict.fromkeys(extra)),   # deduped, order-preserved
     }
+
+
+def ipinfo_lookup(ip, token, timeout=DEFAULT_TIMEOUT):
+    """Single-IP lookup via api.ipinfo.io/lookup (Bearer auth). Kept for the
+    fused engine and as the fallback when a batch entry is missing."""
+    data, err = http_get_json_ex(
+        "https://api.ipinfo.io/lookup/" + quote(ip, safe=""),
+        timeout, extra_headers={"Authorization": "Bearer " + token})
+    if err or not isinstance(data, dict):
+        return {"_error": f"IPinfo: {err or 'no data'}"}
+    return _ipinfo_parse(data)
+
+
+IPINFO_BATCH_MAX = 1000     # IPinfo's documented per-call cap
+
+
+def ipinfo_batch(ips, token, timeout=DEFAULT_TIMEOUT):
+    """Look up many IPs in ONE POST to api.ipinfo.io/batch (up to 1000 per
+    call). This is the fix for stage-2 socket exhaustion: instead of one direct
+    connection per IP - which drowned the local machine on 10k+ runs - a whole
+    chunk resolves over a single connection. Returns {ip: score_dict}; any IP
+    the batch didn't answer is simply absent, so the caller can fall back.
+    On a transport/HTTP error every IP maps to an {'_error': ...} dict."""
+    ips = list(ips)
+    if not ips:
+        return {}
+    url = "https://api.ipinfo.io/batch?token=" + quote(token, safe="")
+    body = json.dumps(ips).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            url, data=body, method="POST",
+            headers={"User-Agent": USER_AGENT,
+                     "Content-Type": "application/json"})
+        opener = (urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=SSL_CTX)) if SSL_CTX
+            else urllib.request.build_opener())
+        # Batches are bigger than a single lookup - give them more headroom.
+        with opener.open(req, timeout=max(timeout, 60)) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+        obj = json.loads(raw)
+    except urllib.error.HTTPError as e:
+        return {ip: {"_error": f"IPinfo: HTTP {e.code}"} for ip in ips}
+    except socket.timeout:
+        return {ip: {"_error": "IPinfo: timeout"} for ip in ips}
+    except Exception:
+        return {ip: {"_error": "IPinfo: network"} for ip in ips}
+    if not isinstance(obj, dict):
+        return {ip: {"_error": "IPinfo: bad batch response"} for ip in ips}
+    # Keys come back as the IP (bare-IP input). Be lenient: also match a value
+    # that carries its own 'ip' field, in case the endpoint keys differently.
+    out = {}
+    for ip in ips:
+        rec = obj.get(ip)
+        if isinstance(rec, dict):
+            out[ip] = _ipinfo_parse(rec)
+    if len(out) < len(ips):
+        for rec in obj.values():
+            if isinstance(rec, dict) and rec.get("ip") in ips \
+                    and rec["ip"] not in out:
+                out[rec["ip"]] = _ipinfo_parse(rec)
+    return out
 
 
 # The aggregate runs EVERY configured provider concurrently and fuses their
@@ -4541,7 +4612,31 @@ class QualityTab(ttk.Frame):
             breaker = (_ProviderBreaker()
                        if provider == AGGREGATE_PROVIDER else None)
             scores = {}
-            if not self.stop_event.is_set():
+            # Fast path: IPinfo has a bulk endpoint (up to 1000 IPs per POST),
+            # so a whole run resolves in a few requests instead of one direct
+            # connection per IP - which is what exhausted local sockets on big
+            # runs. Only for the single IPinfo provider (fused still merges
+            # per-IP), when a token is set and batch isn't disabled in Settings.
+            use_batch = (provider == "IPinfo" and api_key
+                         and load_setting("ipinfo_batch", True)
+                         and not self.stop_event.is_set())
+            if use_batch:
+                done = 0
+                for i in range(0, unique_n, IPINFO_BATCH_MAX):
+                    if self.stop_event.is_set():
+                        break
+                    chunk = unique[i:i + IPINFO_BATCH_MAX]
+                    got = ipinfo_batch(chunk, api_key, DEFAULT_TIMEOUT)
+                    for ip in chunk:
+                        # Any IP the batch didn't answer falls back to a single
+                        # lookup, so a partial batch never leaves blank rows.
+                        scores[ip] = got.get(ip) or ipinfo_lookup(
+                            ip, api_key, DEFAULT_TIMEOUT)
+                    done += len(chunk)
+                    self.queue.put({"_status": f"Scored {min(done, unique_n)}/"
+                                    f"{unique_n} unique IP(s) "
+                                    f"(batch)..."})
+            if not use_batch and not self.stop_event.is_set():
                 # Stage 2 uses its OWN (lower) concurrency - these are direct
                 # reputation-API calls; too many at once connection-fails IPinfo.
                 score_workers = min(get_score_workers(), max(1, unique_n))
@@ -5039,6 +5134,24 @@ class SettingsTab(ttk.Frame):
         key_row("proxycheck.io key", self.pcheck)
         key_row("IPinfo token (Max = residential proxy)", self.ipinfo)
         key_row("IPQualityScore key", self.ipqs)
+
+        # IPinfo bulk endpoint: one POST per 1000 IPs instead of one connection
+        # per IP - the fix for socket exhaustion on big runs. On by default.
+        self.ipinfo_batch = tk.BooleanVar(
+            value=bool(load_setting("ipinfo_batch", True)))
+        ttk.Checkbutton(
+            host, text="Use IPinfo batch API (1000 IPs/request)",
+            variable=self.ipinfo_batch,
+            command=lambda: (save_setting("ipinfo_batch",
+                                          bool(self.ipinfo_batch.get())),
+                             self.status_lbl.config(text="Saved."))
+            ).grid(row=r, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        r += 1
+        self._help("Scores the IP Quality tab far faster on large lists and "
+                   "avoids the connection failures single-lookup mode hit on "
+                   "10k+ runs. Applies to the 'IPinfo' provider; turn off only "
+                   "if batch results look wrong.", r, pady=(0, 4))
+        r += 1
 
         ttk.Separator(host, orient="horizontal").grid(
             row=r, column=0, columnspan=2, sticky="ew", pady=14)
