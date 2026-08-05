@@ -60,7 +60,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "4.8"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "4.9"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -5411,6 +5411,7 @@ class QualityTab(ttk.Frame):
         prov_status = []
         overlap = None
         pcheck_warning = ""
+        stage1_s = t_stage2 = None
         # Fresh run: re-arm the Spamhaus resolver check (a previous run on a
         # different network may have disabled it).
         _spamhaus_guard.reset()
@@ -5426,6 +5427,7 @@ class QualityTab(ttk.Frame):
             # timeouts (short for connect+tunnel, longer for TLS+GET), keeping
             # the dead-proxy fast-fail without paying the extra handshake.
             discoveries = []
+            t_stage1 = time.perf_counter()
             connect_to, read_to = get_fast_timeout(), EXIT_IP_READ_TIMEOUT
             with ThreadPoolExecutor(max_workers=get_fast_workers()) as pool:
                 futs = {pool.submit(discover_exit_ip_direct, p, connect_to,
@@ -5447,6 +5449,14 @@ class QualityTab(ttk.Frame):
                         self.queue.put({"_status":
                                         f"Resolving {done}/{len(proxies)} "
                                         f"({live_n} live so far)..."})
+
+            stage1_s = time.perf_counter() - t_stage1
+            t_stage2 = time.perf_counter()
+            # How many proxies burned a full timeout instead of answering. On a
+            # wide pool the wall clock is often set by these stragglers rather
+            # than by throughput, so it's worth calling out explicitly.
+            timed_out = sum(1 for d in discoveries
+                            if str(d.get("status", "")).startswith("timeout"))
 
             # --- Speed gate: mark OK-but-slow proxies (kept out of scoring) ---
             if gate_ms is not None:
@@ -5587,7 +5597,11 @@ class QualityTab(ttk.Frame):
                             "err_ct": err_ct, "gated_out": gated_out,
                             "prov_status": prov_status, "overlap": overlap,
                             "pcheck_warning": pcheck_warning,
-                            "spamhaus_refused": _spamhaus_guard.refused})
+                            "spamhaus_refused": _spamhaus_guard.refused,
+                            "stage1_s": stage1_s,
+                            "timed_out": locals().get("timed_out", 0),
+                            "stage2_s": (None if t_stage2 is None
+                                         else time.perf_counter() - t_stage2)})
 
     def _drain_queue(self):
         try:
@@ -5664,9 +5678,19 @@ class QualityTab(ttk.Frame):
         elapsed = _fmt_elapsed(elapsed_s)
         total = getattr(self, "_run_total", 0)
         rate = f", {total / max(elapsed_s, 0.001):.0f}/s" if total else ""
+        # Per-stage split, so "it feels slow" can be pinned on the right stage:
+        # resolve = network wait on YOUR proxies, score = the reputation APIs.
+        split = ""
+        if info.get("stage1_s") is not None:
+            split = f" [resolve {info['stage1_s']:.1f}s"
+            if info.get("stage2_s") is not None:
+                split += f" + score {info['stage2_s']:.1f}s"
+            if info.get("timed_out"):
+                split += f", {info['timed_out']} timed out"
+            split += "]"
         # Persistent summary so filtering never wipes the scored/dedupe counts.
         self._summary = ("Stopped" if stopped
-                         else f"Done in {elapsed}{rate} - {scored} scored"
+                         else f"Done in {elapsed}{rate}{split} - {scored} scored"
                               f"{dedup}{gate_note}{err_note}{prov_note}"
                               f"{pcw_note}")
         # Same-pool warning: shown ONLY when two providers actually collided.
