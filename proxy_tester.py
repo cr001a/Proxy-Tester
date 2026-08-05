@@ -60,7 +60,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "4.4"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "4.5"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -116,6 +116,10 @@ def apply_theme(root):
                     font=(UI_FONT + " Semibold", 15))
     style.configure("Warn.TLabel", background=BASE, foreground=YELLOW,
                     font=(UI_FONT + " Semibold", 11))
+    # The prominent "N shown" count - big and green so it reads at a glance
+    # instead of being buried in the muted status line.
+    style.configure("Count.TLabel", background=BASE, foreground=GREEN,
+                    font=(UI_FONT + " Semibold", 16))
 
     style.configure("TButton", background=SURFACE, foreground=TEXT,
                     bordercolor=SURFACE2, focuscolor=BASE, padding=(12, 6),
@@ -864,20 +868,42 @@ _proxycheck_limiter = _RateLimiter(PROXYCHECK_RATE_PER_SEC)
 
 def proxycheck_lookup(ip, api_key, timeout=DEFAULT_TIMEOUT):
     """Query proxycheck.io for an IP. Cheap/high-volume alternative to IPQS
-    (1,000/day free). Returns a normalized dict (same shape as ipqs_lookup).
+    (1,000/day free). Returns a normalized dict (same shape as ipqs_lookup), or
+    {'_error': ...} with a real reason on failure - never a bare None, so the
+    aggregate breaker can tell WHY a provider got disabled instead of just that
+    it did.
     Uses the v2 endpoint - proxycheck's v3 (announced Aug 2025) restructures
     the response into nested network/detections/operator sections; v2 stays
     supported until 2035, and v3's exact schema needs verifying against a live
-    key before the parser is rewritten to it, so this isn't a blind migration."""
+    key before the parser is rewritten to it, so this isn't a blind migration.
+
+    proxycheck's own docs define FOUR status values, and only two of them are
+    actual failures:
+      ok      (200) - success, no message.
+      warning (200) - STILL A SUCCESSFUL QUERY with an advisory message (e.g.
+                      near your daily quota, or over the per-second soft
+                      limit) - the proxy-check data is present and usable.
+      denied  (401/403/429) - real failure: bad/disabled key, or daily/burst
+                      allowance exhausted.
+      error   (400) - real failure: malformed request.
+    Treating 'warning' as a failure (as this used to) meant an account running
+    anywhere near its daily quota had EVERY lookup discarded and the aggregate
+    breaker would disable proxycheck.io outright after a handful of them -
+    even though every one of those lookups actually succeeded."""
     _proxycheck_limiter.wait()
     url = ("https://proxycheck.io/v2/" + quote(ip, safe="")
            + "?key=" + quote(api_key, safe="") + "&vpn=1&asn=1&risk=1")
     data = http_get_json(url, timeout)
-    if not isinstance(data, dict) or data.get("status") != "ok":
-        return None
+    if not isinstance(data, dict):
+        return {"_error": "proxycheck.io: no data"}
+    status = data.get("status")
+    message = str(data.get("message") or "").strip()
+    if status not in ("ok", "warning"):
+        return {"_error": f"proxycheck.io: {status or 'no status'}"
+                          f"{' - ' + message if message else ''}"}
     rec = data.get(ip)
     if not isinstance(rec, dict):
-        return None
+        return {"_error": "proxycheck.io: no record for IP"}
     ptype = rec.get("type") or ""
     low = ptype.lower()
     try:
@@ -890,6 +916,11 @@ def proxycheck_lookup(ip, api_key, timeout=DEFAULT_TIMEOUT):
         "proxy": rec.get("proxy") == "yes",
         "vpn": "vpn" in low,
         "tor": "tor" in low,
+        # A 'warning' status still succeeded, but the message usually means
+        # you're approaching (or a burst token just covered) your daily/rate
+        # limit - surface it once so it's visible without digging, instead of
+        # the lookup silently vanishing.
+        "_proxycheck_warning": message if status == "warning" else "",
         "recent_abuse": False,
         "bot_status": False,
         "isp": rec.get("provider", "") or rec.get("organisation", ""),
@@ -1600,11 +1631,12 @@ def save_setting(key, value):
         pass
 
 
-MAX_WORKERS_CAP = 500  # upper clamp. proxycheck.io load-balances one hostname
-                       # across ~14 cluster nodes (200 req/s EACH => ~2,800/s
-                       # aggregate), and IPinfo paid is unthrottled, so hundreds
-                       # of concurrent workers are absorbed without targeting
-                       # individual nodes. Threads are the real cost at this end.
+MAX_WORKERS_CAP = 800  # upper clamp for the full-GET / exit-IP path (TLS +
+                       # HTTP GET + body THROUGH each of your own proxies).
+                       # Raised from 500: IP Quality's stage 1b now runs only
+                       # on proxies the connect-only pre-filter already proved
+                       # reachable, so the herd is thinner by the time this
+                       # cap matters - more headroom is pure win, not risk.
 
 
 def get_workers():
@@ -4738,6 +4770,11 @@ class QualityTab(ttk.Frame):
                   style="Muted.TLabel").pack(side="left", padx=(8, 0))
         self.sel_lbl = ttk.Label(btns, text="", style="Muted.TLabel")
         self.sel_lbl.pack(side="right")
+        # The number the user actually wants at a glance: how many proxies are
+        # showing right now (after every active filter). Big and green so it
+        # doesn't require reading the whole status line to find.
+        self.shown_count_lbl = ttk.Label(btns, text="", style="Count.TLabel")
+        self.shown_count_lbl.pack(side="right", padx=(0, 16))
 
         # Run summary / progress on its own full-width row so it can never be
         # clipped off-screen; wraplength tracks the window so it reflows to fit.
@@ -4904,6 +4941,7 @@ class QualityTab(ttk.Frame):
         provider_err, err_ct = "", 0
         prov_status = []
         overlap = None
+        pcheck_warning = ""
         try:
             # --- Stage 1a: connect-only pre-filter (cheap, very wide) ---
             # A dead proxy costs the FULL do_request timeout (TLS+GET+body) if
@@ -4947,8 +4985,15 @@ class QualityTab(ttk.Frame):
                             "reachable proxies - resolving exit IPs..."})
 
             # --- Stage 1b: resolve exit IPs on the SURVIVORS only ---
+            # Shorter timeout than the global default: the pre-filter already
+            # proved each of these opens its CONNECT tunnel within
+            # get_fast_timeout() (5s). A proxy that stalls well past that on
+            # top of a fast CONNECT - for a small GET with a tiny JSON body -
+            # is a low-quality/overloaded exit; holding a worker for the full
+            # 15s on it just delays every proxy behind it in the queue.
+            EXIT_IP_TIMEOUT = 9
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                futs = {pool.submit(discover_exit_ip, p, DEFAULT_TIMEOUT,
+                futs = {pool.submit(discover_exit_ip, p, EXIT_IP_TIMEOUT,
                                     self.stop_event): p for p in alive}
                 done = 0
                 for fut in futs:
@@ -5040,6 +5085,8 @@ class QualityTab(ttk.Frame):
                 if q.get("_error"):
                     err_ct += 1
                     provider_err = q["_error"]
+                if not pcheck_warning and q.get("_proxycheck_warning"):
+                    pcheck_warning = q["_proxycheck_warning"]
             # Per-provider status for the aggregate: which ran ok, which the
             # breaker stopped, and which were skipped for a missing key.
             prov_status = breaker.summary() if breaker else []
@@ -5073,7 +5120,8 @@ class QualityTab(ttk.Frame):
             self.queue.put({"_done": True, "resolved": resolved,
                             "unique": unique_n, "provider_err": provider_err,
                             "err_ct": err_ct, "gated_out": gated_out,
-                            "prov_status": prov_status, "overlap": overlap})
+                            "prov_status": prov_status, "overlap": overlap,
+                            "pcheck_warning": pcheck_warning})
 
     def _drain_queue(self):
         try:
@@ -5133,6 +5181,12 @@ class QualityTab(ttk.Frame):
         prov_note = ""
         if info.get("prov_status"):
             prov_note = "  |  providers - " + "; ".join(info["prov_status"])
+        # proxycheck.io's 'warning' status is a SUCCESSFUL lookup with an
+        # advisory attached (near daily quota, near per-second limit, etc.) -
+        # surface it once so it's visible without checking their dashboard.
+        pcw_note = ""
+        if info.get("pcheck_warning"):
+            pcw_note = f"  |  proxycheck.io: {info['pcheck_warning']}"
         elapsed_s = (time.perf_counter()
                     - getattr(self, "_run_started", time.perf_counter()))
         elapsed = _fmt_elapsed(elapsed_s)
@@ -5141,7 +5195,8 @@ class QualityTab(ttk.Frame):
         # Persistent summary so filtering never wipes the scored/dedupe counts.
         self._summary = ("Stopped" if stopped
                          else f"Done in {elapsed}{rate} - {scored} scored"
-                              f"{dedup}{gate_note}{err_note}{prov_note}")
+                              f"{dedup}{gate_note}{err_note}{prov_note}"
+                              f"{pcw_note}")
         # Same-pool warning: shown ONLY when two providers actually collided.
         self._overlap = info.get("overlap")
         note = overlap_summary(self._overlap or {})
@@ -5308,6 +5363,7 @@ class QualityTab(ttk.Frame):
         self._final_status = self._summary or f"Showing {len(rows)}"
         if filt:
             self._final_status += f"  |  showing {len(rows)} [{', '.join(filt)}]"
+        self.shown_count_lbl.config(text=f"{len(rows):,} shown")
 
         # Cancel any in-flight paint (e.g. a filter toggled mid-render).
         if getattr(self, "_render_job", None):

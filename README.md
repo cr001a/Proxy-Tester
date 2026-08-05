@@ -61,9 +61,23 @@ Four tabs:
    (default **92**) shows only the healthy majority after a run — nothing is
    discarded, it's a display filter, so blank the box (or lower it) to reveal
    the poorer proxies too, stacking with the header Type/Trust filters. **Copy
-   selected** proxies straight to the clipboard (full `host:port:user:pass`).
-   API keys live on the **Settings** tab; concurrency is hard-coded for maximum
-   throughput (nothing to tune).
+   selected** proxies straight to the clipboard (full `host:port:user:pass`). A
+   large **green count** ("N shown") sits next to the buttons so you always
+   know how many proxies pass every active filter at a glance, without reading
+   the full status line. API keys live on the **Settings** tab; concurrency is
+   hard-coded for maximum throughput (nothing to tune).
+
+   **proxycheck.io status handling.** Their API has four status values, and
+   only two are real failures — `ok` and `warning` both mean the query
+   succeeded (a `warning` just carries an advisory, e.g. nearing your daily
+   quota or per-second limit); only `denied`/`error` are actual failures. This
+   used to treat any non-`ok` status as a failure and silently drop the data —
+   meaning an account anywhere near its daily quota had every lookup discarded
+   and got disabled by the fused breaker after a handful of them, even though
+   every one of those lookups had actually succeeded. A real failure now
+   surfaces the vendor's own message (e.g. `proxycheck.io: denied - 100 queries
+   exhausted...`) instead of a bare "failed (stopped)", and a `warning` is
+   shown once per run so you know if you're approaching a limit.
 
    **Scoring detail (IPinfo).** Verified against IPinfo's own Batch Enrichment
    API docs: an exit resolving to a **government**-typed network is a real red
