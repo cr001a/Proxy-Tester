@@ -60,7 +60,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "4.3"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "4.4"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -964,12 +964,22 @@ def _ipinfo_parse(data):
         fraud = 90                      # a proxy exit -> burnt
     elif vpn or tor or relay:
         fraud = 85
-    elif org_type in ("government", "education"):
-        # An exit resolving to an institutional network is not residential at
-        # all - either mislabeled or a compromised/hijacked host. Previously
-        # fell through to the clean-residential branch (fraud 5), which was
-        # simply wrong.
+    elif org_type == "government":
+        # There is essentially no legitimate retail-shopper traffic from a
+        # government/.mil-type network. A "residential" proxy exiting here is
+        # almost certainly a compromised/hijacked host being used as an
+        # unauthorized relay, not a real consumer. Previously fell through to
+        # clean-Residential (fraud 5), which was simply wrong.
         fraud = 80
+    elif org_type == "education":
+        # Softer than government: a university/dorm connection CAN be a real
+        # student's genuine home-like internet (some bandwidth-sharing SDKs
+        # legitimately harvest exactly this kind of connection) - a student
+        # buying a graphics card is a real shopper, not a fraud signal. Still
+        # flagged, mildly, because it means the provider's "residential" pool
+        # includes non-consumer-ISP address space, which is worth knowing -
+        # just not treated as risky as an actual VPN/proxy/government exit.
+        fraud = 35
     elif hosting or org_type == "hosting":
         fraud = 60                      # datacenter / hosting
     else:

@@ -66,10 +66,16 @@ Four tabs:
    throughput (nothing to tune).
 
    **Scoring detail (IPinfo).** Verified against IPinfo's own Batch Enrichment
-   API docs: an exit resolving to a **government or education** network now
-   scores as a real red flag (previously fell through to clean-Residential,
-   which was wrong) — an "education"/"government"-typed ASN is not a home
-   connection. An **anycast** IP is treated as a near-certain non-residential
+   API docs: an exit resolving to a **government**-typed network is a real red
+   flag (previously fell through to clean-Residential, which was wrong) —
+   there's essentially no legitimate retail-shopper traffic from a `.mil`-type
+   network, so a "residential" proxy exiting there is almost certainly a
+   compromised host acting as an unauthorized relay. **Education** is flagged
+   much more mildly — a university/dorm connection can be a real student's
+   genuine home-like internet, so it's noted (the provider's "residential" pool
+   includes non-consumer-ISP space, worth knowing) without being treated as
+   risky as an actual VPN or government exit. An **anycast** IP is treated as a
+   near-certain non-residential
    tell (anycast address space is never a genuine home connection) and floors
    Trust hard. **Satellite** ISPs (Starlink etc.) get their own Type instead of
    hiding inside generic Residential — legitimate, but operationally different
