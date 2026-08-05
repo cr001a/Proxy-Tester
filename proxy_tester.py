@@ -60,7 +60,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "4.5"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "4.6"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -747,6 +747,51 @@ _SPAMHAUS_ZONES = {
 }
 
 
+class _SpamhausGuard:
+    """Spamhaus ZEN refuses queries coming from public/cloud DNS resolvers -
+    it answers 127.255.255.x, which we correctly report as 'couldn't tell'
+    (blacklisted=None, shown as '-'). On a cloud box (an AWS instance, say)
+    that is EVERY lookup: thousands of blocking DNS queries that can never
+    return a usable answer, for nothing.
+
+    So sample the first `sample` lookups of a run. If not one of them could
+    tell, the resolver is clearly refusing us - stop querying for the rest of
+    the run and say so in the summary, instead of burning a DNS round-trip per
+    unique IP to collect nothing."""
+
+    def __init__(self, sample=25):
+        self._lock = threading.Lock()
+        self._sample = sample
+        self._seen = 0
+        self._useful = 0
+        self._disabled = False
+
+    def reset(self):
+        with self._lock:
+            self._seen = self._useful = 0
+            self._disabled = False
+
+    def active(self):
+        return not self._disabled
+
+    @property
+    def refused(self):
+        return self._disabled
+
+    def record(self, blacklisted):
+        with self._lock:
+            if self._disabled or self._seen >= self._sample:
+                return
+            self._seen += 1
+            if blacklisted is not None:
+                self._useful += 1
+            if self._seen >= self._sample and self._useful == 0:
+                self._disabled = True
+
+
+_spamhaus_guard = _SpamhausGuard()
+
+
 def spamhaus_lookup(ip):
     """Spamhaus ZEN DNSBL check (free, no key). Returns a dict:
       blacklisted    : True listed / False clean / None couldn't tell
@@ -754,7 +799,10 @@ def spamhaus_lookup(ip):
                        or a '+'-joined combo, worst-first; '' when not listed.
     A 127.255.255.x answer means a public/cloud resolver refused the query
     ('unknown', NOT a listing) - treating those as listed is what made rows flip
-    listed/clean run to run."""
+    listed/clean run to run. If the resolver is refusing every query (common on
+    cloud hosts), _spamhaus_guard short-circuits the rest of the run."""
+    if not _spamhaus_guard.active():
+        return {"blacklisted": None, "blacklist_kind": ""}
     parts = ip.split(".")
     if len(parts) != 4 or not all(p.isdigit() for p in parts):
         return {"blacklisted": None, "blacklist_kind": ""}
@@ -762,8 +810,12 @@ def spamhaus_lookup(ip):
     try:
         answers = socket.gethostbyname_ex(query)[2]
     except socket.gaierror:
-        return {"blacklisted": False, "blacklist_kind": ""}   # NXDOMAIN => clean
+        # NXDOMAIN => genuinely not listed. That IS a usable answer, so it
+        # counts as the resolver working.
+        _spamhaus_guard.record(False)
+        return {"blacklisted": False, "blacklist_kind": ""}
     except OSError:
+        _spamhaus_guard.record(None)
         return {"blacklisted": None, "blacklist_kind": ""}
     kinds = []
     for a in answers:
@@ -772,9 +824,12 @@ def spamhaus_lookup(ip):
             kinds.append(z)
     if kinds:
         kinds.sort(key=lambda k: {"XBL": 0, "SBL": 1, "PBL": 2}.get(k, 9))
+        _spamhaus_guard.record(True)
         return {"blacklisted": True, "blacklist_kind": "+".join(kinds)}
     if any(a.startswith("127.0.0.") for a in answers):
+        _spamhaus_guard.record(True)
         return {"blacklisted": True, "blacklist_kind": ""}    # listed, zone n/a
+    _spamhaus_guard.record(None)
     return {"blacklisted": None, "blacklist_kind": ""}        # resolver refused
 
 
@@ -901,9 +956,21 @@ def proxycheck_lookup(ip, api_key, timeout=DEFAULT_TIMEOUT):
     if status not in ("ok", "warning"):
         return {"_error": f"proxycheck.io: {status or 'no status'}"
                           f"{' - ' + message if message else ''}"}
-    rec = data.get(ip)
-    if not isinstance(rec, dict):
+    rec = _proxycheck_parse_record(data.get(ip))
+    if rec is None:
         return {"_error": "proxycheck.io: no record for IP"}
+    # A 'warning' status still succeeded, but the message usually means you're
+    # approaching (or a burst token just covered) your daily/rate limit -
+    # surface it once so it's visible without digging.
+    rec["_proxycheck_warning"] = message if status == "warning" else ""
+    return rec
+
+
+def _proxycheck_parse_record(rec):
+    """Normalize ONE proxycheck record into our score dict. Shared by the
+    single-IP lookup and the bulk POST so both can never drift apart."""
+    if not isinstance(rec, dict):
+        return None
     ptype = rec.get("type") or ""
     low = ptype.lower()
     try:
@@ -916,16 +983,96 @@ def proxycheck_lookup(ip, api_key, timeout=DEFAULT_TIMEOUT):
         "proxy": rec.get("proxy") == "yes",
         "vpn": "vpn" in low,
         "tor": "tor" in low,
-        # A 'warning' status still succeeded, but the message usually means
-        # you're approaching (or a burst token just covered) your daily/rate
-        # limit - surface it once so it's visible without digging, instead of
-        # the lookup silently vanishing.
-        "_proxycheck_warning": message if status == "warning" else "",
         "recent_abuse": False,
         "bot_status": False,
         "isp": rec.get("provider", "") or rec.get("organisation", ""),
         "country": rec.get("isocode", ""),
     }
+
+
+# proxycheck.io accepts up to 1,000 addresses in ONE POST (docs: "Queries Per
+# Request 1,000" for registered free and paid plans), comma-separated in an
+# `ips=` body. This is the difference between 17,000 rate-limited GETs and 17
+# POSTs. NOTE: each address still counts as one query against your daily
+# allowance - batching saves REQUESTS and wall-clock, not quota.
+PROXYCHECK_BATCH_MAX = 1000
+PROXYCHECK_BATCH_CONCURRENCY = 6
+
+
+def proxycheck_batch(ips, api_key, timeout=DEFAULT_TIMEOUT):
+    """Check up to PROXYCHECK_BATCH_MAX IPs in a single POST. Returns
+    {ip: score_dict}; on a transport/denied error every IP maps to an
+    {'_error': ...} dict so the caller can report a real reason."""
+    ips = list(ips)
+    if not ips:
+        return {}
+    _proxycheck_limiter.wait()
+    url = ("https://proxycheck.io/v2/?key=" + quote(api_key, safe="")
+           + "&vpn=1&asn=1&risk=1")
+    body = ("ips=" + ",".join(ips)).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            url, data=body, method="POST",
+            headers={"User-Agent": USER_AGENT,
+                     "Content-Type": "application/x-www-form-urlencoded"})
+        opener = (urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=SSL_CTX)) if SSL_CTX
+            else urllib.request.build_opener())
+        # A 1000-IP batch is a much bigger response than a single lookup.
+        with opener.open(req, timeout=max(timeout, 60)) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+        data = json.loads(raw)
+    except urllib.error.HTTPError as e:
+        return {ip: {"_error": f"proxycheck.io: HTTP {e.code}"} for ip in ips}
+    except socket.timeout:
+        return {ip: {"_error": "proxycheck.io: timeout"} for ip in ips}
+    except Exception:
+        return {ip: {"_error": "proxycheck.io: network"} for ip in ips}
+    if not isinstance(data, dict):
+        return {ip: {"_error": "proxycheck.io: bad batch response"}
+                for ip in ips}
+    status = data.get("status")
+    message = str(data.get("message") or "").strip()
+    # Same status rules as the single lookup: 'warning' is a SUCCESS carrying
+    # an advisory, only denied/error are real failures.
+    if status not in ("ok", "warning"):
+        return {ip: {"_error": f"proxycheck.io: {status or 'no status'}"
+                               f"{' - ' + message if message else ''}"}
+                for ip in ips}
+    warn = message if status == "warning" else ""
+    out = {}
+    for ip in ips:
+        rec = _proxycheck_parse_record(data.get(ip))
+        if rec is not None:
+            rec["_proxycheck_warning"] = warn
+            out[ip] = rec
+    return out
+
+
+def proxycheck_batch_all(ips, api_key, timeout=DEFAULT_TIMEOUT):
+    """Resolve every IP through proxycheck's bulk POST, chunked at
+    PROXYCHECK_BATCH_MAX and run concurrently across chunks. Any IP a chunk
+    didn't answer falls back to a single lookup so a partial batch never leaves
+    blank rows. Returns {ip: score_dict}."""
+    ips = list(dict.fromkeys(ips))
+    if not ips:
+        return {}
+    chunks = [ips[i:i + PROXYCHECK_BATCH_MAX]
+              for i in range(0, len(ips), PROXYCHECK_BATCH_MAX)]
+    out = {}
+    with ThreadPoolExecutor(
+            max_workers=max(1, min(PROXYCHECK_BATCH_CONCURRENCY, len(chunks)))
+    ) as pool:
+        futs = {pool.submit(proxycheck_batch, c, api_key, timeout): c
+                for c in chunks}
+        for fut, c in futs.items():
+            try:
+                got = fut.result()
+            except Exception:
+                got = {}
+            for ip in c:
+                out[ip] = got.get(ip) or proxycheck_lookup(ip, api_key, timeout)
+    return out
 
 
 def _ipinfo_parse(data):
@@ -4942,6 +5089,9 @@ class QualityTab(ttk.Frame):
         prov_status = []
         overlap = None
         pcheck_warning = ""
+        # Fresh run: re-arm the Spamhaus resolver check (a previous run on a
+        # different network may have disabled it).
+        _spamhaus_guard.reset()
         try:
             # --- Stage 1a: connect-only pre-filter (cheap, very wide) ---
             # A dead proxy costs the FULL do_request timeout (TLS+GET+body) if
@@ -5048,8 +5198,27 @@ class QualityTab(ttk.Frame):
                                 f"{unique_n} unique IP(s)..."})
                 ipinfo_precomputed = ipinfo_batch_all(unique, ipinfo_key,
                                                       DEFAULT_TIMEOUT)
+            # proxycheck.io takes up to 1,000 addresses per POST as well, so
+            # bulk it exactly like IPinfo. Previously this ran one rate-limited
+            # GET per unique IP - on a 17k-IP run that alone was ~34s of pure
+            # pacing floor before any other work. Now it's ~17 POSTs.
+            pcheck_key = load_setting("proxycheck_api_key", "").strip()
+            pcheck_precomputed = {}
+            if (pcheck_key and provider in ("proxycheck.io", AGGREGATE_PROVIDER)
+                    and not self.stop_event.is_set()):
+                self.queue.put({"_status": f"Batch-resolving proxycheck.io for "
+                                f"{unique_n} unique IP(s)..."})
+                pcheck_precomputed = proxycheck_batch_all(unique, pcheck_key,
+                                                          DEFAULT_TIMEOUT)
             if provider == "IPinfo" and use_batch:
                 scores = dict(ipinfo_precomputed)
+            elif provider == "proxycheck.io" and pcheck_precomputed:
+                # Single-provider proxycheck run: the batch IS the whole score,
+                # apart from the free Spamhaus check merged in below.
+                for ip in unique:
+                    q = dict(pcheck_precomputed.get(ip) or {})
+                    q.update(spamhaus_lookup(ip))
+                    scores[ip] = q
             elif not self.stop_event.is_set():
                 # Stage 2's general pool: spamhaus + whatever providers aren't
                 # already resolved via batch. Concurrency is generous here
@@ -5057,13 +5226,22 @@ class QualityTab(ttk.Frame):
                 # per-second limit via _proxycheck_limiter, and IPinfo (the
                 # provider that used to need protecting) is pre-fetched above.
                 score_workers = min(get_score_workers(), max(1, unique_n))
+
+                def _pre_for(ip):
+                    """Providers already resolved in bulk for this IP - score_ip
+                    skips their live per-IP call entirely."""
+                    pre = {}
+                    if ip in ipinfo_precomputed:
+                        pre["IPinfo"] = ipinfo_precomputed[ip]
+                    if ip in pcheck_precomputed:
+                        pre["proxycheck.io"] = pcheck_precomputed[ip]
+                    return pre or None
+
                 with ThreadPoolExecutor(max_workers=score_workers) as pool:
                     if provider == AGGREGATE_PROVIDER:
                         futs = {pool.submit(
                             score_ip, ip, provider, api_key, DEFAULT_TIMEOUT,
-                            breaker,
-                            ({"IPinfo": ipinfo_precomputed[ip]}
-                             if ip in ipinfo_precomputed else None)): ip
+                            breaker, _pre_for(ip)): ip
                             for ip in unique}
                     else:
                         futs = {pool.submit(score_ip, ip, provider, api_key,
@@ -5121,7 +5299,8 @@ class QualityTab(ttk.Frame):
                             "unique": unique_n, "provider_err": provider_err,
                             "err_ct": err_ct, "gated_out": gated_out,
                             "prov_status": prov_status, "overlap": overlap,
-                            "pcheck_warning": pcheck_warning})
+                            "pcheck_warning": pcheck_warning,
+                            "spamhaus_refused": _spamhaus_guard.refused})
 
     def _drain_queue(self):
         try:
@@ -5187,6 +5366,12 @@ class QualityTab(ttk.Frame):
         pcw_note = ""
         if info.get("pcheck_warning"):
             pcw_note = f"  |  proxycheck.io: {info['pcheck_warning']}"
+        # Spamhaus blocks public/cloud DNS resolvers. If it refused us, say so -
+        # otherwise a wall of '-' in the Blacklist column looks like the data
+        # just isn't there, rather than "your resolver can't ask".
+        if info.get("spamhaus_refused"):
+            pcw_note += ("  |  Spamhaus: resolver refused (cloud/public DNS) - "
+                         "blacklist checks skipped")
         elapsed_s = (time.perf_counter()
                     - getattr(self, "_run_started", time.perf_counter()))
         elapsed = _fmt_elapsed(elapsed_s)

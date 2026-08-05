@@ -42,9 +42,15 @@ Four tabs:
    instead of one connection per IP — the fix for the socket-exhaustion
    failures single-lookup mode hit at scale. Any IP a batch doesn't answer
    falls back to a single lookup, and the whole thing is a Settings toggle (on
-   by default). **proxycheck.io** is paced to its own documented per-second
-   limit (not a guessed thread count) so raising concurrency elsewhere can't
-   overrun it. An optional
+   by default). **proxycheck.io is bulk-queried the same way** — its API takes
+   up to 1,000 addresses in one POST, so a 17k-IP run is ~17 requests instead
+   of 17,000 individually-paced GETs (which alone imposed a ~34s floor before
+   any other work). Each address still counts as one query against your daily
+   allowance — batching saves wall-clock, not quota. **Spamhaus** is checked
+   free over DNS, but it refuses queries from public/cloud resolvers; the app
+   now samples the first few lookups and, if the resolver is clearly being
+   refused, skips the rest of the run and says so instead of burning a DNS
+   round-trip per unique IP to collect nothing. An optional
    **Speed gate** runs a **two-stage funnel**: a connect-only pre-filter first
    (same idea as the Proxy Tester's Liveness mode) kills unreachable proxies in
    one cheap RTT before they ever pay for the full exit-IP request, so a
