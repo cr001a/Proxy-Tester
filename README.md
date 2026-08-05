@@ -36,10 +36,15 @@ Four tabs:
    penalized) — and any listing keeps a row out of the green Trust band. Unique
    exit IPs are **deduped** so you only spend one lookup per IP. For the
    **IPinfo** provider, lookups use its **batch endpoint** (up to 1000 IPs per
-   POST), so a 10k+ run finishes in a handful of requests instead of one
-   connection per IP — the fix for the socket-exhaustion failures single-lookup
-   mode hit at scale. Any IP a batch doesn't answer falls back to a single
-   lookup, and the whole thing is a Settings toggle (on by default). An optional
+   POST, several chunks run concurrently) — including under **fused** mode,
+   which previously called IPinfo per-IP like every other provider and never
+   batched at all. A 10k+ run now finishes IPinfo in a handful of requests
+   instead of one connection per IP — the fix for the socket-exhaustion
+   failures single-lookup mode hit at scale. Any IP a batch doesn't answer
+   falls back to a single lookup, and the whole thing is a Settings toggle (on
+   by default). **proxycheck.io** is paced to its own documented per-second
+   limit (not a guessed thread count) so raising concurrency elsewhere can't
+   overrun it. An optional
    **Speed gate** runs a **two-stage funnel**: a connect-only pre-filter first
    (same idea as the Proxy Tester's Liveness mode) kills unreachable proxies in
    one cheap RTT before they ever pay for the full exit-IP request, so a

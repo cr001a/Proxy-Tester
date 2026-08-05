@@ -60,7 +60,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "4.1"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "4.2"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -678,6 +678,27 @@ def ping_site_via_proxy(proxy, name, target, runs, timeout=DEFAULT_TIMEOUT,
 IPINFO_URL = "https://ipinfo.io/json"
 
 
+class _RateLimiter:
+    """Thread-safe request pacer: spaces calls evenly to a target rate, so
+    throughput is capped by a documented-safe number regardless of how many
+    worker threads are calling it. This is what lets concurrency be raised
+    generously without risking a vendor's hard per-second limit - the limiter,
+    not the thread count, is what actually governs requests/sec."""
+
+    def __init__(self, rate_per_sec):
+        self._interval = 1.0 / rate_per_sec
+        self._lock = threading.Lock()
+        self._next = time.perf_counter()
+
+    def wait(self):
+        with self._lock:
+            now = time.perf_counter()
+            self._next = max(self._next, now) + self._interval
+            delay = self._next - now
+        if delay > 0:
+            time.sleep(delay)
+
+
 def http_get_json_ex(url, timeout=DEFAULT_TIMEOUT, extra_headers=None):
     """Direct (no-proxy) HTTPS GET. Returns (data_or_None, error_or_None) where
     error is a short human string so callers can tell WHY it failed: 'HTTP 401'
@@ -830,9 +851,25 @@ def _trust_score(q):
     return max(0, min(100, int(round(score))))
 
 
+# proxycheck.io's documented per-second limits (API docs, "Service Limits"):
+#   NA 875 soft / 1,000 hard - EU/Africa 1,225 soft / 1,400 hard -
+#   Asia/Oceania 700 soft / 800 hard (per-account, same for free and paid).
+# We don't know which region a given account routes to, so pace to the most
+# conservative region's soft limit with headroom, rather than guess a thread
+# count and hope. This means CONCURRENCY (how many callers can be in flight)
+# can be raised freely - actual req/s is capped here, not by thread count.
+PROXYCHECK_RATE_PER_SEC = 500
+_proxycheck_limiter = _RateLimiter(PROXYCHECK_RATE_PER_SEC)
+
+
 def proxycheck_lookup(ip, api_key, timeout=DEFAULT_TIMEOUT):
     """Query proxycheck.io for an IP. Cheap/high-volume alternative to IPQS
-    (1,000/day free). Returns a normalized dict (same shape as ipqs_lookup)."""
+    (1,000/day free). Returns a normalized dict (same shape as ipqs_lookup).
+    Uses the v2 endpoint - proxycheck's v3 (announced Aug 2025) restructures
+    the response into nested network/detections/operator sections; v2 stays
+    supported until 2035, and v3's exact schema needs verifying against a live
+    key before the parser is rewritten to it, so this isn't a blind migration."""
+    _proxycheck_limiter.wait()
     url = ("https://proxycheck.io/v2/" + quote(ip, safe="")
            + "?key=" + quote(api_key, safe="") + "&vpn=1&asn=1&risk=1")
     data = http_get_json(url, timeout)
@@ -1005,6 +1042,39 @@ def ipinfo_batch(ips, token, timeout=DEFAULT_TIMEOUT):
     return out
 
 
+IPINFO_BATCH_CONCURRENCY = 8   # chunks in flight at once (each POST holds up to
+                              # 1000 IPs, so even a few thousand unique IPs is
+                              # only a handful of chunks - no need for more)
+
+
+def ipinfo_batch_all(ips, token, timeout=DEFAULT_TIMEOUT):
+    """Resolve every IP via IPinfo's batch endpoint, chunked at
+    IPINFO_BATCH_MAX and run CONCURRENTLY across chunks - a single-IPinfo-
+    provider run used to walk its chunks one POST at a time, which serialized a
+    50k-unique-IP run into 50 sequential round trips for no reason (chunks are
+    independent). Falls back to a single lookup for any IP a chunk didn't
+    answer. Returns {ip: score_dict} for every input IP."""
+    ips = list(dict.fromkeys(ips))     # de-dup, preserve order
+    if not ips:
+        return {}
+    chunks = [ips[i:i + IPINFO_BATCH_MAX]
+              for i in range(0, len(ips), IPINFO_BATCH_MAX)]
+    out = {}
+    with ThreadPoolExecutor(
+            max_workers=max(1, min(IPINFO_BATCH_CONCURRENCY, len(chunks)))
+    ) as pool:
+        futs = {pool.submit(ipinfo_batch, c, token, timeout): c
+                for c in chunks}
+        for fut, c in futs.items():
+            try:
+                got = fut.result()
+            except Exception:
+                got = {}
+            for ip in c:
+                out[ip] = got.get(ip) or ipinfo_lookup(ip, token, timeout)
+    return out
+
+
 # The aggregate runs EVERY configured provider concurrently and fuses their
 # signals into one Trust score - so no single vendor's blind spots decide it.
 AGGREGATE_PROVIDER = "All providers (fused)"
@@ -1132,18 +1202,29 @@ class _ProviderBreaker:
         return out
 
 
-def score_ip(ip, provider, api_key, timeout=DEFAULT_TIMEOUT, breaker=None):
+def score_ip(ip, provider, api_key, timeout=DEFAULT_TIMEOUT, breaker=None,
+             precomputed=None):
     """Score one exit IP: free Spamhaus check + provider signal(s). Only the
     public IP is sent to a provider - never any credential. The aggregate runs
     EVERY configured provider concurrently and fuses them (skipping any the
-    breaker has disabled); a single provider runs just that one."""
+    breaker has disabled, or any provider already resolved via `precomputed` -
+    IPinfo's batch endpoint pre-fetches every unique IP up front for fused runs
+    too, so it never needs a live per-IP call here); a single provider runs
+    just that one."""
     if provider == AGGREGATE_PROVIDER:
+        pre = precomputed or {}
         tasks = [("_spamhaus", lambda: spamhaus_lookup(ip))]
         for name, lookup, key in _configured_lookups():
+            if name in pre:
+                continue                # already resolved via batch
             if breaker and not breaker.active(name):
                 continue
             tasks.append((name, lambda lk=lookup, k=key: lk(ip, k, timeout)))
-        results = []
+        results = list(pre.values())
+        for name, r in pre.items():
+            if breaker:
+                breaker.record(name, bool(r) and not (r or {}).get("_error"),
+                               (r or {}).get("_error", ""))
         with ThreadPoolExecutor(max_workers=max(2, len(tasks))) as pool:
             futs = {pool.submit(fn): name for name, fn in tasks}
             for fut in futs:
@@ -1499,17 +1580,22 @@ def get_fast_timeout():
     return DEFAULT_FAST_TIMEOUT
 
 
-DEFAULT_SCORE_WORKERS = 100   # reputation-lookup concurrency (IP Quality stage 2)
-MAX_SCORE_WORKERS = 200
+# Reputation-lookup concurrency (IP Quality stage 2), for whatever providers
+# AREN'T resolved via a batch endpoint - IPinfo now pre-fetches via
+# ipinfo_batch_all regardless of provider mode (fused or solo), so this pool
+# mainly carries spamhaus + proxycheck.io + IPQS. It used to be capped at 100
+# specifically to protect unbatched IPinfo from local socket exhaustion; now
+# that IPinfo is batched, the real limit is proxycheck.io's documented
+# per-second cap (700-1,400 req/s depending on region - see
+# PROXYCHECK_RATE_PER_SEC), which is enforced by its own rate limiter
+# regardless of how many threads call it. So concurrency here can be generous.
+DEFAULT_SCORE_WORKERS = 400
 
 
 def get_score_workers():
-    """Concurrency for the IP-Quality REPUTATION-lookup stage (stage 2). Hard-
-    coded at 100: these are direct API calls from this machine, and running
-    hundreds at once exhausts local sockets and connection-fails IPinfo (which
-    itself has no cap - the ceiling is our own box). 100 keeps every lookup
-    succeeding so no provider drops out of the fused score; IPinfo also batches
-    (1000/POST) so this stage is rarely the bottleneck anyway. Not user-tunable."""
+    """Concurrency for the IP-Quality REPUTATION-lookup stage (stage 2), for
+    providers not already resolved via a batch endpoint. Not user-tunable -
+    see DEFAULT_SCORE_WORKERS for why this number is safe."""
     return DEFAULT_SCORE_WORKERS
 
 
@@ -4826,38 +4912,44 @@ class QualityTab(ttk.Frame):
             breaker = (_ProviderBreaker()
                        if provider == AGGREGATE_PROVIDER else None)
             scores = {}
-            # Fast path: IPinfo has a bulk endpoint (up to 1000 IPs per POST),
-            # so a whole run resolves in a few requests instead of one direct
-            # connection per IP - which is what exhausted local sockets on big
-            # runs. Only for the single IPinfo provider (fused still merges
-            # per-IP), when a token is set and batch isn't disabled in Settings.
-            use_batch = (provider == "IPinfo" and api_key
+            # IPinfo has a bulk endpoint (up to 1000 IPs per POST, run several
+            # chunks concurrently) - a whole run resolves in a handful of
+            # requests instead of one direct connection per IP, which is what
+            # exhausted local sockets on big runs. This now applies whenever
+            # IPinfo has a key and batch isn't disabled in Settings - INCLUDING
+            # fused mode, which previously called IPinfo per-IP inside the same
+            # pool as every other provider and never batched at all.
+            ipinfo_key = load_setting("ipinfo_token", "").strip()
+            use_batch = (bool(ipinfo_key)
                          and load_setting("ipinfo_batch", True)
                          and not self.stop_event.is_set())
-            if use_batch:
-                done = 0
-                for i in range(0, unique_n, IPINFO_BATCH_MAX):
-                    if self.stop_event.is_set():
-                        break
-                    chunk = unique[i:i + IPINFO_BATCH_MAX]
-                    got = ipinfo_batch(chunk, api_key, DEFAULT_TIMEOUT)
-                    for ip in chunk:
-                        # Any IP the batch didn't answer falls back to a single
-                        # lookup, so a partial batch never leaves blank rows.
-                        scores[ip] = got.get(ip) or ipinfo_lookup(
-                            ip, api_key, DEFAULT_TIMEOUT)
-                    done += len(chunk)
-                    self.queue.put({"_status": f"Scored {min(done, unique_n)}/"
-                                    f"{unique_n} unique IP(s) "
-                                    f"(batch)..."})
-            if not use_batch and not self.stop_event.is_set():
-                # Stage 2 uses its OWN (lower) concurrency - these are direct
-                # reputation-API calls; too many at once connection-fails IPinfo.
+            ipinfo_precomputed = {}
+            if use_batch and provider in ("IPinfo", AGGREGATE_PROVIDER):
+                self.queue.put({"_status": f"Batch-resolving IPinfo for "
+                                f"{unique_n} unique IP(s)..."})
+                ipinfo_precomputed = ipinfo_batch_all(unique, ipinfo_key,
+                                                      DEFAULT_TIMEOUT)
+            if provider == "IPinfo" and use_batch:
+                scores = dict(ipinfo_precomputed)
+            elif not self.stop_event.is_set():
+                # Stage 2's general pool: spamhaus + whatever providers aren't
+                # already resolved via batch. Concurrency is generous here
+                # because proxycheck.io self-paces to its own documented
+                # per-second limit via _proxycheck_limiter, and IPinfo (the
+                # provider that used to need protecting) is pre-fetched above.
                 score_workers = min(get_score_workers(), max(1, unique_n))
                 with ThreadPoolExecutor(max_workers=score_workers) as pool:
-                    futs = {pool.submit(score_ip, ip, provider, api_key,
-                                        DEFAULT_TIMEOUT, breaker): ip
+                    if provider == AGGREGATE_PROVIDER:
+                        futs = {pool.submit(
+                            score_ip, ip, provider, api_key, DEFAULT_TIMEOUT,
+                            breaker,
+                            ({"IPinfo": ipinfo_precomputed[ip]}
+                             if ip in ipinfo_precomputed else None)): ip
                             for ip in unique}
+                    else:
+                        futs = {pool.submit(score_ip, ip, provider, api_key,
+                                            DEFAULT_TIMEOUT, breaker): ip
+                                for ip in unique}
                     done = 0
                     for fut in futs:
                         ip = futs[fut]
@@ -5461,7 +5553,9 @@ class SettingsTab(ttk.Frame):
         self._help("Concurrency and timeouts are tuned for maximum throughput "
                    "and hard-coded - the liveness sweep runs up to ~1,200 "
                    "connections at once, the full/exit-IP path 500, and "
-                   "reputation lookups 100. Nothing to adjust.", r)
+                   "reputation lookups 400 (IPinfo batches separately at "
+                   "1,000/request; proxycheck.io self-paces to its own "
+                   "documented per-second limit). Nothing to adjust.", r)
         r += 1
 
         # Auto-save: any edit persists after a short debounce, so a forgotten
