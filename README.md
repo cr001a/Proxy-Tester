@@ -51,13 +51,16 @@ Four tabs:
    now samples the first few lookups and, if the resolver is clearly being
    refused, skips the rest of the run and says so instead of burning a DNS
    round-trip per unique IP to collect nothing. An optional
-   **Speed gate** runs a **two-stage funnel**: a connect-only pre-filter first
-   (same idea as the Proxy Tester's Liveness mode) kills unreachable proxies in
-   one cheap RTT before they ever pay for the full exit-IP request, so a
-   dead-heavy list resolves far faster; exit-IP resolution then times each
-   surviving proxy against the *neutral* `ipinfo.io/json` endpoint (**no
-   retailer is ever contacted during scanning**), and the *paid* reputation
-   lookup runs
+   **Speed gate** runs a **two-stage funnel**. Stage 1 resolves each proxy's
+   exit IP against the *neutral* `ipinfo.io/json` endpoint (**no retailer is
+   ever contacted during scanning**) in a **single connection** — TCP →
+   `CONNECT` tunnel → TLS → GET — with **staged timeouts**: a short budget on
+   the connect/tunnel phase so dead proxies fail fast, a longer one on the
+   request itself. (This replaced a two-pass design that opened a throwaway
+   `CONNECT` probe, closed it, then redialled the same proxy from scratch; the
+   probe only ever saved time on *dead* proxies, so on a mostly-live list —
+   a real 20k run measured 92% alive — it was a wasted round trip on nearly
+   every proxy.) The *paid* reputation lookup then runs
    **only on proxies that resolved under your millisecond threshold** — so a
    slow proxy never costs an API call. (The actual retailer latency test is your
    deliberate final step on the vetted list — use the Proxy Tester tab with the

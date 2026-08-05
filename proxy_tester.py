@@ -60,7 +60,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "4.6"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "4.7"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1368,10 +1368,52 @@ def _merge_signals(dicts):
     return merged
 
 
-def discover_exit_ip(proxy, timeout=DEFAULT_TIMEOUT, stop_event=None):
-    """Route through a proxy to learn its public exit IP (and latency). This is
-    the only step that touches your proxy credentials - they go to the proxy
-    server only, never to any reputation API."""
+def _read_http_body(sock, cap=65536):
+    """Read a whole 'Connection: close' HTTP response off a socket and return
+    (status_code, body_bytes). Handles chunked transfer-encoding, since we're
+    speaking HTTP directly instead of going through urllib."""
+    buf = b""
+    while len(buf) < cap:
+        try:
+            chunk = sock.recv(8192)
+        except socket.timeout:
+            break
+        if not chunk:
+            break
+        buf += chunk
+    head, _, body = buf.partition(b"\r\n\r\n")
+    first = head.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+    parts = first.split(None, 2)          # "HTTP/1.1 200 OK"
+    code = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else None
+    if b"chunked" in head.lower():
+        out, rest = b"", body
+        while rest:
+            ln, _, rest = rest.partition(b"\r\n")
+            try:
+                size = int(ln.strip().split(b";")[0] or b"0", 16)
+            except ValueError:
+                break
+            if size <= 0:
+                break
+            out += rest[:size]
+            rest = rest[size:].lstrip(b"\r\n")
+        body = out
+    return code, body
+
+
+def discover_exit_ip_direct(proxy, connect_timeout, read_timeout,
+                            stop_event=None):
+    """Resolve a proxy's exit IP in ONE connection: TCP -> CONNECT tunnel ->
+    TLS -> GET -> body, with a SHORT timeout on the connect/tunnel phase and a
+    longer one on the request phase.
+
+    This replaces a two-pass approach that opened a throwaway CONNECT probe to
+    prove the proxy was alive, closed it, then dialed the SAME proxy again from
+    scratch to do the real request. That probe only ever saved time on DEAD
+    proxies; for a live one it was an entirely wasted round trip - and on a
+    mostly-live list (a real run measured 92% alive) that overhead landed on
+    almost every proxy. Staging the timeouts on a single connection keeps the
+    fast-fail for dead proxies AND drops the extra handshake for live ones."""
     host, port = proxy["host"], proxy["port"]
     user, pw = proxy["user"], proxy["pw"]
     display = (f"{host}:{port}:{user}:****" if user and pw is not None
@@ -1382,13 +1424,74 @@ def discover_exit_ip(proxy, timeout=DEFAULT_TIMEOUT, stop_event=None):
            "status": "stopped"}
     if stop_event is not None and stop_event.is_set():
         return out
-    r = do_request(build_proxy_url(host, port, user, pw), IPINFO_URL, timeout)
-    if not r["ok"]:
-        return {**out, "status": response_label(r)}
-    ip = _parse_json_field(r["body"], "ip")
-    if not ip:
-        return {**out, "status": "no exit ip"}
-    return {**out, "exit_ip": ip, "ping": r["ms"], "status": "OK"}
+    try:
+        p_port = int(port)
+    except (TypeError, ValueError):
+        return {**out, "status": "bad proxy port"}
+
+    thost, tport = LIVENESS_TARGET
+    req = f"CONNECT {thost}:{tport} HTTP/1.1\r\nHost: {thost}:{tport}\r\n"
+    if user and pw is not None:
+        token = base64.b64encode(
+            f"{user}:{pw}".encode("utf-8")).decode("ascii")
+        req += f"Proxy-Authorization: Basic {token}\r\n"
+    req += "\r\n"
+
+    start = time.perf_counter()
+    sock = tls = None
+    try:
+        # --- phase 1: TCP + CONNECT tunnel, on the SHORT timeout ---
+        sock = socket.create_connection((host, p_port), timeout=connect_timeout)
+        sock.settimeout(connect_timeout)
+        sock.sendall(req.encode("ascii"))
+        buf = b""
+        while b"\r\n\r\n" not in buf and len(buf) < 4096:
+            chunk = sock.recv(256)
+            if not chunk:
+                break
+            buf += chunk
+        line = buf.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+        parts = line.split(None, 2)
+        code = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else None
+        if code != 200:
+            return {**out, "status": _fast_status(code, None)}
+
+        # --- phase 2: TLS + GET, on the LONGER timeout ---
+        if stop_event is not None and stop_event.is_set():
+            return out
+        sock.settimeout(read_timeout)
+        if SSL_CTX is None:
+            return {**out, "status": "no tls context"}
+        tls = SSL_CTX.wrap_socket(sock, server_hostname=thost)
+        tls.sendall(
+            (f"GET /json HTTP/1.1\r\nHost: {thost}\r\n"
+             f"User-Agent: {USER_AGENT}\r\nAccept: application/json\r\n"
+             "Connection: close\r\n\r\n").encode("ascii"))
+        http_code, body = _read_http_body(tls)
+        ms = (time.perf_counter() - start) * 1000.0
+        if http_code is None:
+            return {**out, "status": "bad response"}
+        if http_code != 200:
+            return {**out, "status": f"HTTP {http_code}"}
+        ip = _parse_json_field(body, "ip")
+        if not ip:
+            return {**out, "status": "no exit ip"}
+        return {**out, "exit_ip": ip, "ping": ms, "status": "OK"}
+    except socket.timeout:
+        return {**out, "status": "timeout"}
+    except ssl.SSLError:
+        return {**out, "status": "tls failed"}
+    except OSError:
+        return {**out, "status": "unreachable"}
+    except Exception:
+        return {**out, "status": "error"}
+    finally:
+        for s in (tls, sock):
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:
+                    pass
 
 
 def _configured_lookups():
@@ -1805,6 +1908,11 @@ FULL_MODE = "Full (exit IP + geo)"
 DEFAULT_FAST_TIMEOUT = 5      # seconds - a CONNECT is one RTT; 5s spares slow
                              # residential/mobile gateways without holding a
                              # dead proxy for the full 15s.
+# Read/TLS phase budget for the single-pass exit-IP resolver. The connect+
+# tunnel phase uses the shorter get_fast_timeout(); a proxy whose tunnel opens
+# quickly but then stalls this long on a tiny JSON GET is an overloaded exit,
+# not worth holding a worker for.
+EXIT_IP_READ_TIMEOUT = 9
 
 
 def get_fast_workers():
@@ -5078,12 +5186,13 @@ class QualityTab(ttk.Frame):
                 "status": status}
 
     def _run_pool(self, proxies, provider, api_key, gate_ms=None):
-        """Two-stage funnel. Stage 1: resolve each proxy's exit IP (this hits
-        the NEUTRAL ipinfo.io/json, never a retailer, and gives a free latency).
-        Speed gate (optional): a proxy that resolved slower than the threshold is
-        shown but NOT scored. Stage 2: score each UNIQUE surviving exit IP once
-        (dedupe). The retailer test is a separate deliberate final step."""
-        workers = get_workers()
+        """Two-stage funnel. Stage 1: resolve each proxy's exit IP in ONE
+        connection (this hits the NEUTRAL ipinfo.io/json, never a retailer, and
+        gives a free latency). Speed gate (optional): a proxy that resolved
+        slower than the threshold is shown but NOT scored. Stage 2: score each
+        UNIQUE surviving exit IP once (dedupe), bulk-querying every provider
+        that offers a batch endpoint. The retailer test is a separate
+        deliberate final step."""
         resolved = unique_n = gated_out = 0
         provider_err, err_ct = "", 0
         prov_status = []
@@ -5093,58 +5202,22 @@ class QualityTab(ttk.Frame):
         # different network may have disabled it).
         _spamhaus_guard.reset()
         try:
-            # --- Stage 1a: connect-only pre-filter (cheap, very wide) ---
-            # A dead proxy costs the FULL do_request timeout (TLS+GET+body) if
-            # it goes straight into stage 1b, held by one of only `workers`
-            # (500) full-path slots. A CONNECT-only probe answers "is this
-            # proxy even reachable" in one RTT at ~1,200-wide concurrency and a
-            # short timeout, so the dead majority of a huge list never touches
-            # the expensive path at all. Same target host as stage 1b's GET
-            # (ipinfo.io:443), so a pass here means the real request can follow.
+            # --- Stage 1: resolve exit IPs in ONE pass per proxy ---
+            # This used to be two passes: a throwaway CONNECT probe to prove
+            # the proxy was alive, then a SECOND connection that redid
+            # DNS+TCP+CONNECT from scratch to make the real request. The probe
+            # only ever saved time on DEAD proxies - for a live one it was a
+            # wasted round trip, and a real 20k run measured 92% alive, so that
+            # overhead landed on almost the whole list.
+            # discover_exit_ip_direct does both on ONE connection with STAGED
+            # timeouts (short for connect+tunnel, longer for TLS+GET), keeping
+            # the dead-proxy fast-fail without paying the extra handshake.
             discoveries = []
-            alive = []
-            thost, tport = LIVENESS_TARGET
+            connect_to, read_to = get_fast_timeout(), EXIT_IP_READ_TIMEOUT
             with ThreadPoolExecutor(max_workers=get_fast_workers()) as pool:
-                futs = {pool.submit(proxy_connect_ping, p, thost, tport,
-                                    get_fast_timeout()): p for p in proxies}
-                done = 0
-                for fut, p in futs.items():
-                    display = (f"{p['host']}:{p['port']}:{p['user']}:****"
-                              if p.get("user") and p.get("pw") is not None
-                              else f"{p['host']}:{p['port']}")
-                    full = (f"{p['host']}:{p['port']}:{p['user']}:{p['pw']}"
-                           if p.get("user") and p.get("pw") is not None
-                           else display)
-                    try:
-                        ms, code, err = fut.result()
-                    except Exception as e:
-                        ms, code, err = None, None, str(e)[:60]
-                    if code == 200:
-                        alive.append(p)
-                    else:
-                        discoveries.append({
-                            "proxy": display, "full": full, "exit_ip": "",
-                            "ping": None, "status": _fast_status(code, err)})
-                    done += 1
-                    if done % 200 == 0:
-                        self.queue.put({"_status":
-                                        f"Pre-filtering {done}/{len(proxies)} "
-                                        f"({len(alive)} reachable so far)..."})
-            self.queue.put({"_status":
-                            f"Pre-filter kept {len(alive)}/{len(proxies)} "
-                            "reachable proxies - resolving exit IPs..."})
-
-            # --- Stage 1b: resolve exit IPs on the SURVIVORS only ---
-            # Shorter timeout than the global default: the pre-filter already
-            # proved each of these opens its CONNECT tunnel within
-            # get_fast_timeout() (5s). A proxy that stalls well past that on
-            # top of a fast CONNECT - for a small GET with a tiny JSON body -
-            # is a low-quality/overloaded exit; holding a worker for the full
-            # 15s on it just delays every proxy behind it in the queue.
-            EXIT_IP_TIMEOUT = 9
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futs = {pool.submit(discover_exit_ip, p, EXIT_IP_TIMEOUT,
-                                    self.stop_event): p for p in alive}
+                futs = {pool.submit(discover_exit_ip_direct, p, connect_to,
+                                    read_to, self.stop_event): p
+                        for p in proxies}
                 done = 0
                 for fut in futs:
                     try:
@@ -5156,10 +5229,11 @@ class QualityTab(ttk.Frame):
                              "full": f"{p['host']}:{p['port']}"}
                     discoveries.append(d)
                     done += 1
-                    if done % 25 == 0:
+                    if done % 200 == 0:
+                        live_n = sum(1 for x in discoveries if x.get("exit_ip"))
                         self.queue.put({"_status":
-                                        f"Resolved {done}/{len(alive)} "
-                                        "exit IPs..."})
+                                        f"Resolving {done}/{len(proxies)} "
+                                        f"({live_n} live so far)..."})
 
             # --- Speed gate: mark OK-but-slow proxies (kept out of scoring) ---
             if gate_ms is not None:
