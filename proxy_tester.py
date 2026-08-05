@@ -60,7 +60,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "4.0"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "4.1"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -488,6 +488,21 @@ def _parse_json_field(body, field):
 
 def _fmt_ms(value):
     return f"{value:.0f}" if value is not None else "-"
+
+
+def _fmt_elapsed(seconds):
+    """Human wall-clock duration for a finished run's status line, e.g. '850ms',
+    '12.3s', '4m 07s', '1h 02m'. Precise enough to actually compare runs."""
+    s = max(0.0, seconds)
+    if s < 1:
+        return f"{s * 1000:.0f}ms"
+    if s < 60:
+        return f"{s:.1f}s"
+    m, rem = divmod(int(s), 60)
+    if m < 60:
+        return f"{m}m {rem:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m"
 
 
 # --------------------------------------------------------------------------- #
@@ -3320,6 +3335,7 @@ class ProxyTab(ttk.Frame):
         self._tested = self._live = 0
         self._count_cfg = ("Tested", "live", "dead")
         self._ping_mode = None
+        self._run_started = time.perf_counter()
         self.status_lbl.config(text=f"Testing 0/{len(proxies)}...")
 
         worker = threading.Thread(
@@ -3511,6 +3527,7 @@ class ProxyTab(ttk.Frame):
         self.ping_btn.config(text="Stop", style="Stop.TButton",
                              command=self.on_stop)
         self._ping_mode = "proxy" if via_proxy else "direct"
+        self._run_started = time.perf_counter()
         if via_proxy:
             self._run_total = len(proxies)
             self._tested = self._live = 0
@@ -3563,17 +3580,23 @@ class ProxyTab(ttk.Frame):
         self.ping_btn.config(text="Ping site", style="TButton",
                              command=self.on_ping_site, state="normal")
         base = "Stopped" if stopped else "Done"
+        elapsed_s = (time.perf_counter()
+                    - getattr(self, "_run_started", time.perf_counter()))
+        elapsed = _fmt_elapsed(elapsed_s)
         if getattr(self, "_ping_mode", None) == "proxy":
             # Summarise the CONNECT-tunnel ping run from the live counters.
             ok, total = self._live, self._tested
+            rate = f", {total / max(elapsed_s, 0.001):.0f}/s" if not stopped else ""
             self.status_lbl.config(
-                text=f"{base} - {total} pinged, {ok} reachable, "
-                     f"{total - ok} failed")
+                text=f"{base} in {elapsed} - {total} pinged, {ok} reachable, "
+                     f"{total - ok} failed{rate}")
         else:
             tested, alive = self._proxy_counts()
             dead = tested - alive
+            rate = f", {tested / max(elapsed_s, 0.001):.0f}/s" if not stopped else ""
             self.status_lbl.config(
-                text=f"{base} - {tested} tested, {alive} live, {dead} dead")
+                text=f"{base} in {elapsed} - {tested} tested, {alive} live, "
+                     f"{dead} dead{rate}")
         self._ping_mode = None
 
     def _proxy_counts(self):
@@ -4667,6 +4690,8 @@ class QualityTab(ttk.Frame):
         self._rows = []
         self.running = True
         self.stop_event.clear()
+        self._run_started = time.perf_counter()
+        self._run_total = len(proxies)
         self.run_btn.config(text="Stop", style="Stop.TButton",
                             command=self.on_stop)
         # The aggregate lists whichever keyed providers are active; a single
@@ -4720,11 +4745,51 @@ class QualityTab(ttk.Frame):
         prov_status = []
         overlap = None
         try:
-            # --- Stage 1: resolve exit IPs (neutral endpoint, free) ---
+            # --- Stage 1a: connect-only pre-filter (cheap, very wide) ---
+            # A dead proxy costs the FULL do_request timeout (TLS+GET+body) if
+            # it goes straight into stage 1b, held by one of only `workers`
+            # (500) full-path slots. A CONNECT-only probe answers "is this
+            # proxy even reachable" in one RTT at ~1,200-wide concurrency and a
+            # short timeout, so the dead majority of a huge list never touches
+            # the expensive path at all. Same target host as stage 1b's GET
+            # (ipinfo.io:443), so a pass here means the real request can follow.
             discoveries = []
+            alive = []
+            thost, tport = LIVENESS_TARGET
+            with ThreadPoolExecutor(max_workers=get_fast_workers()) as pool:
+                futs = {pool.submit(proxy_connect_ping, p, thost, tport,
+                                    get_fast_timeout()): p for p in proxies}
+                done = 0
+                for fut, p in futs.items():
+                    display = (f"{p['host']}:{p['port']}:{p['user']}:****"
+                              if p.get("user") and p.get("pw") is not None
+                              else f"{p['host']}:{p['port']}")
+                    full = (f"{p['host']}:{p['port']}:{p['user']}:{p['pw']}"
+                           if p.get("user") and p.get("pw") is not None
+                           else display)
+                    try:
+                        ms, code, err = fut.result()
+                    except Exception as e:
+                        ms, code, err = None, None, str(e)[:60]
+                    if code == 200:
+                        alive.append(p)
+                    else:
+                        discoveries.append({
+                            "proxy": display, "full": full, "exit_ip": "",
+                            "ping": None, "status": _fast_status(code, err)})
+                    done += 1
+                    if done % 200 == 0:
+                        self.queue.put({"_status":
+                                        f"Pre-filtering {done}/{len(proxies)} "
+                                        f"({len(alive)} reachable so far)..."})
+            self.queue.put({"_status":
+                            f"Pre-filter kept {len(alive)}/{len(proxies)} "
+                            "reachable proxies - resolving exit IPs..."})
+
+            # --- Stage 1b: resolve exit IPs on the SURVIVORS only ---
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 futs = {pool.submit(discover_exit_ip, p, DEFAULT_TIMEOUT,
-                                    self.stop_event): p for p in proxies}
+                                    self.stop_event): p for p in alive}
                 done = 0
                 for fut in futs:
                     try:
@@ -4738,7 +4803,7 @@ class QualityTab(ttk.Frame):
                     done += 1
                     if done % 25 == 0:
                         self.queue.put({"_status":
-                                        f"Resolved {done}/{len(proxies)} "
+                                        f"Resolved {done}/{len(alive)} "
                                         "exit IPs..."})
 
             # --- Speed gate: mark OK-but-slow proxies (kept out of scoring) ---
@@ -4902,10 +4967,15 @@ class QualityTab(ttk.Frame):
         prov_note = ""
         if info.get("prov_status"):
             prov_note = "  |  providers - " + "; ".join(info["prov_status"])
+        elapsed_s = (time.perf_counter()
+                    - getattr(self, "_run_started", time.perf_counter()))
+        elapsed = _fmt_elapsed(elapsed_s)
+        total = getattr(self, "_run_total", 0)
+        rate = f", {total / max(elapsed_s, 0.001):.0f}/s" if total else ""
         # Persistent summary so filtering never wipes the scored/dedupe counts.
         self._summary = ("Stopped" if stopped
-                         else f"Done - {scored} scored{dedup}{gate_note}"
-                              f"{err_note}{prov_note}")
+                         else f"Done in {elapsed}{rate} - {scored} scored"
+                              f"{dedup}{gate_note}{err_note}{prov_note}")
         # Same-pool warning: shown ONLY when two providers actually collided.
         self._overlap = info.get("overlap")
         note = overlap_summary(self._overlap or {})

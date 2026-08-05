@@ -40,13 +40,19 @@ Four tabs:
    connection per IP — the fix for the socket-exhaustion failures single-lookup
    mode hit at scale. Any IP a batch doesn't answer falls back to a single
    lookup, and the whole thing is a Settings toggle (on by default). An optional
-   **Speed gate** runs a **two-stage funnel**: exit-IP resolution already times
-   each proxy against the *neutral* `ipinfo.io/json` endpoint (**no retailer is
-   ever contacted during scanning**), and the *paid* reputation lookup runs
+   **Speed gate** runs a **two-stage funnel**: a connect-only pre-filter first
+   (same idea as the Proxy Tester's Liveness mode) kills unreachable proxies in
+   one cheap RTT before they ever pay for the full exit-IP request, so a
+   dead-heavy list resolves far faster; exit-IP resolution then times each
+   surviving proxy against the *neutral* `ipinfo.io/json` endpoint (**no
+   retailer is ever contacted during scanning**), and the *paid* reputation
+   lookup runs
    **only on proxies that resolved under your millisecond threshold** — so a
    slow proxy never costs an API call. (The actual retailer latency test is your
    deliberate final step on the vetted list — use the Proxy Tester tab with the
-   retailer as the test URL.) Results sort best-first; click any header to re-sort, filter by **min
+   retailer as the test URL.) Both this tab and the Proxy Tester report **how
+   long the run took and its rate** (e.g. `Done in 4m 07s, 812/s`) when finished.
+   Results sort best-first; click any header to re-sort, filter by **min
    trust**, and **copy selected** proxies straight to the clipboard (full
    `host:port:user:pass`). API keys live on the **Settings** tab; concurrency is
    hard-coded for maximum throughput (nothing to tune).
