@@ -60,7 +60,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "4.2"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "4.3"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -899,9 +899,11 @@ def proxycheck_lookup(ip, api_key, timeout=DEFAULT_TIMEOUT):
 
 def _ipinfo_parse(data):
     """Turn one IPinfo record into our score dict. Tolerant of BOTH schemas:
-    the newer /lookup/ shape (anonymous/as/mobile, with is_res_proxy) and the
-    classic shape returned by the /batch endpoint (privacy/asn|company/carrier).
-    Either way we pull the same proxy/vpn/tor/relay/hosting/mobile signals."""
+    the newer /lookup//batch shape (anonymous/as/mobile, with is_res_proxy,
+    is_anycast, is_satellite - confirmed against IPinfo's own Batch Enrichment
+    API docs) and the classic legacy shape (privacy/asn|company/carrier). Either
+    way we pull the same proxy/vpn/tor/relay/hosting/mobile/anycast/satellite
+    signals."""
     if not isinstance(data, dict):
         return {"_error": "IPinfo: no data"}
     # anonymous (new) vs privacy (classic)
@@ -932,27 +934,63 @@ def _ipinfo_parse(data):
     hosting = bool(data.get("is_hosting")) or _b("hosting")
     is_mobile = bool(data.get("is_mobile")) or bool(mob_o.get("carrier")
                                                     or mob_o.get("name"))
-    # Some tiers include the residential-proxy service name; keep it if present.
-    service = str(anon_o.get("service") or anon_o.get("res_proxy_service")
-                  or "").strip()
+    # An anycast IP is never a genuine home connection - it's always CDN/global-
+    # accelerator/infra address space, even on ranges not flagged 'hosting'.
+    # A "residential" exit sitting on anycast space is close to a hard tell.
+    is_anycast = bool(data.get("is_anycast"))
+    # Satellite ISPs (Starlink etc.) are legitimate consumer connections, but
+    # behave very differently - much higher/variable latency, coarse geo,
+    # often CGNAT-shared - so they get their own Type rather than hiding inside
+    # generic Residential/ISP.
+    is_satellite = bool(data.get("is_satellite"))
+    # 'name' is the confirmed new-schema field for a detected proxy/VPN/resi-
+    # proxy service; keep the older guesses too in case a legacy record uses
+    # them.
+    service = str(anon_o.get("name") or anon_o.get("service")
+                  or anon_o.get("res_proxy_service") or "").strip()
     carrier_name = str(mob_o.get("carrier") or mob_o.get("name") or "").strip()
+    # When IPinfo last confirmed a positive detection - lets you weigh a flag
+    # seen yesterday differently from one seen a year ago.
+    last_seen = str(anon_o.get("last_seen") or "").strip()
+    hostname = str(data.get("hostname") or "").strip()
 
+    # Confirmed real values (IPinfo's own Batch Enrichment API examples):
+    # isp, business, hosting, education, government. There is no 'residential'
+    # value - a residential/ISP exit is inferred from org_type=='isp' plus no
+    # anonymity flags.
     org_type = (as_o.get("type") or "").lower()
     anon = res_proxy or proxy or vpn or tor or relay
     if res_proxy or proxy:
         fraud = 90                      # a proxy exit -> burnt
     elif vpn or tor or relay:
         fraud = 85
+    elif org_type in ("government", "education"):
+        # An exit resolving to an institutional network is not residential at
+        # all - either mislabeled or a compromised/hijacked host. Previously
+        # fell through to the clean-residential branch (fraud 5), which was
+        # simply wrong.
+        fraud = 80
     elif hosting or org_type == "hosting":
         fraud = 60                      # datacenter / hosting
     else:
         fraud = 5                       # clean residential / ISP / mobile
+    if is_anycast:
+        # Independent hard floor - anycast overrides a lower score from any
+        # branch above, but never LOWERS a worse one (e.g. res_proxy + anycast
+        # stays at least this bad).
+        fraud = max(fraud, 95)
     if res_proxy:
         conn = "Residential proxy"
     elif is_mobile:
         conn = "Mobile"
     elif hosting or org_type == "hosting":
         conn = "Datacenter"
+    elif org_type == "government":
+        conn = "Government"
+    elif org_type == "education":
+        conn = "Education"
+    elif is_satellite:
+        conn = "Satellite"
     elif org_type == "isp":
         conn = "Residential/ISP"
     elif org_type == "business":
@@ -963,19 +1001,33 @@ def _ipinfo_parse(data):
     extra = []
     if res_proxy:
         extra.append("residential proxy")
+    if is_anycast:
+        extra.append("anycast")
     if service:
         extra.append(service.lower())
     if carrier_name:
         extra.append(carrier_name.lower())
+    if anon and last_seen:
+        # Only meaningful attached to an actual positive detection - a clean
+        # IP has no 'last seen doing something bad' to report.
+        extra.append(f"seen {last_seen}")
+    if org_type == "isp" and not is_mobile and not anon and not hostname:
+        # Weak, non-scored anomaly: genuine WIRED residential ISPs almost
+        # always have descriptive rDNS (pool-x.isp.net etc.), so a bare
+        # ISP-typed IP with none is a mild oddity worth a soft tag. Excluded
+        # for mobile: cellular CGNAT gateways commonly have no rDNS at all as
+        # a normal thing, so the same absence there carries no signal.
+        extra.append("no rdns")
     return {
         "fraud_score": fraud,
         "connection_type": conn,        # Mobile / Residential proxy / DC / ...
         "proxy": anon,
         "vpn": vpn,
         "tor": tor,
-        "recent_abuse": res_proxy or proxy,
+        "recent_abuse": res_proxy or proxy or is_anycast,
         "bot_status": False,
         "isp": org,
+        "hostname": hostname,
         "country": geo_o.get("country_code") or geo_o.get("country", ""),
         "flag_extra": list(dict.fromkeys(extra)),   # deduped, order-preserved
     }
@@ -4543,6 +4595,9 @@ def open_generate_dialog(parent, text_widget):
     make_modal(top)
 
 
+DEFAULT_MIN_TRUST = 92   # default display floor - the healthy majority shows
+                        # after a run; clear/lower the box to see the rest.
+
 # Trust-range buckets for the Trust header filter (label, predicate on trust).
 TRUST_BUCKETS = [
     ("90-100", lambda t: isinstance(t, int) and 90 <= t <= 100),
@@ -4660,6 +4715,15 @@ class QualityTab(ttk.Frame):
         ttk.Checkbutton(btns, text="Unique exit IPs only",
                         variable=self._unique_only,
                         command=self._render_rows).pack(side="left", padx=(4, 0))
+        # Default view is the healthy majority - only Trust >= this shows after
+        # a run. Clear the box (or lower it) to reveal the poorer proxies;
+        # nothing is discarded, this only changes what's displayed.
+        ttk.Label(btns, text="Min trust").pack(side="left", padx=(10, 4))
+        self.min_trust = tk.StringVar(value=str(DEFAULT_MIN_TRUST))
+        min_trust_entry = ttk.Entry(btns, textvariable=self.min_trust, width=4)
+        min_trust_entry.pack(side="left")
+        min_trust_entry.bind("<Return>", lambda e: self._render_rows())
+        min_trust_entry.bind("<FocusOut>", lambda e: self._render_rows())
         ttk.Label(btns, text="Filter Type / Trust from headers ▾",
                   style="Muted.TLabel").pack(side="left", padx=(8, 0))
         self.sel_lbl = ttk.Label(btns, text="", style="Muted.TLabel")
@@ -5174,6 +5238,20 @@ class QualityTab(ttk.Frame):
         shows live paint progress and only flips to the final summary once every
         row is actually on screen."""
         rows = getattr(self, "_rows", [])
+        # Min-trust floor: the default view after a run. Blank the box (or
+        # lower it) to reveal poorer proxies - nothing is discarded, only the
+        # display changes, same as every other filter here.
+        min_trust = None
+        raw_mt = (self.min_trust.get() or "").strip()
+        if raw_mt:
+            try:
+                min_trust = max(0, min(100, int(raw_mt)))
+            except (TypeError, ValueError):
+                min_trust = None
+            if min_trust is not None:
+                rows = [r for r in rows
+                        if isinstance(r.get("trust"), int)
+                        and r["trust"] >= min_trust]
         if self._trust_buckets:
             preds = [p for (lbl, p) in TRUST_BUCKETS
                      if lbl in self._trust_buckets]
@@ -5208,6 +5286,8 @@ class QualityTab(ttk.Frame):
         filt = []
         if unique_only:
             filt.append("unique IPs")
+        if min_trust is not None:
+            filt.append(f"trust≥{min_trust}")
         if gate_ms is not None:
             filt.append(f"≤{gate_ms}ms")
         if self._trust_buckets:

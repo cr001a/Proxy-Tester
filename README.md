@@ -57,10 +57,25 @@ Four tabs:
    deliberate final step on the vetted list — use the Proxy Tester tab with the
    retailer as the test URL.) Both this tab and the Proxy Tester report **how
    long the run took and its rate** (e.g. `Done in 4m 07s, 812/s`) when finished.
-   Results sort best-first; click any header to re-sort, filter by **min
-   trust**, and **copy selected** proxies straight to the clipboard (full
-   `host:port:user:pass`). API keys live on the **Settings** tab; concurrency is
-   hard-coded for maximum throughput (nothing to tune).
+   Results sort best-first; click any header to re-sort. A **Min trust** box
+   (default **92**) shows only the healthy majority after a run — nothing is
+   discarded, it's a display filter, so blank the box (or lower it) to reveal
+   the poorer proxies too, stacking with the header Type/Trust filters. **Copy
+   selected** proxies straight to the clipboard (full `host:port:user:pass`).
+   API keys live on the **Settings** tab; concurrency is hard-coded for maximum
+   throughput (nothing to tune).
+
+   **Scoring detail (IPinfo).** Verified against IPinfo's own Batch Enrichment
+   API docs: an exit resolving to a **government or education** network now
+   scores as a real red flag (previously fell through to clean-Residential,
+   which was wrong) — an "education"/"government"-typed ASN is not a home
+   connection. An **anycast** IP is treated as a near-certain non-residential
+   tell (anycast address space is never a genuine home connection) and floors
+   Trust hard. **Satellite** ISPs (Starlink etc.) get their own Type instead of
+   hiding inside generic Residential — legitimate, but operationally different
+   (much higher/variable latency, coarse geolocation). A confirmed positive
+   detection also carries **when IPinfo last saw it** (e.g. `seen 2026-03-24`),
+   so a stale flag can be weighed differently from a fresh one.
 
    **Pool-overlap detection.** Because every exit IP is resolved anyway, the tab
    also checks whether *two different providers handed back the same exit IP* —
