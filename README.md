@@ -48,8 +48,8 @@ Four tabs:
    deliberate final step on the vetted list — use the Proxy Tester tab with the
    retailer as the test URL.) Results sort best-first; click any header to re-sort, filter by **min
    trust**, and **copy selected** proxies straight to the clipboard (full
-   `host:port:user:pass`). API keys and worker concurrency live on the
-   **Settings** tab.
+   `host:port:user:pass`). API keys live on the **Settings** tab; concurrency is
+   hard-coded for maximum throughput (nothing to tune).
 
    **Pool-overlap detection.** Because every exit IP is resolved anyway, the tab
    also checks whether *two different providers handed back the same exit IP* —
@@ -330,9 +330,9 @@ status (`200` reachable, `407` auth, `502`/`504` upstream). Pick a single site
 - Requests use `urllib.request` with a `ProxyHandler` (standard library).
 - Tests run on a background thread with a `ThreadPoolExecutor` so the GUI never
   freezes; results are marshalled back to the table via a thread-safe queue.
-  Worker count comes from **Settings ▸ Concurrency** (default 40); the Proxy
-  Tester floors it at 40 for large lists so a run isn't throttled by a low
-  saved value. Raise it for more parallelism.
+  Concurrency is **tuned for maximum throughput and hard-coded** — no knobs to
+  get wrong: the connect-only liveness sweep runs up to ~1,200 connections at
+  once, the full/exit-IP path 500, and reputation lookups 100.
 - **Fail-fast:** on the Proxy Tester tab, a proxy whose first request fails at
   the connection level (timeout / refused / tunnel failure) is marked dead
   immediately instead of retrying every run — so dead proxies no longer hold a
