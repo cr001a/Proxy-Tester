@@ -281,7 +281,17 @@ landed on.
 ## Tab 2: Proxy Tester
 
 Paste proxies one per line as `host:port:user:pass` (or `host:port` for no
-auth). Set any test URL. Each proxy is tested N times.
+auth). Each proxy is tested N times, in one of two **Test modes**:
+
+- **Liveness (fast)** — *default, built for huge lists.* Opens one HTTP
+  `CONNECT` tunnel per proxy to a neutral host and times the round-trip to
+  `200 Connection established` — no TLS-to-target, no HTTP GET, no body. It runs
+  at much higher concurrency (up to ~1200 workers) with a short, configurable
+  connect timeout (**Settings ▸ Liveness connect timeout**, default 5s), so a
+  200k list finishes in minutes instead of tens of minutes. It proves the tunnel
+  opens, *not* that egress works or what the exit IP is; the Test URL is ignored.
+- **Full (exit IP + geo)** — the original per-proxy `GET` to the Test URL;
+  slower, but harvests exit IP, ASN and location. Use it on a vetted shortlist.
 
 Results table: `Proxy | Status | HTTP code | Median ms | Success (n/N) |
 Exit IP`. The exit IP is parsed from the `ip` field if the response is JSON.

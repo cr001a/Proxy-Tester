@@ -60,7 +60,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "3.98"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "3.99"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1458,6 +1458,34 @@ def get_workers():
     return max(1, min(MAX_WORKERS_CAP, n))
 
 
+# The connect-only liveness path (ProxyTab "Liveness (fast)" mode) does one
+# CONNECT handshake per proxy - no TLS-to-target, no GET, no body - so it can
+# run far wider than the full-GET cap. Capped conservatively: past ~1500 you're
+# GIL/context-switch-bound and hit ephemeral-port/TIME_WAIT churn on Windows.
+FAST_WORKERS_CAP = 1200
+FAST_MIN_WORKERS = 200
+FAST_MODE = "Liveness (fast)"
+FULL_MODE = "Full (exit IP + geo)"
+DEFAULT_FAST_TIMEOUT = 5      # seconds - a CONNECT is one RTT; 5s spares slow
+                             # residential/mobile gateways without holding a
+                             # dead proxy for the full 15s.
+
+
+def get_fast_workers():
+    """Worker count for the connect-only liveness path - scales up from the
+    saved concurrency but is capped higher than the full-GET path."""
+    return min(FAST_WORKERS_CAP, max(get_workers() * 2, FAST_MIN_WORKERS))
+
+
+def get_fast_timeout():
+    """Connect timeout (seconds) for the liveness path, from Settings."""
+    try:
+        n = int(load_setting("fast_connect_timeout", DEFAULT_FAST_TIMEOUT))
+    except (TypeError, ValueError):
+        n = DEFAULT_FAST_TIMEOUT
+    return max(1, min(30, n))
+
+
 DEFAULT_SCORE_WORKERS = 100   # reputation-lookup concurrency (IP Quality stage 2)
 MAX_SCORE_WORKERS = 200
 
@@ -2391,6 +2419,88 @@ def test_proxy(proxy, url, runs, timeout, stop_event=None):
     }
 
 
+# Neutral CONNECT target for the liveness probe - never a retailer, so no
+# bot-defence engages. The tunnel opening (or not) is the liveness signal.
+LIVENESS_TARGET = ("ipinfo.io", 443)
+
+
+def _fast_status(code, err):
+    """A short status label for a connect-only probe outcome."""
+    if code == 407:
+        return "auth failed (407)"
+    if code in (502, 504):
+        return "upstream error"
+    if code:
+        return f"HTTP {code}"
+    if err == "timeout":
+        return "timeout"
+    return "unreachable"
+
+
+def test_proxy_fast(proxy, runs, timeout, stop_event=None):
+    """Connect-only liveness + latency: open an HTTP CONNECT tunnel through the
+    proxy to a neutral host:port and time the round-trip to '200 Connection
+    established'. No TLS to the target, no HTTP request, no body read - far
+    cheaper than a full GET, which is what makes huge lists fast. It proves the
+    tunnel opens, NOT that egress works or what the exit IP is; use Full mode
+    for the exit IP. Same result shape as test_proxy (exit_ip/org/location
+    blank)."""
+    host, port, user, pw = proxy["host"], proxy["port"], proxy["user"], proxy["pw"]
+    if user and pw is not None:
+        display = f"{host}:{port}:{user}:****"
+        full = f"{host}:{port}:{user}:{pw}"
+    else:
+        display = f"{host}:{port}"
+        full = display
+
+    thost, tport = LIVENESS_TARGET
+    latencies = []
+    successes = attempts = 0
+    last_code = None
+    labels = []
+    for _ in range(runs):
+        if stop_event is not None and stop_event.is_set():
+            break
+        attempts += 1
+        ms, code, err = proxy_connect_ping(proxy, thost, tport, timeout)
+        if code is not None:
+            last_code = code
+        if ms is not None and code == 200:
+            successes += 1
+            latencies.append(ms)
+        else:
+            labels.append(_fast_status(code, err))
+            # Fail-fast: a connection-level failure (no HTTP code at all) with
+            # no success yet means the proxy is dead - don't pay another full
+            # timeout. A 407/502 is an answer, so those still run every time.
+            if code is None and successes == 0:
+                break
+
+    interrupted = stop_event is not None and stop_event.is_set()
+    if successes > 0:
+        status = "OK"
+    elif interrupted and not labels:
+        status = "stopped"
+    elif labels:
+        status = Counter(labels).most_common(1)[0][0]
+    else:
+        status = "no response"
+
+    return {
+        "proxy": display,
+        "full": full,
+        "status": status,
+        "code": str(last_code) if last_code is not None else "-",
+        "median": statistics.median(latencies) if latencies else None,
+        "success": successes,
+        "runs": attempts,
+        "exit_ip": "",
+        "org": "",
+        "location": "",
+        "reason": "",
+    }
+
+
 # --------------------------------------------------------------------------- #
 # GUI
 # --------------------------------------------------------------------------- #
@@ -3011,12 +3121,27 @@ class ProxyTab(ttk.Frame):
         self.url = tk.StringVar(value="https://ipinfo.io/json")
         self.runs = tk.StringVar(value="1")
 
+        # Test mode. Liveness (fast) is connect-only - one CONNECT handshake per
+        # proxy, no TLS/GET/body - so it blazes through huge lists but only
+        # proves the tunnel opens. Full does the exit-IP GET (slower, richer).
+        self.test_mode = tk.StringVar(value=FAST_MODE)
+        ttk.Label(form, text="Test mode").grid(row=0, column=1, sticky="w")
+        self.mode_cb = ttk.Combobox(
+            form, textvariable=self.test_mode, state="readonly", width=22,
+            values=[FAST_MODE, FULL_MODE])
+        self.mode_cb.grid(row=0, column=2, sticky="w", pady=3)
+        self.mode_cb.bind("<<ComboboxSelected>>", self._on_mode_change)
+
         ttk.Label(form, text="Test URL").grid(row=1, column=1, sticky="w")
-        ttk.Entry(form, textvariable=self.url, width=40).grid(
-            row=1, column=2, sticky="w", pady=3)
+        self.url_entry = ttk.Entry(form, textvariable=self.url, width=40)
+        self.url_entry.grid(row=1, column=2, sticky="w", pady=3)
         ttk.Label(form, text="Runs per proxy").grid(row=2, column=1, sticky="w")
         ttk.Entry(form, textvariable=self.runs, width=6).grid(
             row=2, column=2, sticky="w", pady=3)
+        # Muted hint that explains what the current mode measures.
+        self.mode_hint = ttk.Label(form, text="", style="Muted.TLabel")
+        self.mode_hint.grid(row=3, column=1, columnspan=2, sticky="w")
+        self._on_mode_change()
 
         btns = ttk.Frame(self)
         btns.pack(fill="x", pady=(12, 4))
@@ -3145,16 +3270,34 @@ class ProxyTab(ttk.Frame):
         self.url.set(d.get("url", "https://ipinfo.io/json"))
         self.runs.set(d.get("runs", "1"))
 
+    def _on_mode_change(self, _event=None):
+        """Fast mode is connect-only, so the Test URL doesn't apply - grey it
+        out and swap the hint text so it's clear what each mode measures."""
+        fast = self.test_mode.get() == FAST_MODE
+        try:
+            self.url_entry.config(state="disabled" if fast else "normal")
+        except Exception:
+            pass
+        self.mode_hint.config(
+            text=("Connect-only: opens a CONNECT tunnel per proxy - fast, but "
+                  "no exit IP (URL ignored)."
+                  if fast else
+                  "Full GET to the Test URL - slower; harvests exit IP, ASN "
+                  "and location."))
+
     def on_run(self):
         if self.running:
             return
+        fast = self.test_mode.get() == FAST_MODE
         url = self.url.get().strip()
         try:
             runs = max(1, int(self.runs.get().strip()))
         except ValueError:
             messagebox.showerror("ProxyTester", "Runs per proxy must be a number.")
             return
-        if not url:
+        # Fast (connect-only) mode ignores the Test URL - it CONNECTs to a
+        # neutral target - so only require a URL for Full mode.
+        if not fast and not url:
             messagebox.showerror("ProxyTester", "Test URL is required.")
             return
 
@@ -3188,7 +3331,7 @@ class ProxyTab(ttk.Frame):
         self.status_lbl.config(text=f"Testing 0/{len(proxies)}...")
 
         worker = threading.Thread(
-            target=self._run_pool, args=(proxies, url, runs), daemon=True)
+            target=self._run_pool, args=(proxies, url, runs, fast), daemon=True)
         worker.start()
         self.after(100, self._drain_queue)
 
@@ -3199,18 +3342,27 @@ class ProxyTab(ttk.Frame):
         self.run_btn.config(state="disabled")
         self.status_lbl.config(text="Stopping...")
 
-    def _run_pool(self, proxies, url, runs):
+    def _run_pool(self, proxies, url, runs, fast=False):
         # Proxy testing is pure network I/O, so parallelism is the main speed
-        # lever. Honour a higher Settings concurrency, but floor at 40 for big
-        # lists so a large run isn't throttled by a low saved value.
-        workers = min(MAX_WORKERS_CAP, max(get_workers(), min(len(proxies), 40)))
+        # lever. The connect-only fast path is cheap enough to run far wider
+        # (and with a short timeout) than the full-GET path.
+        if fast:
+            workers = get_fast_workers()
+            fast_to = get_fast_timeout()
+        else:
+            workers = min(MAX_WORKERS_CAP,
+                          max(get_workers(), min(len(proxies), 40)))
         try:
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = {
-                    pool.submit(test_proxy, p, url, runs, DEFAULT_TIMEOUT,
-                                self.stop_event): p
-                    for p in proxies
-                }
+                futures = {}
+                for p in proxies:
+                    if fast:
+                        fut = pool.submit(test_proxy_fast, p, runs, fast_to,
+                                          self.stop_event)
+                    else:
+                        fut = pool.submit(test_proxy, p, url, runs,
+                                          DEFAULT_TIMEOUT, self.stop_event)
+                    futures[fut] = p
                 for fut, p in futures.items():
                     try:
                         result = fut.result()
@@ -5126,6 +5278,7 @@ class SettingsTab(ttk.Frame):
         self.ipinfo = tk.StringVar(value=load_setting("ipinfo_token", ""))
         self.workers = tk.StringVar(value=str(get_workers()))
         self.score_workers = tk.StringVar(value=str(get_score_workers()))
+        self.fast_timeout = tk.StringVar(value=str(get_fast_timeout()))
 
         def key_row(label, var):
             nonlocal r
@@ -5274,12 +5427,26 @@ class SettingsTab(ttk.Frame):
                    "concurrency above - so precision isn't traded for speed.", r)
         r += 1
 
+        ttk.Label(host,
+                  text="Liveness connect timeout (seconds, 1-30)").grid(
+            row=r, column=0, sticky="w", pady=4)
+        fto = ttk.Entry(host, textvariable=self.fast_timeout, width=6)
+        fto.grid(row=r, column=1, sticky="w", pady=4, padx=(10, 0))
+        fto.bind("<FocusOut>", lambda _e: self.on_save(), add="+")
+        r += 1
+        self._help("Proxy Tester 'Liveness (fast)' mode only - how long to wait "
+                   "for a proxy's CONNECT tunnel before calling it dead. Default "
+                   "5s. Lower = faster on dead-heavy lists but may false-kill "
+                   "slow residential/mobile gateways.", r)
+        r += 1
+
         # Auto-save: any edit persists after a short debounce, so a forgotten
         # click on 'Save settings' can never silently drop a key again.
         for _v in (self.ipqs, self.pcheck, self.ipinfo, self.oxy_mobile,
                    self.oxy_resi, self.ipr, self.brightdata, self.proxyhaus,
                    self.rayobyte, self.packetstream, self.hellworld,
-                   self.thuproxy, self.workers, self.score_workers):
+                   self.thuproxy, self.workers, self.score_workers,
+                   self.fast_timeout):
             _v.trace_add("write", self._schedule_autosave)
 
         # Settings auto-save (debounced on every edit), so there's no Save
@@ -5324,6 +5491,11 @@ class SettingsTab(ttk.Frame):
         except (TypeError, ValueError):
             sw = DEFAULT_SCORE_WORKERS
         save_setting("score_concurrency", sw)
+        try:
+            ft = max(1, min(30, int(self.fast_timeout.get().strip())))
+        except (TypeError, ValueError):
+            ft = DEFAULT_FAST_TIMEOUT
+        save_setting("fast_connect_timeout", ft)
         if announce:
             self.status_lbl.config(text="Saved.")
         if self._on_saved:
@@ -5342,6 +5514,11 @@ class SettingsTab(ttk.Frame):
         except (TypeError, ValueError):
             sw = DEFAULT_SCORE_WORKERS
         self.score_workers.set(str(sw))
+        try:
+            ft = max(1, min(30, int(self.fast_timeout.get().strip())))
+        except (TypeError, ValueError):
+            ft = DEFAULT_FAST_TIMEOUT
+        self.fast_timeout.set(str(ft))
         self._persist(announce=True)
 
 
@@ -5728,9 +5905,29 @@ def _listen_for_second_instance(root):
     return srv
 
 
+def _raise_fd_limit():
+    """The connect-only fast path opens hundreds-to-thousands of sockets at
+    once. On macOS/Linux the default soft file-descriptor limit is often 256,
+    which would cap concurrency and throw 'Too many open files'. Raise the soft
+    limit toward the hard limit. POSIX-only; Windows has no such limit and no
+    `resource` module."""
+    if sys.platform.startswith("win"):
+        return
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        want = min(hard, 4096) if hard != resource.RLIM_INFINITY else 4096
+        if soft < want:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+    except Exception:
+        pass
+
+
 def main():
     if _signal_existing_instance():
         return  # another instance is already open - brought it to the front
+
+    _raise_fd_limit()
 
     root = tk.Tk()
     root.title("ProxyTester")
