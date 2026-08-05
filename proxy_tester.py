@@ -60,7 +60,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "4.7"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "4.8"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -243,6 +243,198 @@ def reveal_on_focus(entry):
     """Show the password while the field is focused, mask it otherwise."""
     entry.bind("<FocusIn>", lambda e: entry.configure(show=""))
     entry.bind("<FocusOut>", lambda e: entry.configure(show="•"))
+
+
+class _UndoStack:
+    """Undo/redo history for a tk Entry. tkinter gives Text a built-in undo
+    stack but Entry none at all, so track the variable ourselves. Edits made in
+    a burst (within COALESCE_S) collapse into ONE step, so undo moves in useful
+    chunks instead of one character at a time."""
+
+    COALESCE_S = 0.6
+
+    def __init__(self, var, limit=200):
+        self._var = var
+        self._limit = limit
+        self._undo = [var.get()]
+        self._redo = []
+        self._muted = False
+        self._last = 0.0
+        var.trace_add("write", self._on_write)
+
+    def _on_write(self, *_):
+        if self._muted:
+            return
+        cur = self._var.get()
+        if self._undo and self._undo[-1] == cur:
+            return
+        now = time.perf_counter()
+        if len(self._undo) > 1 and (now - self._last) < self.COALESCE_S:
+            self._undo[-1] = cur          # same typing burst - replace the top
+        else:
+            self._undo.append(cur)
+            if len(self._undo) > self._limit:
+                self._undo.pop(0)
+        self._last = now
+        self._redo.clear()
+
+    def _apply(self, value):
+        self._muted = True
+        try:
+            self._var.set(value)
+        finally:
+            self._muted = False
+        self._last = 0.0
+
+    def undo(self):
+        if len(self._undo) < 2:
+            return "break"
+        self._redo.append(self._undo.pop())
+        self._apply(self._undo[-1])
+        return "break"
+
+    def redo(self):
+        if not self._redo:
+            return "break"
+        value = self._redo.pop()
+        self._undo.append(value)
+        self._apply(value)
+        return "break"
+
+
+def enable_text_undo(widget):
+    """Turn on tk.Text's built-in undo stack and bind the usual keys. Paste is
+    deliberately NOT rebound - the proxy-list boxes have their own <<Paste>>
+    behaviour (append to end / replace selection) that must keep working."""
+    try:
+        widget.configure(undo=True, autoseparators=True, maxundo=-1)
+    except Exception:
+        return widget
+
+    def _undo(_e=None):
+        try:
+            widget.edit_undo()
+        except Exception:
+            pass
+        return "break"
+
+    def _redo(_e=None):
+        try:
+            widget.edit_redo()
+        except Exception:
+            pass
+        return "break"
+
+    for seq, fn in (("<Control-z>", _undo), ("<Control-Z>", _undo),
+                    ("<Command-z>", _undo),
+                    ("<Control-y>", _redo), ("<Control-Y>", _redo),
+                    ("<Control-Shift-Z>", _redo), ("<Command-Shift-Z>", _redo)):
+        widget.bind(seq, fn)
+    return widget
+
+
+def enable_edit_keys(entry, var=None):
+    """Full editing keys on an Entry: select-all, copy, cut, paste, undo/redo.
+
+    tkinter's defaults fall short in two ways that bite here: an Entry has no
+    undo stack at all, and a MASKED entry (show='*') refuses to copy outright -
+    so Ctrl+C in an API-key or password field silently does nothing. We read the
+    widget's real text and drive the clipboard ourselves, which fixes both.
+    Command-* is bound too so it works from a Mac keyboard."""
+    hist = _UndoStack(var) if var is not None else None
+
+    def _sel():
+        try:
+            if entry.selection_present():
+                s, e = entry.index("sel.first"), entry.index("sel.last")
+                return entry.get()[s:e]
+        except Exception:
+            pass
+        return ""
+
+    def copy(_e=None):
+        # Fall back to the whole field when nothing is highlighted - copying a
+        # key you just want to move somewhere else is the common case.
+        txt = _sel() or entry.get()
+        if txt:
+            entry.clipboard_clear()
+            entry.clipboard_append(txt)
+        return "break"
+
+    def cut(_e=None):
+        txt = _sel()
+        if txt:
+            entry.clipboard_clear()
+            entry.clipboard_append(txt)
+            try:
+                entry.delete("sel.first", "sel.last")
+            except Exception:
+                pass
+        return "break"
+
+    def paste(_e=None):
+        try:
+            data = entry.clipboard_get()
+        except Exception:
+            return "break"
+        data = " ".join(data.split())     # an Entry is single-line
+        try:
+            if entry.selection_present():
+                entry.delete("sel.first", "sel.last")
+        except Exception:
+            pass
+        entry.insert("insert", data)
+        return "break"
+
+    def select_all(_e=None):
+        entry.select_range(0, "end")
+        entry.icursor("end")
+        return "break"
+
+    def undo(_e=None):
+        return hist.undo() if hist else "break"
+
+    def redo(_e=None):
+        return hist.redo() if hist else "break"
+
+    for seq, fn in (("<Control-c>", copy), ("<Control-C>", copy),
+                    ("<Command-c>", copy),
+                    ("<Control-x>", cut), ("<Control-X>", cut),
+                    ("<Command-x>", cut),
+                    ("<Control-v>", paste), ("<Control-V>", paste),
+                    ("<Command-v>", paste),
+                    ("<Control-a>", select_all), ("<Control-A>", select_all),
+                    ("<Command-a>", select_all),
+                    ("<Control-z>", undo), ("<Control-Z>", undo),
+                    ("<Command-z>", undo),
+                    ("<Control-y>", redo), ("<Control-Y>", redo),
+                    ("<Control-Shift-Z>", redo), ("<Command-Shift-Z>", redo)):
+        entry.bind(seq, fn)
+    return entry
+
+
+def apply_edit_keys_tree(widget):
+    """Walk the whole widget tree and give EVERY Entry full editing keys and
+    every Text an undo stack, so a newly-added field can't silently miss out."""
+    for child in widget.winfo_children():
+        try:
+            if isinstance(child, tk.Text):
+                enable_text_undo(child)
+            elif isinstance(child, (ttk.Entry, tk.Entry)):
+                # Recover the field's StringVar (by its Tcl name) so Entry undo
+                # has something to track; without one it still gets copy/paste.
+                var = None
+                try:
+                    name = str(child.cget("textvariable"))
+                    if name:
+                        var = tk.StringVar(master=child, name=name)
+                except Exception:
+                    var = None
+                enable_edit_keys(child, var)
+        except Exception:
+            pass
+        apply_edit_keys_tree(child)
+    return widget
 
 
 def status_tag(status):
@@ -954,8 +1146,7 @@ def proxycheck_lookup(ip, api_key, timeout=DEFAULT_TIMEOUT):
     status = data.get("status")
     message = str(data.get("message") or "").strip()
     if status not in ("ok", "warning"):
-        return {"_error": f"proxycheck.io: {status or 'no status'}"
-                          f"{' - ' + message if message else ''}"}
+        return {"_error": _proxycheck_error(status, message)}
     rec = _proxycheck_parse_record(data.get(ip))
     if rec is None:
         return {"_error": "proxycheck.io: no record for IP"}
@@ -964,6 +1155,22 @@ def proxycheck_lookup(ip, api_key, timeout=DEFAULT_TIMEOUT):
     # surface it once so it's visible without digging.
     rec["_proxycheck_warning"] = message if status == "warning" else ""
     return rec
+
+
+def _proxycheck_error(status, message):
+    """Build a proxycheck.io failure string, decoding the misleading ones."""
+    hint = ""
+    low = (message or "").lower()
+    if "free api key" in low or "100 queries exhausted" in low:
+        # This is proxycheck's ANONYMOUS/unregistered-user message (100/day).
+        # Seeing it while holding a real key means the key wasn't accepted at
+        # all - NOT that a paid allowance ran out. Say so, because the raw
+        # message sends you to the dashboard to look at a quota that's fine.
+        hint = ("  [this is proxycheck's unregistered/anonymous limit - your "
+                "API key was not recognised, so check it in Settings; it is "
+                "NOT your paid quota]")
+    return (f"proxycheck.io: {status or 'no status'}"
+            f"{' - ' + message if message else ''}{hint}")
 
 
 def _proxycheck_parse_record(rec):
@@ -1036,9 +1243,8 @@ def proxycheck_batch(ips, api_key, timeout=DEFAULT_TIMEOUT):
     # Same status rules as the single lookup: 'warning' is a SUCCESS carrying
     # an advisory, only denied/error are real failures.
     if status not in ("ok", "warning"):
-        return {ip: {"_error": f"proxycheck.io: {status or 'no status'}"
-                               f"{' - ' + message if message else ''}"}
-                for ip in ips}
+        err = _proxycheck_error(status, message)
+        return {ip: {"_error": err} for ip in ips}
     warn = message if status == "warning" else ""
     out = {}
     for ip in ips:
@@ -1537,7 +1743,14 @@ class _ProviderBreaker:
         out = []
         for name in set(self._ok) | set(self._fail) | set(self.disabled):
             if name in self.disabled:
-                out.append(f"{name}: {self.disabled[name]} (stopped)")
+                # A provider's own error string usually already leads with its
+                # name ("proxycheck.io: denied - ..."), so strip that off
+                # rather than printing "proxycheck.io: proxycheck.io: ...".
+                reason = str(self.disabled[name] or "").strip()
+                pfx = name + ":"
+                if reason.lower().startswith(pfx.lower()):
+                    reason = reason[len(pfx):].strip()
+                out.append(f"{name}: {reason} (stopped)")
             elif self._ok.get(name):
                 out.append(f"{name}: ok")
             else:
@@ -5711,6 +5924,12 @@ class QualityTab(ttk.Frame):
 
         def apply(sel):
             self._trust_buckets = sel
+            # The Min-trust floor and an explicit range pick are two ways of
+            # saying the same thing, and silently AND-ing them is what made
+            # "every range ticked" still hide rows (a 1-24 tick can never
+            # survive a floor of 92). An explicit pick wins - drop the floor.
+            if sel and self.min_trust.get().strip():
+                self.min_trust.set("")
             self._render_rows()
 
         self._open_checkbox_filter("Filter by Trust range", labels,
@@ -5846,7 +6065,8 @@ class SettingsTab(ttk.Frame):
             r += 1
 
         key_row("proxycheck.io key", self.pcheck)
-        key_row("IPinfo token (Max = residential proxy)", self.ipinfo)
+        key_row("IPinfo token (Max plan adds residential-proxy detection)",
+                self.ipinfo)
         key_row("IPQualityScore key", self.ipqs)
 
         # IPinfo bulk endpoint: one POST per 1000 IPs instead of one connection
@@ -6449,6 +6669,12 @@ def main():
 
     # Keep a reference so the listening socket lives as long as the window.
     root._instance_server = _listen_for_second_instance(root)
+
+    # Every Entry gets copy/cut/paste/select-all/undo and every Text gets an
+    # undo stack. Done in one sweep AFTER the tabs are built so no field can be
+    # missed - notably the masked API-key boxes, which tkinter otherwise
+    # refuses to copy from at all.
+    apply_edit_keys_tree(root)
 
     # macOS system Tk 8.5 sometimes opens a blank/white window until something
     # forces a repaint - nudge it. Harmless elsewhere; the real fix for old Tk

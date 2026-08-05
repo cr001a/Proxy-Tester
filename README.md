@@ -204,6 +204,13 @@ Each generator provider has an **in generator** tick-box next to its credentials
 Untick it to hide that provider from **Generate batch** *without deleting the
 credentials* — ticking it back restores it with nothing to re-type.
 
+**Editing keys.** Every text field — including the masked API-key and
+password boxes — supports **copy / cut / paste / select-all / undo / redo**
+(`Ctrl`- and `Cmd`-based). tkinter doesn't give an `Entry` an undo stack at all,
+and it flatly refuses to copy from a masked field, so the app drives the
+clipboard itself; typing coalesces into sensible undo steps rather than one per
+character.
+
 Settings are saved to `%APPDATA%\ProxyTester\settings.json`. Credentials
 (including passwords) are stored there in **plain text** on your own machine —
 fine for local use, but don't sync that file anywhere public.
