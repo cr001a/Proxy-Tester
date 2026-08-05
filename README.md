@@ -60,7 +60,12 @@ Four tabs:
    `CONNECT` probe, closed it, then redialled the same proxy from scratch; the
    probe only ever saved time on *dead* proxies, so on a mostly-live list —
    a real 20k run measured 92% alive — it was a wasted round trip on nearly
-   every proxy.) The *paid* reputation lookup then runs
+   every proxy.) When the **Speed gate** is on, its threshold also becomes each
+   proxy's **total time budget** — anything slower is going to be filtered out
+   of scoring anyway, so it's abandoned early rather than being allowed to hold
+   a worker (and the run's wall clock) for the full read timeout. Results stream
+   back in **completion order**, so one straggler can't hide results that have
+   already finished behind it. The *paid* reputation lookup then runs
    **only on proxies that resolved under your millisecond threshold** — so a
    slow proxy never costs an API call. (The actual retailer latency test is your
    deliberate final step on the vetted list — use the Proxy Tester tab with the

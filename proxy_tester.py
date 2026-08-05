@@ -39,7 +39,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote, unquote, urlsplit
 
 # macOS system Tk (8.5) prints a deprecation warning on import when running from
@@ -60,7 +60,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "4.9"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "5.0"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 
@@ -1608,7 +1608,7 @@ def _read_http_body(sock, cap=65536):
 
 
 def discover_exit_ip_direct(proxy, connect_timeout, read_timeout,
-                            stop_event=None):
+                            stop_event=None, total_budget=None):
     """Resolve a proxy's exit IP in ONE connection: TCP -> CONNECT tunnel ->
     TLS -> GET -> body, with a SHORT timeout on the connect/tunnel phase and a
     longer one on the request phase.
@@ -1619,7 +1619,12 @@ def discover_exit_ip_direct(proxy, connect_timeout, read_timeout,
     proxies; for a live one it was an entirely wasted round trip - and on a
     mostly-live list (a real run measured 92% alive) that overhead landed on
     almost every proxy. Staging the timeouts on a single connection keeps the
-    fast-fail for dead proxies AND drops the extra handshake for live ones."""
+    fast-fail for dead proxies AND drops the extra handshake for live ones.
+
+    `total_budget` (seconds) caps the WHOLE attempt, not just each phase. The
+    speed gate feeds it: a proxy slower than the gate is going to be filtered
+    out of scoring anyway, so waiting the full read budget for it buys nothing
+    and lets one straggler set the wall clock for the entire run."""
     host, port = proxy["host"], proxy["port"]
     user, pw = proxy["user"], proxy["pw"]
     display = (f"{host}:{port}:{user}:****" if user and pw is not None
@@ -1644,11 +1649,21 @@ def discover_exit_ip_direct(proxy, connect_timeout, read_timeout,
     req += "\r\n"
 
     start = time.perf_counter()
+    deadline = (start + total_budget) if total_budget else None
+
+    def _left(phase_timeout):
+        """Time left for the next blocking op: the phase's own budget, further
+        clamped by whatever remains of the overall deadline."""
+        if deadline is None:
+            return phase_timeout
+        return max(0.05, min(phase_timeout, deadline - time.perf_counter()))
+
     sock = tls = None
     try:
         # --- phase 1: TCP + CONNECT tunnel, on the SHORT timeout ---
-        sock = socket.create_connection((host, p_port), timeout=connect_timeout)
-        sock.settimeout(connect_timeout)
+        sock = socket.create_connection((host, p_port),
+                                        timeout=_left(connect_timeout))
+        sock.settimeout(_left(connect_timeout))
         sock.sendall(req.encode("ascii"))
         buf = b""
         while b"\r\n\r\n" not in buf and len(buf) < 4096:
@@ -1665,10 +1680,11 @@ def discover_exit_ip_direct(proxy, connect_timeout, read_timeout,
         # --- phase 2: TLS + GET, on the LONGER timeout ---
         if stop_event is not None and stop_event.is_set():
             return out
-        sock.settimeout(read_timeout)
+        sock.settimeout(_left(read_timeout))
         if SSL_CTX is None:
             return {**out, "status": "no tls context"}
         tls = SSL_CTX.wrap_socket(sock, server_hostname=thost)
+        tls.settimeout(_left(read_timeout))
         tls.sendall(
             (f"GET /json HTTP/1.1\r\nHost: {thost}\r\n"
              f"User-Agent: {USER_AGENT}\r\nAccept: application/json\r\n"
@@ -5429,12 +5445,25 @@ class QualityTab(ttk.Frame):
             discoveries = []
             t_stage1 = time.perf_counter()
             connect_to, read_to = get_fast_timeout(), EXIT_IP_READ_TIMEOUT
+            # Tie the per-proxy budget to the speed gate. Anything slower than
+            # the gate gets filtered out of scoring anyway, so waiting the full
+            # read budget for it buys nothing - and one straggler holding a
+            # worker is what sets the wall clock on a wide pool. Headroom (x1.5
+            # + 0.5s) keeps a proxy sitting right on the threshold from being
+            # cut off mid-handshake.
+            budget = None
+            if gate_ms is not None:
+                budget = min(float(read_to),
+                             max(1.0, (gate_ms / 1000.0) * 1.5 + 0.5))
             with ThreadPoolExecutor(max_workers=get_fast_workers()) as pool:
                 futs = {pool.submit(discover_exit_ip_direct, p, connect_to,
-                                    read_to, self.stop_event): p
+                                    read_to, self.stop_event, budget): p
                         for p in proxies}
                 done = 0
-                for fut in futs:
+                # as_completed, NOT submission order: a single slow proxy used
+                # to block every already-finished result behind it, so the bulk
+                # appeared stalled while it was actually done.
+                for fut in as_completed(futs):
                     try:
                         d = fut.result()
                     except Exception as e:
