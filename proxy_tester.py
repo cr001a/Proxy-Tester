@@ -60,7 +60,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "5.6"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "5.7"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 # Worker threads get a 512 KB stack instead of the platform default (8 MB on
@@ -109,6 +109,61 @@ YELLOW = "#f9e2af"
 
 UI_FONT = "Segoe UI"
 MONO_FONT = "Consolas"
+
+
+def _legacy_aqua_tk(root):
+    """True on Apple's system Tk 8.5, the one that opens blank white windows.
+
+    /usr/bin/python3 links Tcl/Tk 8.5.9 - a build from around 2010 whose Aqua
+    port misses the initial damage event on modern macOS, so a window maps but
+    never paints. python.org Python (Tk 8.6) doesn't have this, and neither
+    does Windows or Linux, so the workaround stays off for them: forcing
+    redraws where they aren't needed just makes the window flicker on open."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        return float(root.tk.call("info", "tclversion")) < 8.6
+    except Exception:
+        return False
+
+
+def force_repaint(root):
+    """Resize the window by one pixel and back, to make old Tk actually draw.
+
+    update_idletasks(), lift() and deiconify() are NOT enough here - they flush
+    Tk's own work queue, but the missing piece is on the macOS side: the window
+    server never sent the expose event that triggers a full redraw. A real
+    geometry change does generate one, which is exactly why dragging the corner
+    has always fixed this by hand. This just does that for the user."""
+    try:
+        root.update_idletasks()
+        w, h = root.winfo_width(), root.winfo_height()
+        x, y = root.winfo_x(), root.winfo_y()
+        if w > 1 and h > 1:
+            root.geometry(f"{w + 1}x{h + 1}+{x}+{y}")
+            root.update_idletasks()
+            root.geometry(f"{w}x{h}+{x}+{y}")
+        root.update()
+    except Exception:
+        pass                       # a repaint helper must never break startup
+
+
+def install_legacy_tk_repaint(root, notebook=None):
+    """Wire up the blank-window workaround, but only where it's needed."""
+    root.after(60, root.deiconify)
+    if not _legacy_aqua_tk(root):
+        root.after(80, root.update)
+        return
+    # Several attempts on purpose. The window isn't mapped yet at 80ms, and on
+    # a slow/remote session the first nudge can land before there's anything to
+    # draw - so try again as the window settles. They're idempotent.
+    for delay in (120, 400, 900):
+        root.after(delay, lambda: force_repaint(root))
+    if notebook is not None:
+        # Same bug per tab: switching to a tab that has never been drawn shows
+        # a blank pane until something forces it.
+        notebook.bind("<<NotebookTabChanged>>",
+                      lambda e: root.after(30, root.update), add="+")
 
 
 def apply_theme(root):
@@ -7197,12 +7252,9 @@ def main():
     # refuses to copy from at all.
     apply_edit_keys_tree(root)
 
-    # macOS system Tk 8.5 sometimes opens a blank/white window until something
-    # forces a repaint - nudge it. Harmless elsewhere; the real fix for old Tk
-    # is python.org Python (Tk 8.6).
     root.update_idletasks()
     root.lift()
-    root.after(60, lambda: (root.deiconify(), root.update()))
+    install_legacy_tk_repaint(root, notebook)
 
     root.mainloop()
 

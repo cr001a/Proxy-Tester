@@ -285,6 +285,26 @@ installer, or `brew install python-tk`).
 If `python3` can't be found at all, the launcher says so in a dialog instead of
 failing silently.
 
+### The blank white window on Apple's Python
+
+`/usr/bin/python3` links **Tcl/Tk 8.5.9**, a build from around 2010 whose Aqua
+port misses the initial damage event on modern macOS: the window maps but never
+paints, so you get a white rectangle. Dragging the window's corner has always
+fixed it, because a real resize is what makes the window server send the expose
+event the redraw is waiting on.
+
+The app now does that resize itself — one pixel out and back, retried a few
+times as the window settles, plus a repaint when you switch tabs. Note that
+`update_idletasks()`, `lift()` and `deiconify()` do **not** work here: they
+flush Tk's own queue, but the missing event is on the macOS side.
+
+This only runs on macOS with Tk older than 8.6. Everywhere else it's off —
+forcing redraws that aren't needed just makes the window flicker on open.
+
+It's a workaround, not a cure. Apple's Tk 8.5 is fifteen years old and has other
+rough edges. If you can install Python from python.org (Tk 8.6), do — the app
+prefers it automatically once it's there.
+
 ---
 
 ## Running from source
