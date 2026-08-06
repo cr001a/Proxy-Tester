@@ -272,11 +272,19 @@ python-tk`. The launcher therefore **probes candidates and picks the first one
 that can actually `import tkinter`**, rather than taking whatever is first on
 `PATH` and giving up if that one can't.
 
-Preference order: the python.org framework build (it bundles **Tk 8.6**), then
-Homebrew, then `/usr/local/bin`, then `PATH`, and Apple's `/usr/bin/python3`
-last — that one links the **system Tk 8.5**, which renders a blank window on
-some macOS versions, so it's a working-but-ugly fallback rather than a first
-choice.
+It picks by **capability, not path order**, deciding two things in one probe:
+
+1. **Can it import tkinter?** (Homebrew's can't, without `python-tk`.)
+2. **Which Tk does it link?** A **Tk 8.6** interpreter *wins outright*, even if
+   a Tk 8.5 one was found first. Apple's `/usr/bin/python3` uses the system
+   **Tk 8.5.9**, the one that opens blank white windows — it's used only when
+   nothing better exists, since running-but-ugly beats not starting.
+
+Candidates include **user-writable locations** — `~/Desktop/python`, uv-managed
+Pythons under `~/.local/share/uv/python`, `~/.local/bin`, and a `python/` folder
+beside the source. Installing into `/Library` needs admin, which plenty of
+managed and remote Macs don't grant; **a relocatable Python unpacked into a
+folder you own works fine**, and the launcher will find and prefer it.
 
 If nothing on the machine has tkinter, the dialog **lists every interpreter it
 tried** so you can see what's installed, and points at the two fixes (python.org

@@ -89,17 +89,27 @@ else
     exit 1
 fi
 
-# Find a python3 that can ACTUALLY import tkinter, rather than taking the first
-# one on PATH and giving up if it can't. Homebrew's python3 ships without Tk
-# unless python-tk is installed separately, and it sits near the front of the
-# PATH above - so a Mac that has a perfectly good Apple or python.org Python
-# would still fail on the Homebrew one. Each candidate is probed, not assumed.
+# Pick a python3 by what it can actually DO, not by where it sits on PATH.
 #
-# Order is deliberate: the python.org framework build first because it bundles
-# Tk 8.6, and Apple's /usr/bin/python3 last because it links the system Tk 8.5,
-# which renders a blank window on some macOS versions. Working-but-ugly beats
-# not starting, so it stays in the list.
-PY=""
+# Two things are being decided at once:
+#   1. Can it import tkinter? Homebrew's python3 can't unless python-tk was
+#      installed separately, and it sits near the front of the PATH above - so
+#      taking the first python3 found would fail on a Mac that has a perfectly
+#      good one elsewhere.
+#   2. Which Tk does it link? Apple's /usr/bin/python3 uses the system Tk
+#      8.5.9 (circa 2010), whose Aqua port opens blank white windows. A Tk 8.6
+#      interpreter is strictly better, so it WINS even if a Tk 8.5 one was
+#      found first. A Tk 8.5 interpreter is only used when nothing else works -
+#      ugly-but-running beats not starting, and the app has a repaint
+#      workaround for exactly that case.
+#
+# Candidates include user-writable locations (~/Desktop, uv, ~/.local, and a
+# 'python' folder beside the source) because installing to /Library needs admin
+# - which plenty of managed and remote Macs don't grant. A relocatable Python
+# unpacked into a folder you own is a perfectly good answer, and unmatched
+# globs simply fail the executable test below.
+BEST=""
+FALLBACK=""
 TRIED=""
 SEEN=""
 for cand in \\
@@ -108,6 +118,14 @@ for cand in \\
     /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 \\
     /Library/Frameworks/Python.framework/Versions/3.12/bin/python3 \\
     /Library/Frameworks/Python.framework/Versions/3.11/bin/python3 \\
+    ./python/bin/python3 \\
+    ./python/python3 \\
+    "\$HOME"/Desktop/python/bin/python3 \\
+    "\$HOME"/Desktop/python/python3 \\
+    "\$HOME"/Desktop/python/*/bin/python3 \\
+    "\$HOME"/.local/share/uv/python/*/bin/python3 \\
+    "\$HOME"/Desktop/uv-bin/python/*/bin/python3 \\
+    "\$HOME"/.local/bin/python3 \\
     /opt/homebrew/bin/python3 \\
     /usr/local/bin/python3 \\
     python3 \\
@@ -117,21 +135,32 @@ do
     [ -n "\$resolved" ] && [ -x "\$resolved" ] || continue
     case "\$SEEN " in *"\$resolved "*) continue ;; esac
     SEEN="\$SEEN\$resolved "
-    # Keep the REASON, not just the fact of failure. A GUI launch gets a
-    # different environment from Terminal, so an interpreter that imports
-    # tkinter fine when you test it by hand can still fail here - and "no
-    # tkinter" alone sends you off installing a Python you already have.
-    err="\$("\$resolved" -c "import tkinter" 2>&1)"
+    # One probe answers both questions. Keep the REASON on failure, not just
+    # the fact of it: a GUI launch gets a different environment from Terminal,
+    # so an interpreter that imports tkinter fine by hand can still fail here,
+    # and a bare "no tkinter" sends you off installing a Python you already own.
+    out="\$("\$resolved" -c 'import tkinter; print("TK86" if tkinter.TkVersion >= 8.6 else "TK85")' 2>&1)"
     if [ \$? -eq 0 ]; then
-        PY="\$resolved"
-        break
+        case "\$out" in
+            *TK86*)
+                BEST="\$resolved"
+                break ;;                      # modern Tk - stop looking
+            *TK85*)
+                # Usable, but blank-window prone. Remember it and keep looking
+                # for something better before settling.
+                [ -n "\$FALLBACK" ] || FALLBACK="\$resolved"
+                continue ;;
+        esac
     fi
-    why="\$(printf '%s' "\$err" | tail -1 | tr -d '\\"' | cut -c1-120)"
+    why="\$(printf '%s' "\$out" | tail -1 | tr -d '\\"' | cut -c1-120)"
     [ -n "\$why" ] || why="exited non-zero with no output"
     TRIED="\$TRIED
   \$resolved
       \$why"
 done
+
+PY="\$BEST"
+[ -n "\$PY" ] || PY="\$FALLBACK"
 
 if [ -z "\$PY" ]; then
     if [ -z "\$TRIED" ]; then
