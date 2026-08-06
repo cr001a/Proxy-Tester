@@ -60,7 +60,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "5.1"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "5.2"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 # Worker threads get a 512 KB stack instead of the platform default (8 MB on
@@ -1619,7 +1619,8 @@ def _read_http_body(sock, cap=65536):
 
 
 def discover_exit_ip_direct(proxy, connect_timeout, read_timeout,
-                            stop_event=None, total_budget=None):
+                            stop_event=None, total_budget=None,
+                            want_geo=False):
     """Resolve a proxy's exit IP in ONE connection: TCP -> CONNECT tunnel ->
     TLS -> GET -> body, with a SHORT timeout on the connect/tunnel phase and a
     longer one on the request phase.
@@ -1635,7 +1636,13 @@ def discover_exit_ip_direct(proxy, connect_timeout, read_timeout,
     `total_budget` (seconds) caps the WHOLE attempt, not just each phase. The
     speed gate feeds it: a proxy slower than the gate is going to be filtered
     out of scoring anyway, so waiting the full read budget for it buys nothing
-    and lets one straggler set the wall clock for the entire run."""
+    and lets one straggler set the wall clock for the entire run.
+
+    `want_geo` also keeps the provider/ASN and location out of the response
+    body, which costs no extra network - it's the same JSON either way. It is
+    off by default because IP Quality resolves hundreds of thousands of proxies
+    and never displays those two fields; retaining them there would add ~80 MB
+    to a 400k run for strings nothing reads."""
     host, port = proxy["host"], proxy["port"]
     user, pw = proxy["user"], proxy["pw"]
     display = (f"{host}:{port}:{user}:****" if user and pw is not None
@@ -1643,7 +1650,7 @@ def discover_exit_ip_direct(proxy, connect_timeout, read_timeout,
     full = (f"{host}:{port}:{user}:{pw}" if user and pw is not None
             else (f"{host}:{port}:{user}" if user else f"{host}:{port}"))
     out = {"proxy": display, "full": full, "exit_ip": "", "ping": None,
-           "status": "stopped"}
+           "org": "", "location": "", "status": "stopped"}
     if stop_event is not None and stop_event.is_set():
         return out
     try:
@@ -1709,7 +1716,18 @@ def discover_exit_ip_direct(proxy, connect_timeout, read_timeout,
         ip = _parse_json_field(body, "ip")
         if not ip:
             return {**out, "status": "no exit ip"}
-        return {**out, "exit_ip": ip, "ping": ms, "status": "OK"}
+        if not want_geo:
+            return {**out, "exit_ip": ip, "ping": ms, "status": "OK"}
+        # The provider/ASN and location are in the SAME response body we just
+        # paid for, so pulling them out costs no extra network. They used to be
+        # discarded unconditionally, which is why a fast sweep left the
+        # Provider/ASN and Location columns blank and read as reporting nothing.
+        city = _parse_json_field(body, "city")
+        region = _parse_json_field(body, "region")
+        country = _parse_json_field(body, "country")
+        return {**out, "exit_ip": ip, "ping": ms, "status": "OK",
+                "org": _parse_json_field(body, "org"),
+                "location": ", ".join(p for p in (city, region, country) if p)}
     except socket.timeout:
         return {**out, "status": "timeout"}
     except ssl.SSLError:
@@ -2144,7 +2162,15 @@ def get_workers():
 FAST_WORKERS_CAP = 1200
 FAST_MIN_WORKERS = 200
 FAST_MODE = "Liveness (fast)"
-FULL_MODE = "Full (exit IP + geo)"
+# The middle mode, and the default. One connection does TCP -> CONNECT -> TLS
+# -> GET -> body with staged timeouts, so it returns the exit IP, provider/ASN
+# and location for barely more than the connect-only probe costs - the extra
+# work is a TLS handshake and one small GET on a tunnel that is already open.
+# Liveness mode leaves those three columns empty by design, which reads as
+# "reported nothing"; Full mode fills them but goes through urllib, redialling
+# per run with no staged timeouts. This is the one worth reaching for.
+RESOLVE_MODE = "Exit IP + geo (fast)"
+FULL_MODE = "Full (custom URL)"
 DEFAULT_FAST_TIMEOUT = 5      # seconds - a CONNECT is one RTT; 5s spares slow
                              # residential/mobile gateways without holding a
                              # dead proxy for the full 15s.
@@ -3881,14 +3907,18 @@ class ProxyTab(ttk.Frame):
         self.url = tk.StringVar(value="https://ipinfo.io/json")
         self.runs = tk.StringVar(value="1")
 
-        # Test mode. Liveness (fast) is connect-only - one CONNECT handshake per
-        # proxy, no TLS/GET/body - so it blazes through huge lists but only
-        # proves the tunnel opens. Full does the exit-IP GET (slower, richer).
-        self.test_mode = tk.StringVar(value=FAST_MODE)
+        # Test mode, cheapest first. Liveness is connect-only - one CONNECT
+        # handshake per proxy, no TLS/GET/body - so it blazes through huge
+        # lists but only proves the tunnel opens, leaving the Exit IP,
+        # Provider/ASN and Location columns empty. Exit IP + geo resolves all
+        # three on the SAME single connection for barely more cost, which
+        # makes it the right default. Full is the urllib path, for testing a
+        # custom URL over several runs.
+        self.test_mode = tk.StringVar(value=RESOLVE_MODE)
         ttk.Label(form, text="Test mode").grid(row=0, column=1, sticky="w")
         self.mode_cb = ttk.Combobox(
             form, textvariable=self.test_mode, state="readonly", width=22,
-            values=[FAST_MODE, FULL_MODE])
+            values=[FAST_MODE, RESOLVE_MODE, FULL_MODE])
         self.mode_cb.grid(row=0, column=2, sticky="w", pady=3)
         self.mode_cb.bind("<<ComboboxSelected>>", self._on_mode_change)
 
@@ -3979,6 +4009,10 @@ class ProxyTab(ttk.Frame):
         tag_tree(self.tree)
         enable_drag_select(self.tree)
         self.tree.pack(fill="both", expand=True, pady=(8, 0))
+        # Re-apply the mode now the tree exists: _on_mode_change ran during the
+        # form build, before this widget, so its column visibility had nothing
+        # to act on.
+        self._on_mode_change()
         # Ctrl+C copies the selected proxies (full host:port:user:pass), Ctrl+A
         # selects every row - matching the IP Quality tab.
         self.tree.bind("<Control-c>", self._copy_selected)
@@ -4030,34 +4064,55 @@ class ProxyTab(ttk.Frame):
         self.url.set(d.get("url", "https://ipinfo.io/json"))
         self.runs.set(d.get("runs", "1"))
 
+    # What each mode measures. Keyed by mode so adding one can't leave a stale
+    # if/else behind.
+    MODE_HINTS = {
+        FAST_MODE: ("Connect-only: opens a CONNECT tunnel per proxy. Fastest, "
+                    "but proves only that the tunnel opens - there is no exit "
+                    "IP to report, so those columns are hidden (URL ignored)."),
+        RESOLVE_MODE: ("One connection per proxy: CONNECT + TLS + GET with "
+                       "staged timeouts. Nearly as fast as connect-only, and "
+                       "returns exit IP, provider/ASN and location (URL "
+                       "ignored)."),
+        FULL_MODE: ("Full GET to the Test URL via urllib, redialled every "
+                    "run. Slowest - for testing a specific URL, not for "
+                    "sweeping a big list."),
+    }
+
     def _on_mode_change(self, _event=None):
-        """Fast mode is connect-only, so the Test URL doesn't apply - grey it
-        out and swap the hint text so it's clear what each mode measures."""
-        fast = self.test_mode.get() == FAST_MODE
+        """Swap the hint, enable the Test URL only where it's used, and hide
+        the columns the chosen mode cannot fill. Connect-only genuinely has no
+        exit IP to report, and three permanently blank columns read as a broken
+        run rather than a deliberate trade-off."""
+        mode = self.test_mode.get()
         try:
-            self.url_entry.config(state="disabled" if fast else "normal")
+            self.url_entry.config(
+                state="normal" if mode == FULL_MODE else "disabled")
         except Exception:
             pass
-        self.mode_hint.config(
-            text=("Connect-only: opens a CONNECT tunnel per proxy - fast, but "
-                  "no exit IP (URL ignored)."
-                  if fast else
-                  "Full GET to the Test URL - slower; harvests exit IP, ASN "
-                  "and location."))
+        cols = self.COLUMNS
+        if mode == FAST_MODE:
+            cols = tuple(c for c in cols
+                         if c not in ("exit_ip", "org", "location"))
+        try:
+            self.tree.config(displaycolumns=cols)
+        except Exception:
+            pass
+        self.mode_hint.config(text=self.MODE_HINTS.get(mode, ""))
 
     def on_run(self):
         if self.running:
             return
-        fast = self.test_mode.get() == FAST_MODE
+        mode = self.test_mode.get()
         url = self.url.get().strip()
         try:
             runs = max(1, int(self.runs.get().strip()))
         except ValueError:
             messagebox.showerror("ProxyTester", "Runs per proxy must be a number.")
             return
-        # Fast (connect-only) mode ignores the Test URL - it CONNECTs to a
-        # neutral target - so only require a URL for Full mode.
-        if not fast and not url:
+        # Only Full mode uses the Test URL. Both fast modes go to a neutral
+        # target of their own, so an empty URL must not block them.
+        if mode == FULL_MODE and not url:
             messagebox.showerror("ProxyTester", "Test URL is required.")
             return
 
@@ -4093,7 +4148,7 @@ class ProxyTab(ttk.Frame):
         self.status_lbl.config(text=f"Testing 0/{len(proxies)}...")
 
         worker = threading.Thread(
-            target=self._run_pool, args=(proxies, url, runs, fast), daemon=True)
+            target=self._run_pool, args=(proxies, url, runs, mode), daemon=True)
         worker.start()
         self.after(100, self._drain_queue)
 
@@ -4104,23 +4159,41 @@ class ProxyTab(ttk.Frame):
         self.run_btn.config(state="disabled")
         self.status_lbl.config(text="Stopping...")
 
-    def _run_pool(self, proxies, url, runs, fast=False):
+    def _run_pool(self, proxies, url, runs, mode=FAST_MODE):
         # Proxy testing is pure network I/O, so parallelism is the main speed
-        # lever. The connect-only fast path is cheap enough to run far wider
-        # (and with a short timeout) than the full-GET path.
-        if fast:
-            workers = get_fast_workers()
-            fast_to = get_fast_timeout()
-        else:
+        # lever. Both single-connection modes are cheap enough to run far wider
+        # (and with shorter timeouts) than the urllib full-GET path.
+        if mode == FULL_MODE:
             workers = min(MAX_WORKERS_CAP,
                           max(get_workers(), min(len(proxies), 40)))
-        if fast:
-            def _test(p):
-                return test_proxy_fast(p, runs, fast_to, self.stop_event)
-        else:
+
             def _test(p):
                 return test_proxy(p, url, runs, DEFAULT_TIMEOUT,
                                   self.stop_event)
+        elif mode == RESOLVE_MODE:
+            workers = get_fast_workers()
+            connect_to = get_fast_timeout()
+
+            def _test(p):
+                # The same single-pass resolver IP Quality stage 1 uses, mapped
+                # onto this tab's row shape. `runs` doesn't apply: one pass IS
+                # the measurement, and re-dialling a proxy to average a number
+                # the run doesn't use would just multiply the wall clock.
+                d = discover_exit_ip_direct(p, connect_to, EXIT_IP_READ_TIMEOUT,
+                                            self.stop_event, want_geo=True)
+                ok = d["status"] == "OK"
+                return {"proxy": d["proxy"], "full": d["full"],
+                        "status": d["status"], "code": "200" if ok else "-",
+                        "median": d["ping"], "success": 1 if ok else 0,
+                        "runs": 1, "exit_ip": d["exit_ip"],
+                        "org": d.get("org", ""),
+                        "location": d.get("location", ""), "reason": ""}
+        else:
+            workers = get_fast_workers()
+            fast_to = get_fast_timeout()
+
+            def _test(p):
+                return test_proxy_fast(p, runs, fast_to, self.stop_event)
 
         def _on_result(p, result, exc):
             if exc is not None:
