@@ -60,7 +60,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "5.3"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "5.4"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 # Worker threads get a 512 KB stack instead of the platform default (8 MB on
@@ -554,6 +554,38 @@ def enable_drag_select(tree):
 
     tree.bind("<Button-1>", on_press, add="+")
     tree.bind("<B1-Motion>", on_drag)
+
+
+def enable_list_keys(widget, copy_fn, select_all_fn):
+    """Wire Select-all and Copy on a results table or list, under BOTH
+    modifiers.
+
+    Control-* alone isn't enough. On a Mac the shortcut is Cmd, which Tk
+    reports as the Command modifier - no Control binding will ever see it, so
+    on macOS these keys did nothing at all. (Driving a Windows box over RDP, a
+    Mac's Cmd isn't delivered as Control either; the right-click menu covers
+    that half.) Binding both means the habit that works everywhere else works
+    here, whichever machine it's on.
+
+    Handlers return 'break' so Tk's class-level binding doesn't also run and
+    move the selection out from under the one just made."""
+    def _sel(_e=None):
+        select_all_fn()
+        return "break"
+
+    def _copy(_e=None):
+        copy_fn()
+        return "break"
+
+    for seq in ("<Control-a>", "<Control-A>", "<Command-a>", "<Command-A>"):
+        widget.bind(seq, _sel)
+    for seq in ("<Control-c>", "<Control-C>", "<Command-c>", "<Command-C>"):
+        widget.bind(seq, _copy)
+    # A key binding only fires on the FOCUSED widget, and a Treeview doesn't
+    # reliably take keyboard focus from a plain click on every platform - so
+    # claim it here, or the shortcut silently does nothing until the user has
+    # tabbed into the table some other way.
+    widget.bind("<Button-1>", lambda e: widget.focus_set(), add="+")
 
 
 # --------------------------------------------------------------------------- #
@@ -3401,8 +3433,10 @@ class AsnTab(ttk.Frame):
         self._visible_asns = []
         self._refilter_asns()  # populate
 
-        self.asn_list.bind("<Control-c>", self._copy_selected_asns)
-        self.asn_list.bind("<Control-C>", self._copy_selected_asns)
+        enable_list_keys(self.asn_list, self._copy_selected_asns,
+                         lambda: self.asn_list.size() and
+                         self.asn_list.selection_set(0,
+                                                     self.asn_list.size() - 1))
         attach_copy_menu(self.asn_list, self._copy_selected_asns,
                          "Copy selected ASNs")
 
@@ -3469,10 +3503,9 @@ class AsnTab(ttk.Frame):
             self.tree.column(col, width=w, minwidth=mw, stretch=st, anchor=anc)
         tag_tree(self.tree)
         enable_drag_select(self.tree)
-        self.tree.bind("<Control-c>", self._copy_rows)
-        self.tree.bind("<Control-C>", self._copy_rows)
-        self.tree.bind("<Control-a>", lambda e: (self.tree.selection_set(
-            self.tree.get_children()), "break")[1])
+        enable_list_keys(self.tree, self._copy_rows,
+                         lambda: self.tree.selection_set(
+                             self.tree.get_children()))
         attach_copy_menu(self.tree, self._copy_rows, "Copy selected rows")
         self.tree.pack(fill="both", expand=True, pady=(8, 0))
 
@@ -4015,10 +4048,7 @@ class ProxyTab(ttk.Frame):
         self._on_mode_change()
         # Ctrl+C copies the selected proxies (full host:port:user:pass), Ctrl+A
         # selects every row - matching the IP Quality tab.
-        self.tree.bind("<Control-c>", self._copy_selected)
-        self.tree.bind("<Control-C>", self._copy_selected)
-        self.tree.bind("<Control-a>", self._select_all_rows)
-        self.tree.bind("<Control-A>", self._select_all_rows)
+        enable_list_keys(self.tree, self._copy_selected, self._select_all_rows)
         attach_copy_menu(self.tree, self._copy_selected,
                          "Copy selected proxies")
 
@@ -5462,9 +5492,12 @@ class QualityTab(ttk.Frame):
         ttk.Button(btns, text="Generate batch",
                    command=lambda: open_generate_dialog(
                        self, self.proxy_text)).pack(side="left", padx=8)
-        # Exports the highlighted rows, or all currently-shown rows if none are.
-        ttk.Button(btns, text="Export shown/selected",
-                   command=self.on_export).pack(side="left", padx=(0, 8))
+        # What this table is FOR is feeding proxies into something else, so the
+        # primary action is the clipboard, not a CSV on disk. Copies the
+        # highlighted proxies, or every proxy that passed the filters when
+        # nothing is highlighted.
+        ttk.Button(btns, text="Copy proxies",
+                   command=self.on_copy_results).pack(side="left", padx=(0, 8))
         # Collapse to one row (best Trust) per distinct exit IP.
         self._unique_only = tk.BooleanVar(value=False)
         ttk.Checkbutton(btns, text="Unique exit IPs only",
@@ -5542,12 +5575,15 @@ class QualityTab(ttk.Frame):
         tag_tree(self.tree)
         enable_drag_select(self.tree)
         self.tree.bind("<<TreeviewSelect>>", self._update_sel_count)
-        self.tree.bind("<Control-c>", lambda e: (self.on_copy_selected(), "break"))
-        self.tree.bind("<Control-C>", lambda e: (self.on_copy_selected(), "break"))
-        self.tree.bind("<Control-a>", lambda e: (self._select_all_rows(), "break"))
-        self.tree.bind("<Control-A>", lambda e: (self._select_all_rows(), "break"))
+        enable_list_keys(self.tree, self.on_copy_selected,
+                         self._select_all_rows)
+        # CSV moves to the right-click menu: the button bar's job is the thing
+        # you do every run (get proxies onto the clipboard), and a full-detail
+        # spreadsheet is the occasional case, not the default one.
         attach_copy_menu(self.tree, self.on_copy_selected,
-                         "Copy selected proxies")
+                         "Copy selected proxies",
+                         extra=[("Export to CSV (all columns)",
+                                 self.on_export)])
         self.tree.pack(fill="both", expand=True, pady=(8, 0))
         vsb = ttk.Scrollbar(self.tree, orient="vertical",
                             command=self.tree.yview)
@@ -6152,7 +6188,7 @@ class QualityTab(ttk.Frame):
             rows = rows[:MAX_DISPLAY_ROWS]
             self._final_status += (
                 f"  |  table shows the top {MAX_DISPLAY_ROWS:,} of "
-                f"{len(self._filtered):,} - filter further, or Export CSV "
+                f"{len(self._filtered):,} - filter further, or Copy proxies "
                 f"for all of them")
         self.shown_count_lbl.config(
             text=(f"{len(rows):,} of {len(self._filtered):,} shown" if capped
@@ -6292,6 +6328,40 @@ class QualityTab(ttk.Frame):
         self.update_idletasks()
         self.status_lbl.config(
             text=f"Copied {len(lines)} proxy(ies) to clipboard.")
+
+    def on_copy_results(self):
+        """Copy proxies to the clipboard: the highlighted ones, or every proxy
+        that passed the filters when nothing is highlighted.
+
+        The 'nothing highlighted' case reads _filtered, NOT the table. The
+        table stops at MAX_DISPLAY_ROWS, so copying from it would silently hand
+        over the first 20,000 of a much larger filtered set - and a short
+        proxy list looks exactly like a correct one until it's already in use
+        somewhere else."""
+        sel = self.tree.selection()
+        if sel:
+            lines = [self._item_full.get(i, "") for i in sel]
+            scope = "selected"
+        else:
+            lines = [(r.get("full") or r.get("proxy") or "")
+                     for r in getattr(self, "_filtered", self._rows)]
+            scope = "filtered"
+        lines = [ln for ln in lines if ln]
+        if not lines:
+            self.status_lbl.config(
+                text="Nothing to copy - score a list first, or loosen the "
+                     "filters.")
+            return
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(lines))
+        self.update_idletasks()
+        extra = ""
+        if scope == "filtered" and len(lines) > MAX_DISPLAY_ROWS:
+            # Say it explicitly: the count copied is larger than the count on
+            # screen, which is right but surprising.
+            extra = f" (all of them - the table only shows {MAX_DISPLAY_ROWS:,})"
+        self.status_lbl.config(
+            text=f"Copied {len(lines):,} {scope} proxy(ies) to clipboard{extra}.")
 
     def on_export(self):
         # Export the highlighted rows; if nothing is highlighted, export every

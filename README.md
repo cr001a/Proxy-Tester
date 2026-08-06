@@ -470,15 +470,25 @@ status (`200` reachable, `407` auth, `502`/`504` upstream). Pick a single site
 - Per-request timeout defaults to 15s.
 - A dead proxy or ASN shows a status in its own row and never blocks the others
   or crashes the app.
-- **Export CSV** on each tab writes the current results to a `.csv`. With rows
-  highlighted it exports just those; with nothing highlighted it exports every
-  row that passed the filters — including rows past the 20,000-row display cap,
-  so a big run never hands back a quietly truncated file.
-- **Copying:** every results table and the ASN catalog have a **right-click
-  menu** with *Copy selected* / *Select all*, alongside `Ctrl+C` / `Ctrl+A`.
-  The menu matters on remote desktops — a Mac keyboard driving a Windows box
-  over RDP sends `Cmd`, which Windows never receives as `Ctrl`, so the shortcut
-  silently does nothing. Right-clicking a row outside the current selection
-  selects it; right-clicking inside a multi-row selection keeps the whole
-  selection. ASN results copy as tab-separated rows (paste-ready for a
+- **Copy proxies** is the primary action on IP Quality, because what the list
+  is *for* is feeding proxies into something else. With rows highlighted it
+  copies those; with nothing highlighted it copies **every proxy that passed
+  the filters** — including rows past the 20,000-row display cap, and it says
+  so in the status line when the count copied exceeds the count on screen.
+  (Copying from the visible table instead would hand back a short list that
+  looks entirely correct until it's already loaded somewhere else.) Full CSV
+  with every column is still there, on the table's **right-click menu**.
+- **Export CSV** on the other tabs writes the current results to a `.csv`. With
+  rows highlighted it exports just those; with nothing highlighted it exports
+  every row that passed the filters.
+- **Copying:** `Ctrl+C` / `Ctrl+A` and `Cmd+C` / `Cmd+A` both work on every
+  results table and the ASN catalog — **both modifiers are bound**, because on
+  a Mac the shortcut is `Cmd`, which Tk reports as a different modifier that no
+  `Control` binding ever sees. Clicking a table also claims keyboard focus, or
+  the keystroke would go nowhere. There's a **right-click menu** with *Copy
+  selected* / *Select all* as well, which is what covers a Mac keyboard driving
+  a Windows box over RDP — there `Cmd` isn't delivered as `Ctrl` at all, so no
+  binding on either side can catch it. Right-clicking a row outside the current
+  selection selects it; right-clicking inside a multi-row selection keeps the
+  whole selection. ASN results copy as tab-separated rows (paste-ready for a
   spreadsheet); proxy tables copy full `host:port:user:pass`.
