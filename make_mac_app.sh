@@ -89,13 +89,48 @@ else
     exit 1
 fi
 
-if ! command -v python3 >/dev/null 2>&1; then
-    osascript -e 'display alert "ProxyTester" message "python3 was not found. Install Python from python.org (it includes the tkinter GUI toolkit)."'
-    exit 1
-fi
+# Find a python3 that can ACTUALLY import tkinter, rather than taking the first
+# one on PATH and giving up if it can't. Homebrew's python3 ships without Tk
+# unless python-tk is installed separately, and it sits near the front of the
+# PATH above - so a Mac that has a perfectly good Apple or python.org Python
+# would still fail on the Homebrew one. Each candidate is probed, not assumed.
+#
+# Order is deliberate: the python.org framework build first because it bundles
+# Tk 8.6, and Apple's /usr/bin/python3 last because it links the system Tk 8.5,
+# which renders a blank window on some macOS versions. Working-but-ugly beats
+# not starting, so it stays in the list.
+PY=""
+TRIED=""
+for cand in \\
+    /Library/Frameworks/Python.framework/Versions/Current/bin/python3 \\
+    /Library/Frameworks/Python.framework/Versions/3.14/bin/python3 \\
+    /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 \\
+    /Library/Frameworks/Python.framework/Versions/3.12/bin/python3 \\
+    /Library/Frameworks/Python.framework/Versions/3.11/bin/python3 \\
+    /opt/homebrew/bin/python3 \\
+    /usr/local/bin/python3 \\
+    python3 \\
+    /usr/bin/python3
+do
+    resolved="\$(command -v "\$cand" 2>/dev/null)" || continue
+    [ -n "\$resolved" ] && [ -x "\$resolved" ] || continue
+    case " \$TRIED " in *" \$resolved "*) continue ;; esac
+    TRIED="\$TRIED \$resolved"
+    if "\$resolved" -c "import tkinter" >/dev/null 2>&1; then
+        PY="\$resolved"
+        break
+    fi
+done
 
-if ! python3 -c "import tkinter" >/dev/null 2>&1; then
-    osascript -e 'display alert "ProxyTester" message "Your python3 has no tkinter. Install Python from python.org, or run: brew install python-tk"'
+if [ -z "\$PY" ]; then
+    if [ -z "\$TRIED" ]; then
+        MSG="No python3 was found on this Mac. Install Python from python.org - it includes the tkinter GUI toolkit."
+    else
+        MSG="Found python3, but none of these can import tkinter:\$TRIED
+
+Install Python from python.org (it bundles Tk), or if you use Homebrew run: brew install python-tk"
+    fi
+    osascript -e "display alert \\"ProxyTester\\" message \\"\$MSG\\""
     exit 1
 fi
 
@@ -120,7 +155,7 @@ if [ -z "\$PROXYTESTER_NO_AUTOPULL" ] && [ -d .git ] && command -v git >/dev/nul
     wait \$watchdog_pid 2>/dev/null
 fi
 
-exec python3 proxy_tester.py
+exec "\$PY" proxy_tester.py
 LAUNCHER
 chmod +x "$APP/Contents/MacOS/ProxyTester"
 

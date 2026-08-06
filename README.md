@@ -264,7 +264,25 @@ already has. Set `PROXYTESTER_NO_AUTOPULL=1` to disable the launch-time pull.
 > bundle's launcher, so an `.app` built before this change still needs a manual
 > `git pull` that one last time.
 
-If `python3` or `tkinter` is missing, the launcher says so in a dialog instead of
+### Which Python the launcher uses
+
+macOS Macs routinely have several `python3` binaries, and **not all of them have
+tkinter** — Homebrew's ships without it unless you also `brew install
+python-tk`. The launcher therefore **probes candidates and picks the first one
+that can actually `import tkinter`**, rather than taking whatever is first on
+`PATH` and giving up if that one can't.
+
+Preference order: the python.org framework build (it bundles **Tk 8.6**), then
+Homebrew, then `/usr/local/bin`, then `PATH`, and Apple's `/usr/bin/python3`
+last — that one links the **system Tk 8.5**, which renders a blank window on
+some macOS versions, so it's a working-but-ugly fallback rather than a first
+choice.
+
+If nothing on the machine has tkinter, the dialog **lists every interpreter it
+tried** so you can see what's installed, and points at the two fixes (python.org
+installer, or `brew install python-tk`).
+
+If `python3` can't be found at all, the launcher says so in a dialog instead of
 failing silently.
 
 ---
