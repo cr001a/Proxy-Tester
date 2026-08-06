@@ -39,7 +39,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote, unquote, urlsplit
 
 # macOS system Tk (8.5) prints a deprecation warning on import when running from
@@ -60,8 +60,19 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "5.0"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "5.2"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
+
+# Worker threads get a 512 KB stack instead of the platform default (8 MB on
+# Linux, and the linker default on Windows). The pools here run up to 1,200
+# threads wide, and 8 MB apiece reserves ~9.4 GB of address space - enough to
+# fail thread creation outright and to push a loaded machine around. These
+# workers only nest a few frames deep (socket -> TLS -> HTTP read), so 512 KB
+# is generous. Must be set before any thread starts, hence import time.
+try:
+    threading.stack_size(512 * 1024)
+except (ValueError, RuntimeError):
+    pass                            # platform won't take it; the default works
 
 
 def _make_ssl_context():
@@ -1608,7 +1619,8 @@ def _read_http_body(sock, cap=65536):
 
 
 def discover_exit_ip_direct(proxy, connect_timeout, read_timeout,
-                            stop_event=None, total_budget=None):
+                            stop_event=None, total_budget=None,
+                            want_geo=False):
     """Resolve a proxy's exit IP in ONE connection: TCP -> CONNECT tunnel ->
     TLS -> GET -> body, with a SHORT timeout on the connect/tunnel phase and a
     longer one on the request phase.
@@ -1624,7 +1636,13 @@ def discover_exit_ip_direct(proxy, connect_timeout, read_timeout,
     `total_budget` (seconds) caps the WHOLE attempt, not just each phase. The
     speed gate feeds it: a proxy slower than the gate is going to be filtered
     out of scoring anyway, so waiting the full read budget for it buys nothing
-    and lets one straggler set the wall clock for the entire run."""
+    and lets one straggler set the wall clock for the entire run.
+
+    `want_geo` also keeps the provider/ASN and location out of the response
+    body, which costs no extra network - it's the same JSON either way. It is
+    off by default because IP Quality resolves hundreds of thousands of proxies
+    and never displays those two fields; retaining them there would add ~80 MB
+    to a 400k run for strings nothing reads."""
     host, port = proxy["host"], proxy["port"]
     user, pw = proxy["user"], proxy["pw"]
     display = (f"{host}:{port}:{user}:****" if user and pw is not None
@@ -1632,7 +1650,7 @@ def discover_exit_ip_direct(proxy, connect_timeout, read_timeout,
     full = (f"{host}:{port}:{user}:{pw}" if user and pw is not None
             else (f"{host}:{port}:{user}" if user else f"{host}:{port}"))
     out = {"proxy": display, "full": full, "exit_ip": "", "ping": None,
-           "status": "stopped"}
+           "org": "", "location": "", "status": "stopped"}
     if stop_event is not None and stop_event.is_set():
         return out
     try:
@@ -1698,7 +1716,18 @@ def discover_exit_ip_direct(proxy, connect_timeout, read_timeout,
         ip = _parse_json_field(body, "ip")
         if not ip:
             return {**out, "status": "no exit ip"}
-        return {**out, "exit_ip": ip, "ping": ms, "status": "OK"}
+        if not want_geo:
+            return {**out, "exit_ip": ip, "ping": ms, "status": "OK"}
+        # The provider/ASN and location are in the SAME response body we just
+        # paid for, so pulling them out costs no extra network. They used to be
+        # discarded unconditionally, which is why a fast sweep left the
+        # Provider/ASN and Location columns blank and read as reporting nothing.
+        city = _parse_json_field(body, "city")
+        region = _parse_json_field(body, "region")
+        country = _parse_json_field(body, "country")
+        return {**out, "exit_ip": ip, "ping": ms, "status": "OK",
+                "org": _parse_json_field(body, "org"),
+                "location": ", ".join(p for p in (city, region, country) if p)}
     except socket.timeout:
         return {**out, "status": "timeout"}
     except ssl.SSLError:
@@ -2133,7 +2162,15 @@ def get_workers():
 FAST_WORKERS_CAP = 1200
 FAST_MIN_WORKERS = 200
 FAST_MODE = "Liveness (fast)"
-FULL_MODE = "Full (exit IP + geo)"
+# The middle mode, and the default. One connection does TCP -> CONNECT -> TLS
+# -> GET -> body with staged timeouts, so it returns the exit IP, provider/ASN
+# and location for barely more than the connect-only probe costs - the extra
+# work is a TLS handshake and one small GET on a tunnel that is already open.
+# Liveness mode leaves those three columns empty by design, which reads as
+# "reported nothing"; Full mode fills them but goes through urllib, redialling
+# per run with no staged timeouts. This is the one worth reaching for.
+RESOLVE_MODE = "Exit IP + geo (fast)"
+FULL_MODE = "Full (custom URL)"
 DEFAULT_FAST_TIMEOUT = 5      # seconds - a CONNECT is one RTT; 5s spares slow
                              # residential/mobile gateways without holding a
                              # dead proxy for the full 15s.
@@ -2175,6 +2212,81 @@ def get_score_workers():
     providers not already resolved via a batch endpoint. Not user-tunable -
     see DEFAULT_SCORE_WORKERS for why this number is safe."""
     return DEFAULT_SCORE_WORKERS
+
+
+# Hard cap on rows painted into a results table. Nothing is discarded - the
+# full result set stays in memory for filtering and exports intact - but a
+# ttk.Treeview stores every row as Tcl objects, which cost far more than the
+# Python dict behind them, and a table hundreds of thousands of rows long is
+# unreadable regardless. Rows are sorted best-first, so the cap keeps the ones
+# worth looking at.
+MAX_DISPLAY_ROWS = 20000
+
+
+def run_streaming(items, fn, workers, on_result, stop_event=None):
+    """Run fn over every item using a FIXED pool of threads that pull from a
+    shared iterator. Returns once every item is done (or stop_event is set).
+
+    This exists instead of ThreadPoolExecutor.submit()-per-item because submit
+    builds one Future - and one work-queue entry - for EVERY item before any of
+    them run. A Future is not cheap: it carries its own threading.Condition,
+    which is a lock plus a waiter deque. Measured, that is ~1.6 KB apiece:
+
+        400,000 items  ->  639 MB of Futures before a single socket opens
+
+    On a 400k list that allocation alone, before any work, was enough to push
+    the machine into swap and take it down. Here the threads call next() on a
+    shared iterator, so the only per-item memory in flight is the handful the
+    workers are actively holding - flat whether the list is 20 thousand or 4
+    million.
+
+    on_result(item, result, exc) is called from the worker threads but
+    serialised under a lock, so callers can append to plain lists/dicts without
+    doing their own locking. Exactly one of result/exc is meaningful: a raised
+    exception is handed over rather than swallowed, matching Future.result().
+    Keep the callback cheap - it holds the lock, so anything O(n) in there
+    becomes O(n^2) across the run and stalls every worker.
+    """
+    src = iter(items)
+    src_lock = threading.Lock()
+    out_lock = threading.Lock()
+
+    def _worker():
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                return
+            with src_lock:
+                try:
+                    item = next(src)
+                except StopIteration:
+                    return
+            result = exc = None
+            try:
+                result = fn(item)
+            except Exception as e:          # handed to the caller, not hidden
+                exc = e
+            with out_lock:
+                on_result(item, result, exc)
+
+    n = max(1, int(workers))
+    try:
+        n = min(n, max(1, len(items)))     # don't spawn 1200 threads for 5 items
+    except TypeError:
+        pass                                # a bare iterator has no len()
+    threads = [threading.Thread(target=_worker, daemon=True,
+                                name=f"pt-worker-{i}") for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+
+def progress_every(total):
+    """How often to push a progress update for a run of `total` items. A fixed
+    interval doesn't scale: every 200 items is fine for 5,000 but fires 2,000
+    times on a 400k list, and each one is a cross-thread queue put the GUI then
+    has to drain. Aim for ~400 updates whatever the size."""
+    return max(50, total // 400)
 
 
 def split_creds(value):
@@ -3771,6 +3883,9 @@ class ProxyTab(ttk.Frame):
         self.stop_event = threading.Event()
         self._sort_dir = {}       # column -> current sort direction
         self._row_full = {}       # tree item id -> full host:port:user:pass
+        self._results = []        # every result dict this run produced. The
+                                  # table is capped at MAX_DISPLAY_ROWS; this
+                                  # is not, and it's what cull/counts read.
         self._build()
 
     def _build(self):
@@ -3792,14 +3907,18 @@ class ProxyTab(ttk.Frame):
         self.url = tk.StringVar(value="https://ipinfo.io/json")
         self.runs = tk.StringVar(value="1")
 
-        # Test mode. Liveness (fast) is connect-only - one CONNECT handshake per
-        # proxy, no TLS/GET/body - so it blazes through huge lists but only
-        # proves the tunnel opens. Full does the exit-IP GET (slower, richer).
-        self.test_mode = tk.StringVar(value=FAST_MODE)
+        # Test mode, cheapest first. Liveness is connect-only - one CONNECT
+        # handshake per proxy, no TLS/GET/body - so it blazes through huge
+        # lists but only proves the tunnel opens, leaving the Exit IP,
+        # Provider/ASN and Location columns empty. Exit IP + geo resolves all
+        # three on the SAME single connection for barely more cost, which
+        # makes it the right default. Full is the urllib path, for testing a
+        # custom URL over several runs.
+        self.test_mode = tk.StringVar(value=RESOLVE_MODE)
         ttk.Label(form, text="Test mode").grid(row=0, column=1, sticky="w")
         self.mode_cb = ttk.Combobox(
             form, textvariable=self.test_mode, state="readonly", width=22,
-            values=[FAST_MODE, FULL_MODE])
+            values=[FAST_MODE, RESOLVE_MODE, FULL_MODE])
         self.mode_cb.grid(row=0, column=2, sticky="w", pady=3)
         self.mode_cb.bind("<<ComboboxSelected>>", self._on_mode_change)
 
@@ -3890,6 +4009,10 @@ class ProxyTab(ttk.Frame):
         tag_tree(self.tree)
         enable_drag_select(self.tree)
         self.tree.pack(fill="both", expand=True, pady=(8, 0))
+        # Re-apply the mode now the tree exists: _on_mode_change ran during the
+        # form build, before this widget, so its column visibility had nothing
+        # to act on.
+        self._on_mode_change()
         # Ctrl+C copies the selected proxies (full host:port:user:pass), Ctrl+A
         # selects every row - matching the IP Quality tab.
         self.tree.bind("<Control-c>", self._copy_selected)
@@ -3941,34 +4064,55 @@ class ProxyTab(ttk.Frame):
         self.url.set(d.get("url", "https://ipinfo.io/json"))
         self.runs.set(d.get("runs", "1"))
 
+    # What each mode measures. Keyed by mode so adding one can't leave a stale
+    # if/else behind.
+    MODE_HINTS = {
+        FAST_MODE: ("Connect-only: opens a CONNECT tunnel per proxy. Fastest, "
+                    "but proves only that the tunnel opens - there is no exit "
+                    "IP to report, so those columns are hidden (URL ignored)."),
+        RESOLVE_MODE: ("One connection per proxy: CONNECT + TLS + GET with "
+                       "staged timeouts. Nearly as fast as connect-only, and "
+                       "returns exit IP, provider/ASN and location (URL "
+                       "ignored)."),
+        FULL_MODE: ("Full GET to the Test URL via urllib, redialled every "
+                    "run. Slowest - for testing a specific URL, not for "
+                    "sweeping a big list."),
+    }
+
     def _on_mode_change(self, _event=None):
-        """Fast mode is connect-only, so the Test URL doesn't apply - grey it
-        out and swap the hint text so it's clear what each mode measures."""
-        fast = self.test_mode.get() == FAST_MODE
+        """Swap the hint, enable the Test URL only where it's used, and hide
+        the columns the chosen mode cannot fill. Connect-only genuinely has no
+        exit IP to report, and three permanently blank columns read as a broken
+        run rather than a deliberate trade-off."""
+        mode = self.test_mode.get()
         try:
-            self.url_entry.config(state="disabled" if fast else "normal")
+            self.url_entry.config(
+                state="normal" if mode == FULL_MODE else "disabled")
         except Exception:
             pass
-        self.mode_hint.config(
-            text=("Connect-only: opens a CONNECT tunnel per proxy - fast, but "
-                  "no exit IP (URL ignored)."
-                  if fast else
-                  "Full GET to the Test URL - slower; harvests exit IP, ASN "
-                  "and location."))
+        cols = self.COLUMNS
+        if mode == FAST_MODE:
+            cols = tuple(c for c in cols
+                         if c not in ("exit_ip", "org", "location"))
+        try:
+            self.tree.config(displaycolumns=cols)
+        except Exception:
+            pass
+        self.mode_hint.config(text=self.MODE_HINTS.get(mode, ""))
 
     def on_run(self):
         if self.running:
             return
-        fast = self.test_mode.get() == FAST_MODE
+        mode = self.test_mode.get()
         url = self.url.get().strip()
         try:
             runs = max(1, int(self.runs.get().strip()))
         except ValueError:
             messagebox.showerror("ProxyTester", "Runs per proxy must be a number.")
             return
-        # Fast (connect-only) mode ignores the Test URL - it CONNECTs to a
-        # neutral target - so only require a URL for Full mode.
-        if not fast and not url:
+        # Only Full mode uses the Test URL. Both fast modes go to a neutral
+        # target of their own, so an empty URL must not block them.
+        if mode == FULL_MODE and not url:
             messagebox.showerror("ProxyTester", "Test URL is required.")
             return
 
@@ -3990,6 +4134,7 @@ class ProxyTab(ttk.Frame):
 
         self.tree.delete(*self.tree.get_children())
         self._row_full = {}
+        self._results = []
         self.running = True
         self.stop_event.clear()
         self.run_btn.config(text="Stop", style="Stop.TButton",
@@ -4003,7 +4148,7 @@ class ProxyTab(ttk.Frame):
         self.status_lbl.config(text=f"Testing 0/{len(proxies)}...")
 
         worker = threading.Thread(
-            target=self._run_pool, args=(proxies, url, runs, fast), daemon=True)
+            target=self._run_pool, args=(proxies, url, runs, mode), daemon=True)
         worker.start()
         self.after(100, self._drain_queue)
 
@@ -4014,36 +4159,56 @@ class ProxyTab(ttk.Frame):
         self.run_btn.config(state="disabled")
         self.status_lbl.config(text="Stopping...")
 
-    def _run_pool(self, proxies, url, runs, fast=False):
+    def _run_pool(self, proxies, url, runs, mode=FAST_MODE):
         # Proxy testing is pure network I/O, so parallelism is the main speed
-        # lever. The connect-only fast path is cheap enough to run far wider
-        # (and with a short timeout) than the full-GET path.
-        if fast:
-            workers = get_fast_workers()
-            fast_to = get_fast_timeout()
-        else:
+        # lever. Both single-connection modes are cheap enough to run far wider
+        # (and with shorter timeouts) than the urllib full-GET path.
+        if mode == FULL_MODE:
             workers = min(MAX_WORKERS_CAP,
                           max(get_workers(), min(len(proxies), 40)))
+
+            def _test(p):
+                return test_proxy(p, url, runs, DEFAULT_TIMEOUT,
+                                  self.stop_event)
+        elif mode == RESOLVE_MODE:
+            workers = get_fast_workers()
+            connect_to = get_fast_timeout()
+
+            def _test(p):
+                # The same single-pass resolver IP Quality stage 1 uses, mapped
+                # onto this tab's row shape. `runs` doesn't apply: one pass IS
+                # the measurement, and re-dialling a proxy to average a number
+                # the run doesn't use would just multiply the wall clock.
+                d = discover_exit_ip_direct(p, connect_to, EXIT_IP_READ_TIMEOUT,
+                                            self.stop_event, want_geo=True)
+                ok = d["status"] == "OK"
+                return {"proxy": d["proxy"], "full": d["full"],
+                        "status": d["status"], "code": "200" if ok else "-",
+                        "median": d["ping"], "success": 1 if ok else 0,
+                        "runs": 1, "exit_ip": d["exit_ip"],
+                        "org": d.get("org", ""),
+                        "location": d.get("location", ""), "reason": ""}
+        else:
+            workers = get_fast_workers()
+            fast_to = get_fast_timeout()
+
+            def _test(p):
+                return test_proxy_fast(p, runs, fast_to, self.stop_event)
+
+        def _on_result(p, result, exc):
+            if exc is not None:
+                result = {"proxy": f"{p['host']}:{p['port']}",
+                          "status": "unreachable", "code": "-",
+                          "median": None, "success": 0, "runs": runs,
+                          "exit_ip": "", "reason": str(exc)}
+            self.queue.put(result)
+
         try:
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = {}
-                for p in proxies:
-                    if fast:
-                        fut = pool.submit(test_proxy_fast, p, runs, fast_to,
-                                          self.stop_event)
-                    else:
-                        fut = pool.submit(test_proxy, p, url, runs,
-                                          DEFAULT_TIMEOUT, self.stop_event)
-                    futures[fut] = p
-                for fut, p in futures.items():
-                    try:
-                        result = fut.result()
-                    except Exception as e:
-                        result = {"proxy": f"{p['host']}:{p['port']}",
-                                  "status": "unreachable", "code": "-",
-                                  "median": None, "success": 0, "runs": runs,
-                                  "exit_ip": "", "reason": str(e)}
-                    self.queue.put(result)
+            # run_streaming rather than a Future per proxy - see its docstring.
+            # This loop also used to hand results back in SUBMISSION order, so
+            # a single slow proxy near the front held every finished result
+            # behind it and the run looked stalled when it wasn't.
+            run_streaming(proxies, _test, workers, _on_result, self.stop_event)
         finally:
             self.queue.put({"_done": True})
 
@@ -4054,7 +4219,16 @@ class ProxyTab(ttk.Frame):
                 if item.get("_done"):
                     self._finish()
                     return
-                self._insert_row(item)
+                # Every result is kept in Python; only the first
+                # MAX_DISPLAY_ROWS are painted. A ttk.Treeview holds each row
+                # as Tcl objects, far heavier than the dict behind it, so a
+                # 400k-proxy sweep used to spend gigabytes on a table nobody
+                # could read. Cull, the speed filter and the counters all read
+                # _results, so nothing below the cap is lost - it just isn't
+                # drawn.
+                self._results.append(item)
+                if len(self._results) <= MAX_DISPLAY_ROWS:
+                    self._insert_row(item)
                 # Live counter: count proxy-test results and proxy-ping results
                 # (both stream one row per proxy); skip direct site-ping rows.
                 cfg = getattr(self, "_count_cfg", None)
@@ -4174,16 +4348,20 @@ class ProxyTab(ttk.Frame):
         # onto the ping rows (the CONNECT ping itself resolves no geo).
         self._loc_map = {}
         if via_proxy:
-            for iid in self.tree.get_children():
-                vals = self.tree.item(iid, "values")
-                if str(vals[0]).startswith("PING"):
+            # From _results, not the table - past the display cap the table
+            # doesn't have the row to harvest geo from.
+            for r in getattr(self, "_results", []):
+                if r.get("_ping") or r.get("_pping"):
                     continue
-                ident = self._proxy_ident(vals[0])
+                ident = self._proxy_ident(r.get("proxy", ""))
                 if ident:
-                    self._loc_map[ident] = (vals[5], vals[6], vals[7])
+                    self._loc_map[ident] = (r.get("exit_ip", ""),
+                                            r.get("org", ""),
+                                            r.get("location", ""))
         # A fresh ping starts with a clean table (results replace the Run).
         self.tree.delete(*self.tree.get_children())
         self._row_full = {}
+        self._results = []
 
         self.running = True
         self.stop_event.clear()
@@ -4223,16 +4401,18 @@ class ProxyTab(ttk.Frame):
     def _proxy_ping_worker(self, proxies, target, runs):
         name, url = target
         workers = min(MAX_WORKERS_CAP, max(get_workers(), min(len(proxies), 40)))
+        def _on_result(p, result, exc):
+            if exc is None:
+                self.queue.put(result)
+
         try:
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futs = {pool.submit(ping_site_via_proxy, p, name, url, runs,
-                                    DEFAULT_TIMEOUT, self.stop_event): p
-                        for p in proxies}
-                for fut in futs:
-                    try:
-                        self.queue.put(fut.result())
-                    except Exception:
-                        pass
+            # run_streaming, not a Future per proxy - this pings through the
+            # same list the Run tab tests, so it hits the same 400k scale.
+            run_streaming(
+                proxies,
+                lambda p: ping_site_via_proxy(p, name, url, runs,
+                                              DEFAULT_TIMEOUT, self.stop_event),
+                workers, _on_result, self.stop_event)
         finally:
             self.queue.put({"_done": True})
 
@@ -4247,31 +4427,37 @@ class ProxyTab(ttk.Frame):
         elapsed_s = (time.perf_counter()
                     - getattr(self, "_run_started", time.perf_counter()))
         elapsed = _fmt_elapsed(elapsed_s)
+        # Say so when the table is showing less than the run produced -
+        # otherwise "20,000 rows" reads as "that's all there was".
+        n_res = len(getattr(self, "_results", []))
+        capped = (f"  |  table shows the first {MAX_DISPLAY_ROWS:,} of "
+                  f"{n_res:,} - Cull and the speed filter still use all of "
+                  f"them" if n_res > MAX_DISPLAY_ROWS else "")
         if getattr(self, "_ping_mode", None) == "proxy":
             # Summarise the CONNECT-tunnel ping run from the live counters.
             ok, total = self._live, self._tested
             rate = f", {total / max(elapsed_s, 0.001):.0f}/s" if not stopped else ""
             self.status_lbl.config(
                 text=f"{base} in {elapsed} - {total} pinged, {ok} reachable, "
-                     f"{total - ok} failed{rate}")
+                     f"{total - ok} failed{rate}{capped}")
         else:
             tested, alive = self._proxy_counts()
             dead = tested - alive
             rate = f", {tested / max(elapsed_s, 0.001):.0f}/s" if not stopped else ""
             self.status_lbl.config(
                 text=f"{base} in {elapsed} - {tested} tested, {alive} live, "
-                     f"{dead} dead{rate}")
+                     f"{dead} dead{rate}{capped}")
         self._ping_mode = None
 
     def _proxy_counts(self):
-        """(tested, live) over proxy-test rows only (Site-ping rows excluded)."""
+        """(tested, live) over proxy-test rows only (Site-ping rows excluded).
+        Counted from _results so the totals stay true past the display cap."""
         tested = alive = 0
-        for iid in self.tree.get_children():
-            vals = self.tree.item(iid, "values")
-            if str(vals[0]).startswith("PING"):
+        for r in self._results:
+            if r.get("_ping") or r.get("_pping"):
                 continue
             tested += 1
-            if vals[1] == "OK":
+            if r.get("status") == "OK":
                 alive += 1
         return tested, alive
 
@@ -4306,45 +4492,57 @@ class ProxyTab(ttk.Frame):
             return f"{p['host']}:{p['port']}:{p['user']}:{p['pw']}"
         return f"{p['host']}:{p['port']}"
 
+    def _repaint_results(self):
+        """Redraw the table from _results, up to the display cap."""
+        self.tree.delete(*self.tree.get_children())
+        self._row_full = {}
+        for r in self._results[:MAX_DISPLAY_ROWS]:
+            self._insert_row(r)
+
     def _cull(self, want_removed, label):
-        """Shared cull: `want_removed(vals)` decides if a result row's proxy
-        should be dropped. Removes those rows AND the exact matching input lines
+        """Shared cull: `want_removed(row)` decides if a result's proxy should
+        be dropped. Removes those results AND the exact matching input lines
         (matched by full key, so session-in-password proxies cull correctly).
-        Rows without a real proxy (direct Site-ping) are ignored."""
-        remove_keys, remove_iids = set(), []
-        candidates = 0
-        for iid in self.tree.get_children():
-            full = self._row_full.get(iid)
+        Results without a real proxy (direct Site-ping) are ignored.
+
+        This reads _results, not the table: the table stops at
+        MAX_DISPLAY_ROWS, so culling from it would quietly spare every proxy
+        past that point - on a 400k sweep it would leave the dead ones in."""
+        remove_keys, keep_rows = set(), []
+        candidates = removed = 0
+        for r in self._results:
+            full = r.get("full")
             if not full:
-                continue                       # direct-ping / non-proxy row
+                keep_rows.append(r)            # direct-ping / non-proxy row
+                continue
             candidates += 1
-            vals = self.tree.item(iid, "values")
-            if want_removed(vals):
+            if want_removed(r):
                 k = self._full_key(full)
                 if k:
                     remove_keys.add(k)
-                remove_iids.append(iid)
+                removed += 1
+            else:
+                keep_rows.append(r)
         if not candidates:
             self.status_lbl.config(text="Run or Ping proxies first")
             return
-        if not remove_iids:
+        if not removed:
             self.status_lbl.config(text=f"No {label} proxies to cull")
             return
-        for iid in remove_iids:
-            self.tree.delete(iid)
-            self._row_full.pop(iid, None)
+        self._results = keep_rows
+        self._repaint_results()
         kept = [ln for ln in self.proxy_text.get("1.0", "end").splitlines()
                 if ln.strip() and self._full_key(ln) not in remove_keys]
         self.proxy_text.delete("1.0", "end")
         self.proxy_text.insert("1.0", "\n".join(kept))
         self._update_proxy_count(force=True)
         self.status_lbl.config(
-            text=f"Culled {len(remove_iids)} {label}; kept {len(kept)}")
+            text=f"Culled {removed} {label}; kept {len(kept)}")
 
     def on_cull_dead(self):
         """Drop dead (non-OK) proxies - from Run results OR proxied Site-ping
         results - and their input lines."""
-        self._cull(lambda vals: vals[1] != "OK", "dead")
+        self._cull(lambda r: r.get("status") != "OK", "dead")
 
     def on_cull_slow(self):
         """Speed filter (REVERSIBLE): rebuild the proxy list from the intact
@@ -4358,17 +4556,13 @@ class ProxyTab(ttk.Frame):
             self.status_lbl.config(text="Enter a valid ms threshold")
             return
         kept, seen, excluded, candidates = [], set(), 0, 0
-        for iid in self.tree.get_children():
-            full = self._row_full.get(iid)
+        for r in self._results:               # _results, not the capped table
+            full = r.get("full")
             if not full:
                 continue                       # direct-ping / non-proxy row
             candidates += 1
-            vals = self.tree.item(iid, "values")
-            try:
-                ms = float(vals[3])
-            except (TypeError, ValueError):
-                ms = None                      # dead row - keep (Cull dead's job)
-            if ms is not None and ms > thr:
+            ms = r.get("median")               # None on a dead row - keep it,
+            if ms is not None and ms > thr:    # that's Cull dead's job
                 excluded += 1
                 continue
             key = self._full_key(full)
@@ -4663,6 +4857,41 @@ def _reveal_in_folder(path):
             os.startfile(folder)     # Windows fallback
         except Exception:
             pass
+
+
+def _ask_csv_path():
+    """Ask where to save a CSV export. Returns the path, or '' if cancelled."""
+    return filedialog.asksaveasfilename(
+        defaultextension=".csv",
+        filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        title="Export results to CSV",
+        initialdir=_exports_dir(),
+        initialfile="proxytester_results.csv")
+
+
+def export_dict_rows_csv(rows, headings, cells):
+    """Write result dicts straight to CSV, bypassing the results table.
+
+    The table is capped at MAX_DISPLAY_ROWS so a huge run can't blow up Tk, but
+    an export must still carry every row that survived the filters - reading
+    the CSV back off the (capped) tree would silently hand over a truncated
+    file. `cells(row)` returns that row's cells in heading order, with the
+    proxy unmasked."""
+    if not rows:
+        messagebox.showinfo("Export CSV", "No results to export yet.")
+        return
+    path = _ask_csv_path()
+    if not path:
+        return
+    try:
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(headings)
+            writer.writerows(cells(r) for r in rows)
+    except OSError as e:
+        messagebox.showerror("Export CSV", f"Could not write file:\n{e}")
+        return
+    _reveal_in_folder(path)
 
 
 def export_tree_csv(tree, columns, headings, full_map=None, full_col=0,
@@ -5455,29 +5684,39 @@ class QualityTab(ttk.Frame):
             if gate_ms is not None:
                 budget = min(float(read_to),
                              max(1.0, (gate_ms / 1000.0) * 1.5 + 0.5))
-            with ThreadPoolExecutor(max_workers=get_fast_workers()) as pool:
-                futs = {pool.submit(discover_exit_ip_direct, p, connect_to,
-                                    read_to, self.stop_event, budget): p
-                        for p in proxies}
-                done = 0
-                # as_completed, NOT submission order: a single slow proxy used
-                # to block every already-finished result behind it, so the bulk
-                # appeared stalled while it was actually done.
-                for fut in as_completed(futs):
-                    try:
-                        d = fut.result()
-                    except Exception as e:
-                        p = futs[fut]
-                        d = {"proxy": f"{p['host']}:{p['port']}", "exit_ip": "",
-                             "ping": None, "status": str(e)[:60],
-                             "full": f"{p['host']}:{p['port']}"}
-                    discoveries.append(d)
-                    done += 1
-                    if done % 200 == 0:
-                        live_n = sum(1 for x in discoveries if x.get("exit_ip"))
-                        self.queue.put({"_status":
-                                        f"Resolving {done}/{len(proxies)} "
-                                        f"({live_n} live so far)..."})
+            # run_streaming, NOT a Future per proxy: submit-per-item allocated
+            # ~1.6 KB of Future for every entry BEFORE any of them ran, which
+            # on a 400k list is 639 MB of pure bookkeeping and is what took a
+            # machine down mid-run. See run_streaming for the measurement.
+            # Results still arrive completion-first, so one slow proxy never
+            # holds finished ones behind it.
+            n_proxies = len(proxies)
+            step = progress_every(n_proxies)
+            counts = {"done": 0, "live": 0}
+
+            def _on_discovery(p, d, exc):
+                if exc is not None:
+                    d = {"proxy": f"{p['host']}:{p['port']}", "exit_ip": "",
+                         "ping": None, "status": str(exc)[:60],
+                         "full": f"{p['host']}:{p['port']}"}
+                discoveries.append(d)
+                counts["done"] += 1
+                # A RUNNING counter, not a rescan. This used to re-count the
+                # whole discoveries list on every progress tick - O(n^2), so a
+                # 400k run burned hundreds of millions of dict lookups here,
+                # holding the result lock while every worker waited on it.
+                if d.get("exit_ip"):
+                    counts["live"] += 1
+                if counts["done"] % step == 0:
+                    self.queue.put({"_status":
+                                    f"Resolving {counts['done']}/{n_proxies} "
+                                    f"({counts['live']} live so far)..."})
+
+            run_streaming(
+                proxies,
+                lambda p: discover_exit_ip_direct(p, connect_to, read_to,
+                                                  self.stop_event, budget),
+                get_fast_workers(), _on_discovery, self.stop_event)
 
             stage1_s = time.perf_counter() - t_stage1
             t_stage2 = time.perf_counter()
@@ -5563,27 +5802,33 @@ class QualityTab(ttk.Frame):
                         pre["proxycheck.io"] = pcheck_precomputed[ip]
                     return pre or None
 
-                with ThreadPoolExecutor(max_workers=score_workers) as pool:
-                    if provider == AGGREGATE_PROVIDER:
-                        futs = {pool.submit(
-                            score_ip, ip, provider, api_key, DEFAULT_TIMEOUT,
-                            breaker, _pre_for(ip)): ip
-                            for ip in unique}
-                    else:
-                        futs = {pool.submit(score_ip, ip, provider, api_key,
-                                            DEFAULT_TIMEOUT, breaker): ip
-                                for ip in unique}
-                    done = 0
-                    for fut in futs:
-                        ip = futs[fut]
-                        try:
-                            scores[ip] = fut.result()
-                        except Exception:
-                            scores[ip] = {"blacklisted": None}
-                        done += 1
-                        if done % 50 == 0:
-                            self.queue.put({"_status": f"Scored {done}/"
-                                            f"{unique_n} unique IP(s)..."})
+                if provider == AGGREGATE_PROVIDER:
+                    def _score_one(ip):
+                        return score_ip(ip, provider, api_key, DEFAULT_TIMEOUT,
+                                        breaker, _pre_for(ip))
+                else:
+                    def _score_one(ip):
+                        return score_ip(ip, provider, api_key, DEFAULT_TIMEOUT,
+                                        breaker)
+
+                # Same story as stage 1: no Future per IP. A 400k proxy list
+                # can carry nearly as many unique exit IPs, so this pool paid
+                # the 639 MB-per-400k bookkeeping bill a second time - on top
+                # of stage 1's, while stage 1's results were still resident.
+                # It also iterated futs in SUBMISSION order, so progress
+                # stalled behind whichever IP happened to be slowest early on.
+                step2 = progress_every(unique_n)
+                scored_n = {"done": 0}
+
+                def _on_score(ip, q, exc):
+                    scores[ip] = {"blacklisted": None} if exc is not None else q
+                    scored_n["done"] += 1
+                    if scored_n["done"] % step2 == 0:
+                        self.queue.put({"_status": f"Scored {scored_n['done']}/"
+                                        f"{unique_n} unique IP(s)..."})
+
+                run_streaming(unique, _score_one, score_workers, _on_score,
+                              self.stop_event)
 
             for q in scores.values():
                 if q.get("_error"):
@@ -5606,7 +5851,13 @@ class QualityTab(ttk.Frame):
                                            getattr(self, "_labels", None))
             shared_map = overlap["shared"]
             has_key = bool(api_key) or provider == AGGREGATE_PROVIDER
-            for d in discoveries:
+            # Drain discoveries as rows are built rather than iterating them.
+            # A discovery and the row made from it hold the same strings twice
+            # over; keeping both lists alive to the end of a 400k run costs an
+            # extra ~160 MB for no reason. pop() from the tail frees each one
+            # as soon as its row exists, so peak usage is one list, not two.
+            while discoveries:
+                d = discoveries.pop()
                 if d.get("_slow"):
                     row = self._slow_row(d, gate_ms)
                 else:
@@ -5620,6 +5871,7 @@ class QualityTab(ttk.Frame):
                     row["flags"] = (f"{len(sh)} pools "
                                     + (row.get("flags") or "")).strip()
                 self.queue.put(row)
+            scores.clear()                  # ~250 MB on a 400k run, done with
         finally:
             self.queue.put({"_done": True, "resolved": resolved,
                             "unique": unique_n, "provider_err": provider_err,
@@ -5888,7 +6140,26 @@ class QualityTab(ttk.Frame):
         self._final_status = self._summary or f"Showing {len(rows)}"
         if filt:
             self._final_status += f"  |  showing {len(rows)} [{', '.join(filt)}]"
-        self.shown_count_lbl.config(text=f"{len(rows):,} shown")
+
+        # Every filtered row, kept for CSV export even when the table below is
+        # capped - Export must never quietly hand back a truncated file.
+        self._filtered = rows
+        # A ttk.Treeview keeps each row as Tcl objects on the interpreter side,
+        # which is far heavier than the Python dict it came from. Painting a
+        # 400k-row result set was several GB on its own, and a table that long
+        # is unreadable anyway. Rows are already sorted best-Trust-first, so the
+        # cap keeps the ones that matter; the full set stays in memory for
+        # filtering and lands intact in an export.
+        capped = len(rows) > MAX_DISPLAY_ROWS
+        if capped:
+            rows = rows[:MAX_DISPLAY_ROWS]
+            self._final_status += (
+                f"  |  table shows the top {MAX_DISPLAY_ROWS:,} of "
+                f"{len(self._filtered):,} - filter further, or Export CSV "
+                f"for all of them")
+        self.shown_count_lbl.config(
+            text=(f"{len(rows):,} of {len(self._filtered):,} shown" if capped
+                  else f"{len(rows):,} shown"))
 
         # Cancel any in-flight paint (e.g. a filter toggled mid-render).
         if getattr(self, "_render_job", None):
@@ -6027,12 +6298,24 @@ class QualityTab(ttk.Frame):
 
     def on_export(self):
         # Export the highlighted rows; if nothing is highlighted, export every
-        # currently-shown (filtered) row.
+        # row that passed the filters. That last part goes through _filtered,
+        # NOT the tree: the tree is capped at MAX_DISPLAY_ROWS, so exporting
+        # from it would hand back a silently truncated file on a big run.
         sel = self.tree.selection()
-        export_tree_csv(self.tree, self.COLUMNS,
-                        [self.HEADINGS[c] for c in self.COLUMNS],
-                        full_map=self._item_full, full_col=0,
-                        items=sel if sel else None)
+        if sel:
+            export_tree_csv(self.tree, self.COLUMNS,
+                            [self.HEADINGS[c] for c in self.COLUMNS],
+                            full_map=self._item_full, full_col=0, items=sel)
+            return
+
+        def cells(r):
+            return (r.get("full") or r["proxy"],
+                    r["exit_ip"] or r.get("status", ""), r["fraud"],
+                    r["type"], r["flags"], r["blacklist"], _fmt_ms(r["ping"]),
+                    "" if r["trust"] is None else r["trust"])
+
+        export_dict_rows_csv(getattr(self, "_filtered", self._rows),
+                             [self.HEADINGS[c] for c in self.COLUMNS], cells)
 
 
 class SettingsTab(ttk.Frame):

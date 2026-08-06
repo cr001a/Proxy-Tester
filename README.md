@@ -348,20 +348,32 @@ landed on.
 ## Tab 2: Proxy Tester
 
 Paste proxies one per line as `host:port:user:pass` (or `host:port` for no
-auth). Each proxy is tested N times, in one of two **Test modes**:
+auth), then pick a **Test mode** — cheapest first:
 
-- **Liveness (fast)** — *default, built for huge lists.* Opens one HTTP
-  `CONNECT` tunnel per proxy to a neutral host and times the round-trip to
-  `200 Connection established` — no TLS-to-target, no HTTP GET, no body. It runs
-  at much higher concurrency (up to ~1200 workers) with a short, configurable
-  connect timeout (**Settings ▸ Liveness connect timeout**, default 5s), so a
-  200k list finishes in minutes instead of tens of minutes. It proves the tunnel
-  opens, *not* that egress works or what the exit IP is; the Test URL is ignored.
-- **Full (exit IP + geo)** — the original per-proxy `GET` to the Test URL;
-  slower, but harvests exit IP, ASN and location. Use it on a vetted shortlist.
+- **Liveness (fast)** — the bare minimum. Opens one HTTP `CONNECT` tunnel per
+  proxy to a neutral host and times the round-trip to `200 Connection
+  established` — no TLS-to-target, no GET, no body. Runs up to ~1,200 wide on a
+  short connect timeout, so a 200k list finishes in minutes. It proves the
+  tunnel opens, *not* that egress works or what the exit IP is. **There is no
+  exit IP to report in this mode, so the Exit IP / Provider / Location columns
+  are hidden** rather than left blank — three empty columns read as a broken
+  run, not a deliberate trade-off. The Test URL is ignored.
+- **Exit IP + geo (fast)** — ***the default, and the one to reach for.*** One
+  connection does `TCP → CONNECT → TLS → GET → body` with **staged timeouts**
+  (short for the tunnel, longer for the request), returning the **exit IP,
+  provider/ASN, location and latency**. This is the same single-pass resolver
+  IP Quality uses, and it runs at the same ~1,200 concurrency as connect-only —
+  the extra cost is a TLS handshake and one small GET on a tunnel that is
+  already open. The provider and location come out of the *same response body*
+  the exit-IP lookup already paid for, so they are free. The Test URL is
+  ignored.
+- **Full (custom URL)** — the `urllib` path: a real `GET` to your Test URL,
+  repeated once per run, redialling each time with no staged timeouts. The
+  slowest by a wide margin. Use it to test a *specific URL*, not to sweep a
+  list.
 
 Results table: `Proxy | Status | HTTP code | Median ms | Success (n/N) |
-Exit IP`. The exit IP is parsed from the `ip` field if the response is JSON.
+Exit IP | Provider / ASN | Location`.
 
 This tab is a **plain connectivity/latency tester** — it reports reachability,
 speed, and HTTP status only. No site-specific bot-protection scoring.
@@ -395,11 +407,36 @@ status (`200` reachable, `407` auth, `502`/`504` upstream). Pick a single site
 ## Notes
 
 - Requests use `urllib.request` with a `ProxyHandler` (standard library).
-- Tests run on a background thread with a `ThreadPoolExecutor` so the GUI never
-  freezes; results are marshalled back to the table via a thread-safe queue.
-  Concurrency is **tuned for maximum throughput and hard-coded** — no knobs to
-  get wrong: the connect-only liveness sweep runs up to ~1,200 connections at
-  once, the full/exit-IP path 500, and reputation lookups 100.
+- Tests run on a background thread so the GUI never freezes; results are
+  marshalled back to the table via a thread-safe queue. Concurrency is **tuned
+  for maximum throughput and hard-coded** — no knobs to get wrong: the
+  connect-only liveness sweep runs up to ~1,200 connections at once, the
+  full/exit-IP path 800, and reputation lookups 400.
+- **Built for lists in the hundreds of thousands.** Memory stays flat as the
+  list grows, which is what makes a 400k run survivable:
+  - Work is handed to a **fixed pool of threads pulling from a shared
+    iterator**, not one `Future` per proxy. A `Future` carries its own
+    `threading.Condition` (a lock plus a waiter deque) and measures ~1.6 KB, so
+    `submit()`-per-item allocated **639 MB of bookkeeping on a 400k list before
+    a single socket opened** — and the two-stage IP Quality funnel paid that
+    bill twice. Measured at 200k items: **358 MB → 7.8 MB, a 46× reduction.**
+  - Stage-1 records are **drained into result rows** rather than kept alongside
+    them, and the reputation-score map is released once rows are built.
+  - Worker threads get a **512 KB stack** instead of the 8 MB platform default —
+    1,200 threads reserved ~9.4 GB of address space otherwise.
+  - Progress updates **scale with list size** (~400 per run, however big).
+    A fixed "every 200" fired 2,000 times on 400k, and the live counter behind
+    it rescanned the whole result list each time — O(n²), hundreds of millions
+    of lookups, all while holding the lock every worker needed.
+  - End to end, a 400k-proxy scoring run drops from **~1.83 GB of Python heap
+    to ~429 MB (4.3× less)**, before counting the Tk saving below.
+- **Results tables are capped at 20,000 painted rows.** A `ttk.Treeview` keeps
+  every row as Tcl objects, far heavier than the Python dict behind it, and a
+  table 400,000 rows long is unreadable anyway. **Nothing is lost:** rows are
+  sorted best-first, the full set stays in memory, and *Cull dead*, the speed
+  filter, the counters and **Export CSV all operate on every result**, not just
+  the painted ones. The status line says so whenever the table is showing less
+  than the run produced.
 - **Fail-fast:** on the Proxy Tester tab, a proxy whose first request fails at
   the connection level (timeout / refused / tunnel failure) is marked dead
   immediately instead of retrying every run — so dead proxies no longer hold a
@@ -412,7 +449,10 @@ status (`200` reachable, `407` auth, `502`/`504` upstream). Pick a single site
 - Per-request timeout defaults to 15s.
 - A dead proxy or ASN shows a status in its own row and never blocks the others
   or crashes the app.
-- **Export CSV** on each tab writes the current results table to a `.csv`.
+- **Export CSV** on each tab writes the current results to a `.csv`. With rows
+  highlighted it exports just those; with nothing highlighted it exports every
+  row that passed the filters — including rows past the 20,000-row display cap,
+  so a big run never hands back a quietly truncated file.
 - **Copying:** every results table and the ASN catalog have a **right-click
   menu** with *Copy selected* / *Select all*, alongside `Ctrl+C` / `Ctrl+A`.
   The menu matters on remote desktops — a Mac keyboard driving a Windows box
