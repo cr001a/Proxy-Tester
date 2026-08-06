@@ -101,6 +101,7 @@ fi
 # not starting, so it stays in the list.
 PY=""
 TRIED=""
+SEEN=""
 for cand in \\
     /Library/Frameworks/Python.framework/Versions/Current/bin/python3 \\
     /Library/Frameworks/Python.framework/Versions/3.14/bin/python3 \\
@@ -114,21 +115,35 @@ for cand in \\
 do
     resolved="\$(command -v "\$cand" 2>/dev/null)" || continue
     [ -n "\$resolved" ] && [ -x "\$resolved" ] || continue
-    case " \$TRIED " in *" \$resolved "*) continue ;; esac
-    TRIED="\$TRIED \$resolved"
-    if "\$resolved" -c "import tkinter" >/dev/null 2>&1; then
+    case "\$SEEN " in *"\$resolved "*) continue ;; esac
+    SEEN="\$SEEN\$resolved "
+    # Keep the REASON, not just the fact of failure. A GUI launch gets a
+    # different environment from Terminal, so an interpreter that imports
+    # tkinter fine when you test it by hand can still fail here - and "no
+    # tkinter" alone sends you off installing a Python you already have.
+    err="\$("\$resolved" -c "import tkinter" 2>&1)"
+    if [ \$? -eq 0 ]; then
         PY="\$resolved"
         break
     fi
+    why="\$(printf '%s' "\$err" | tail -1 | tr -d '\\"' | cut -c1-120)"
+    [ -n "\$why" ] || why="exited non-zero with no output"
+    TRIED="\$TRIED
+  \$resolved
+      \$why"
 done
 
 if [ -z "\$PY" ]; then
     if [ -z "\$TRIED" ]; then
         MSG="No python3 was found on this Mac. Install Python from python.org - it includes the tkinter GUI toolkit."
     else
-        MSG="Found python3, but none of these can import tkinter:\$TRIED
+        MSG="No python3 on this Mac could import tkinter when launched from the Dock. What each one said:
+\$TRIED
 
-Install Python from python.org (it bundles Tk), or if you use Homebrew run: brew install python-tk"
+If one of these works in Terminal, the app is hitting a GUI-launch environment difference - run it from Terminal to confirm:
+  cd \\"\$PWD\\" && ./ProxyTester.app/Contents/MacOS/ProxyTester
+
+Otherwise install Python from python.org (it bundles Tk 8.6), or with Homebrew: brew install python-tk"
     fi
     osascript -e "display alert \\"ProxyTester\\" message \\"\$MSG\\""
     exit 1
