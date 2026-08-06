@@ -222,19 +222,35 @@ fine for local use, but don't sync that file anywhere public.
 
 ---
 
-## macOS: a Dock icon
+## macOS: a Desktop icon
 
 There's no prebuilt Mac app (CI only builds Windows), but `make_mac_app.sh`
 wraps the source in a real `.app` bundle so it gets the logo as its icon and can
-be pinned to the Dock:
+be launched like any other app:
 
 ```
 ./make_mac_app.sh
 ```
 
 It uses only tools that ship with macOS (`sips`, `iconutil`), builds
-`ProxyTester.app` next to the source, and needs no `pip install`. Drag the
-result to the Dock (or to **Applications**) and launch it like any other app.
+`ProxyTester.app` next to the source, and needs no `pip install`.
+
+**It puts a ProxyTester shortcut on your Desktop automatically** — the bundle
+stays in this folder (it looks for `proxy_tester.py` beside itself), and the
+Desktop just gets a pointer to it, so you don't have to go digging in Finder.
+Drag the `.app` to the Dock as well if you want it pinned there too.
+
+The shortcut is a real Finder **alias** where macOS allows it, which keeps the
+icon even if you later rename or move this folder. Making one drives Finder via
+AppleScript, and a managed Mac can refuse that permission — so it falls back to
+a **symlink**, which needs no permission and looks the same in Finder. If your
+Mac blocks terminal access to the Desktop entirely, the script says so and
+carries on rather than failing the build.
+
+Pass `--no-desktop-icon` (or set `PROXYTESTER_NO_DESKTOP_ICON=1`) to skip it.
+Re-running the script replaces its own old shortcut rather than piling up
+copies, and it will never overwrite a real app or folder you put on the Desktop
+under that name — it tells you and leaves it alone.
 
 The bundle **doesn't copy the code** — it launches `proxy_tester.py` from this
 folder. Re-run the script only if the logo changes or you want the bundle's

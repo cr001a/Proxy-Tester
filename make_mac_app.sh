@@ -6,11 +6,28 @@
 # so `git pull` updates the app with no rebuild. Re-run this only if the logo or
 # the version changes.
 #
+# It also drops a shortcut on the Desktop so the app is reachable without
+# digging through Finder. Pass --no-desktop-icon (or set
+# PROXYTESTER_NO_DESKTOP_ICON=1) to skip that.
+#
 # Uses nothing but tools that ship with macOS (sips, iconutil, osascript).
 set -e
 cd "$(dirname "$0")"
 REPO="$PWD"
 APP="$REPO/ProxyTester.app"
+
+DESKTOP_ICON=1
+[ -z "$PROXYTESTER_NO_DESKTOP_ICON" ] || DESKTOP_ICON=0
+for arg in "$@"; do
+    case "$arg" in
+        --no-desktop-icon) DESKTOP_ICON=0 ;;
+        -h|--help)
+            echo "usage: ./make_mac_app.sh [--no-desktop-icon]"
+            echo "  Builds ProxyTester.app here and puts a shortcut to it on the Desktop."
+            exit 0 ;;
+        *) echo "unknown option: $arg (try --help)" >&2; exit 2 ;;
+    esac
+done
 
 if ! command -v sips >/dev/null 2>&1 || ! command -v iconutil >/dev/null 2>&1; then
     echo "This builds a macOS app bundle and needs sips/iconutil (macOS only)."
@@ -206,5 +223,64 @@ chmod +x "$APP/Contents/MacOS/ProxyTester"
 # Make Finder pick the new icon up straight away.
 touch "$APP"
 
+# --- Desktop shortcut --------------------------------------------------------
+# The bundle lives next to the source, which may be several folders deep. A
+# shortcut on the Desktop makes it a double-click away without moving the .app
+# out of the repo (it looks for proxy_tester.py beside itself first).
+#
+# A real Finder alias is the better artifact - it keeps the app's icon and
+# survives the repo folder being renamed or moved. But making one drives Finder
+# through AppleScript, which needs Automation permission; a managed Mac can
+# refuse that. So: try the alias, fall back to a symlink, which needs no
+# permission at all and Finder still resolves to the app's icon.
+desktop_shortcut() {
+    DESK="$HOME/Desktop"
+    [ -d "$DESK" ] || { echo "No ~/Desktop here - skipped the Desktop shortcut."; return 0; }
+    if [ "$REPO" = "$DESK" ]; then
+        echo "ProxyTester.app is already on the Desktop - no shortcut needed."
+        return 0
+    fi
+
+    # Never touch a real bundle or folder someone put there by hand; only clear
+    # our own shortcuts (a symlink, or a Finder alias - which is a plain file).
+    for old in "$DESK/ProxyTester" "$DESK/ProxyTester.app"; do
+        if [ ! -L "$old" ] && [ -d "$old" ]; then
+            echo "Left $old alone - it's a real app/folder, not a shortcut."
+            echo "Rename or remove it, then re-run this script."
+            return 0
+        fi
+    done
+    rm -f "$DESK/ProxyTester" "$DESK/ProxyTester.app"
+
+    if osascript >/dev/null 2>&1 <<OSA
+tell application "Finder"
+    set d to POSIX file "$DESK" as alias
+    set t to POSIX file "$APP" as alias
+    make new alias file at d to t with properties {name:"ProxyTester"}
+end tell
+OSA
+    then
+        if [ -e "$DESK/ProxyTester" ]; then
+            echo "Desktop shortcut: ProxyTester (alias)"
+            return 0
+        fi
+    fi
+
+    if ln -s "$APP" "$DESK/ProxyTester.app" 2>/dev/null; then
+        echo "Desktop shortcut: ProxyTester (link)"
+        return 0
+    fi
+
+    # Both paths failed - almost always macOS withholding Desktop access from
+    # the terminal. Say so, and say where the app is, rather than dying.
+    echo "Could not write to the Desktop (macOS may be withholding access)."
+    echo "Allow it in System Settings > Privacy & Security > Files and Folders,"
+    echo "or just drag ProxyTester.app out of this folder yourself."
+    return 0
+}
+
 echo "Built $APP  (v${VERSION})"
-echo "Open the folder in Finder and drag ProxyTester.app to the Dock."
+if [ "$DESKTOP_ICON" -eq 1 ]; then
+    desktop_shortcut
+fi
+echo "Drag ProxyTester.app to the Dock too, if you want it pinned."
