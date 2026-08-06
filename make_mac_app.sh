@@ -71,8 +71,13 @@ PLIST
 cat > "$APP/Contents/MacOS/ProxyTester" <<LAUNCHER
 #!/bin/bash
 # A GUI launch gets a bare PATH, so Homebrew's and python.org's python3 aren't
-# on it - add both before looking.
+# on it - add both before looking. git lives in /usr/bin, already on PATH.
 export PATH="/usr/local/bin:/opt/homebrew/bin:/Library/Frameworks/Python.framework/Versions/Current/bin:\$PATH"
+
+# Tell the app which bundle launched it, so its "Update & restart" button can
+# relaunch through the bundle and keep the Dock icon instead of spawning a
+# bare python process.
+export PROXYTESTER_APP_BUNDLE="\$(cd "\$(dirname "\$0")/../.." && pwd)"
 
 HERE="\$(cd "\$(dirname "\$0")/../../.." && pwd)"
 if [ -f "\$HERE/proxy_tester.py" ]; then
@@ -92,6 +97,27 @@ fi
 if ! python3 -c "import tkinter" >/dev/null 2>&1; then
     osascript -e 'display alert "ProxyTester" message "Your python3 has no tkinter. Install Python from python.org, or run: brew install python-tk"'
     exit 1
+fi
+
+# Pull the latest source before launching, so opening from the Dock always runs
+# the current version - no Terminal, no update prompt. --ff-only means a pull
+# is REFUSED rather than merged if there are local edits or a diverged branch,
+# so this can never clobber uncommitted work; it just launches what's there.
+#
+# The watchdog matters: offline, git sits in DNS/TCP retries far longer than
+# anyone will wait for an app to open, and that delay would be paid on EVERY
+# launch. macOS ships no timeout(1), hence the background-kill pair. 8s is the
+# budget - this repo is a couple of files, so a real pull takes about a second;
+# anything near 8s means the network isn't there and the app should just start.
+# Set PROXYTESTER_NO_AUTOPULL=1 to skip the whole thing.
+if [ -z "\$PROXYTESTER_NO_AUTOPULL" ] && [ -d .git ] && command -v git >/dev/null 2>&1; then
+    git pull --ff-only --quiet >/dev/null 2>&1 &
+    pull_pid=\$!
+    ( sleep 8; kill -9 \$pull_pid >/dev/null 2>&1 ) &
+    watchdog_pid=\$!
+    wait \$pull_pid 2>/dev/null
+    kill -9 \$watchdog_pid >/dev/null 2>&1
+    wait \$watchdog_pid 2>/dev/null
 fi
 
 exec python3 proxy_tester.py

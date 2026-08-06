@@ -60,7 +60,7 @@ MAX_WORKERS = 6        # legacy default (kept for reference)
 DEFAULT_WORKERS = 200  # parallel workers; overridable on the Settings tab
 USER_AGENT = "ProxyTester/1.0"
 
-APP_VERSION = "5.2"                    # single source of truth (CI tags v<this>)
+APP_VERSION = "5.3"                    # single source of truth (CI tags v<this>)
 UPDATE_REPO = "cr001a/Proxy-Tester"     # public repo required for auto-update
 
 # Worker threads get a 512 KB stack instead of the platform default (8 MB on
@@ -5836,15 +5836,12 @@ class QualityTab(ttk.Frame):
                     provider_err = q["_error"]
                 if not pcheck_warning and q.get("_proxycheck_warning"):
                     pcheck_warning = q["_proxycheck_warning"]
-            # Per-provider status for the aggregate: which ran ok, which the
-            # breaker stopped, and which were skipped for a missing key.
+            # Per-provider status for the aggregate: which ran, and which the
+            # breaker stopped. Providers with no key are NOT listed - you
+            # already know you haven't configured them, so "skipped (no key)"
+            # is permanent noise in a line that should only carry what changed
+            # about this run.
             prov_status = breaker.summary() if breaker else []
-            if provider == AGGREGATE_PROVIDER:
-                for name, (ks, lk) in QUALITY_PROVIDERS.items():
-                    if lk is None or not ks:
-                        continue
-                    if not load_setting(ks, "").strip():
-                        prov_status.append(f"{name}: skipped (no key)")
             # Same-pool detection: costs nothing (we already have every exit
             # IP), and only ever surfaces when two providers collide.
             overlap = compute_pool_overlap(discoveries,
@@ -6693,6 +6690,69 @@ def check_for_updates(parent, silent=False):
         _download_and_apply(parent, dl, tag)
 
 
+def git_pull_update(folder, timeout=45):
+    """`git pull --ff-only` in `folder`. Returns (ok, message).
+
+    --ff-only on purpose: it REFUSES rather than merging or rebasing, so local
+    edits and a diverged branch can never be silently clobbered by an update.
+    Every failure mode here (no git, not a checkout, offline, dirty tree) is
+    reported rather than raised, so the caller can fall back to handing over
+    the command instead."""
+    if not os.path.isdir(os.path.join(folder, ".git")):
+        return False, "This copy isn't a git checkout."
+    try:
+        r = subprocess.run(
+            ["git", "-C", folder, "pull", "--ff-only"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=timeout, text=True)
+    except FileNotFoundError:
+        return False, "git isn't installed."
+    except subprocess.TimeoutExpired:
+        return False, f"git pull timed out after {timeout}s."
+    except OSError as e:
+        return False, f"Couldn't run git: {e}"
+    out = (r.stdout or "").strip()
+    if r.returncode == 0:
+        if "Already up to date" in out:
+            return True, "Already up to date."
+        return True, (out.splitlines()[-1] if out else "Updated.")
+    # The two refusals worth naming, because the fix differs for each.
+    low = out.lower()
+    if "local changes" in low or "would be overwritten" in low:
+        return False, ("You have local edits to these files, so the update was "
+                       "refused rather than overwriting them:\n\n" + out)
+    if "non-fast-forward" in low or "diverg" in low:
+        return False, ("Your copy has commits the remote doesn't, so a "
+                       "fast-forward isn't possible:\n\n" + out)
+    return False, out or f"git pull failed (exit {r.returncode})."
+
+
+def restart_app(parent):
+    """Relaunch this app and quit the current process, so a freshly pulled
+    source tree is the one actually running. Only returns (False) if the
+    relaunch could not be started."""
+    bundle = os.environ.get("PROXYTESTER_APP_BUNDLE")
+    try:
+        if bundle and os.path.isdir(bundle):
+            # Launched from ProxyTester.app: let the bundle do the relaunch so
+            # the new process keeps its Dock icon and app identity. -n forces a
+            # fresh instance instead of reactivating the one that's quitting.
+            subprocess.Popen(["open", "-n", bundle])
+        else:
+            script = os.path.abspath(__file__)
+            subprocess.Popen([sys.executable, script],
+                             cwd=os.path.dirname(script))
+    except Exception:
+        return False
+    try:
+        parent.winfo_toplevel().destroy()
+    except Exception:
+        pass
+    # os._exit rather than sys.exit: Tk teardown from inside a widget callback
+    # can hang, and the replacement process is already on its way up.
+    os._exit(0)
+
+
 def open_terminal_at(folder):
     """Open a terminal already sitting in `folder`. Returns True on success."""
     try:
@@ -6715,10 +6775,13 @@ def open_terminal_at(folder):
 
 
 def show_source_update_dialog(parent, tag):
-    """Update notice for a run-from-source copy. A plain messagebox can't be
-    selected or copied, so the exact shell command goes in a real text box -
-    pre-selected, with a Copy button - and is built from THIS install's actual
-    path so it can be pasted from any directory."""
+    """Update flow for a run-from-source copy (how this runs on macOS/Linux).
+
+    A git checkout updates IN PLACE from this button - `git pull --ff-only`
+    followed by a relaunch - so updating never means copying a command into
+    Terminal and restarting the app by hand. The old copy/paste route is kept
+    as the fallback for the cases the button can't handle: no git, no network,
+    or a pull refused because of local edits."""
     folder = _install_dir()
     is_git = os.path.isdir(os.path.join(folder, ".git"))
     cmd = f'cd "{folder}" && git pull' if is_git else folder
@@ -6734,8 +6797,8 @@ def show_source_update_dialog(parent, tag):
               style="Header.TLabel").pack(anchor="w")
     note = ttk.Label(
         frm,
-        text=("This copy runs from source. Paste this into Terminal, then "
-              "restart the app:") if is_git else
+        text=("This copy runs from source. Update and restart in one step:")
+             if is_git else
              ("This copy runs from source but isn't a git checkout, so "
               "download the latest ZIP from the repo and replace this folder. "
               "Your settings live elsewhere and won't be lost. The folder is:"),
@@ -6744,12 +6807,16 @@ def show_source_update_dialog(parent, tag):
 
     box = tk.Text(frm, height=2, wrap="word")
     style_text(box)
-    box.pack(fill="x")
     box.insert("1.0", cmd)
     box.tag_add("sel", "1.0", "end-1c")   # arrives pre-selected
-    box.focus_set()
+    # The manual command is the fallback, so it starts hidden on a checkout
+    # (where the button should just work) and is revealed if the pull fails.
+    if not is_git:
+        box.pack(fill="x")
+        box.focus_set()
 
-    status = ttk.Label(frm, text="", style="Muted.TLabel")
+    status = ttk.Label(frm, text="", style="Muted.TLabel",
+                       justify="left", wraplength=470)
 
     def copy_cmd():
         top.clipboard_clear()
@@ -6767,12 +6834,60 @@ def show_source_update_dialog(parent, tag):
             status.config(text="Couldn't open a terminal - paste the command "
                                "into one yourself")
 
+    def reveal_manual(msg):
+        """Pull failed: show why, and fall back to the by-hand command."""
+        status.config(text=msg)
+        try:
+            box.pack(fill="x", before=status)
+        except Exception:
+            box.pack(fill="x")
+        update_btn.config(state="normal", text="Update & restart")
+
+    def do_update():
+        update_btn.config(state="disabled", text="Updating...")
+        status.config(text=f"Running git pull in {folder} ...")
+        result = {}
+
+        def work():
+            result["r"] = git_pull_update(folder)
+
+        def poll(t):
+            if t.is_alive():
+                top.after(150, lambda: poll(t))
+                return
+            ok, msg = result.get("r", (False, "Update failed."))
+            if not ok:
+                reveal_manual(msg)
+                return
+            if msg == "Already up to date.":
+                # The release feed said there was a newer tag, so a checkout
+                # that's already current is on a different branch or remote.
+                reveal_manual("git says this checkout is already up to date, "
+                              "but a newer release exists - you may be on a "
+                              "different branch or remote.")
+                return
+            status.config(text=f"{msg}\nRestarting...")
+            top.after(400, lambda: (restart_app(top) or reveal_manual(
+                "Updated, but couldn't relaunch automatically - quit and "
+                "reopen the app to run the new version.")))
+
+        t = threading.Thread(target=work, daemon=True)
+        t.start()
+        poll(t)
+
     bar = ttk.Frame(frm)
     bar.pack(fill="x", pady=(10, 0))
-    ttk.Button(bar, text="Copy command" if is_git else "Copy folder path",
-               style="Accent.TButton", command=copy_cmd).pack(side="left")
-    ttk.Button(bar, text="Open Terminal",
-               command=open_term).pack(side="left", padx=8)
+    if is_git:
+        update_btn = ttk.Button(bar, text="Update & restart",
+                                style="Accent.TButton", command=do_update)
+        update_btn.pack(side="left")
+        ttk.Button(bar, text="Copy command instead",
+                   command=copy_cmd).pack(side="left", padx=8)
+    else:
+        ttk.Button(bar, text="Copy folder path", style="Accent.TButton",
+                   command=copy_cmd).pack(side="left")
+        ttk.Button(bar, text="Open Terminal",
+                   command=open_term).pack(side="left", padx=8)
     ttk.Button(bar, text="Close", command=top.destroy).pack(side="right")
     status.pack(anchor="w", pady=(6, 0))
 

@@ -237,11 +237,32 @@ It uses only tools that ship with macOS (`sips`, `iconutil`), builds
 result to the Dock (or to **Applications**) and launch it like any other app.
 
 The bundle **doesn't copy the code** — it launches `proxy_tester.py` from this
-folder, so `git pull` updates the app with no rebuild. Re-run the script only if
-the logo changes or you want the bundle's version string refreshed. Keep the
-`.app` inside this folder if you can: it looks for the source next to itself
-first, and falls back to the path it was built at, so an `.app` moved to
-`/Applications` keeps working as long as the source folder stays put.
+folder. Re-run the script only if the logo changes or you want the bundle's
+version string refreshed. Keep the `.app` inside this folder if you can: it
+looks for the source next to itself first, and falls back to the path it was
+built at, so an `.app` moved to `/Applications` keeps working as long as the
+source folder stays put.
+
+### Updating on macOS — no Terminal
+
+Two automatic paths, neither involving a copied command:
+
+- **Opening the app updates it.** The launcher runs `git pull --ff-only` before
+  starting Python, so launching from the Dock always runs the current version.
+- **"Update & restart"** in ⚙ ▸ *Check for updates* pulls and relaunches in
+  place while the app is already open.
+
+Both use `--ff-only`, which **refuses** rather than merging — local edits and a
+diverged branch can never be silently overwritten by an update. When a pull is
+refused the app says why and falls back to handing over the command.
+
+The launch-time pull is bounded by an 8-second watchdog, so being offline costs
+a few seconds of startup rather than hanging, and the app then runs the code it
+already has. Set `PROXYTESTER_NO_AUTOPULL=1` to disable the launch-time pull.
+
+> Re-run `./make_mac_app.sh` once to pick this up — the auto-update lives in the
+> bundle's launcher, so an `.app` built before this change still needs a manual
+> `git pull` that one last time.
 
 If `python3` or `tkinter` is missing, the launcher says so in a dialog instead of
 failing silently.
