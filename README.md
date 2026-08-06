@@ -395,11 +395,36 @@ status (`200` reachable, `407` auth, `502`/`504` upstream). Pick a single site
 ## Notes
 
 - Requests use `urllib.request` with a `ProxyHandler` (standard library).
-- Tests run on a background thread with a `ThreadPoolExecutor` so the GUI never
-  freezes; results are marshalled back to the table via a thread-safe queue.
-  Concurrency is **tuned for maximum throughput and hard-coded** — no knobs to
-  get wrong: the connect-only liveness sweep runs up to ~1,200 connections at
-  once, the full/exit-IP path 500, and reputation lookups 100.
+- Tests run on a background thread so the GUI never freezes; results are
+  marshalled back to the table via a thread-safe queue. Concurrency is **tuned
+  for maximum throughput and hard-coded** — no knobs to get wrong: the
+  connect-only liveness sweep runs up to ~1,200 connections at once, the
+  full/exit-IP path 800, and reputation lookups 400.
+- **Built for lists in the hundreds of thousands.** Memory stays flat as the
+  list grows, which is what makes a 400k run survivable:
+  - Work is handed to a **fixed pool of threads pulling from a shared
+    iterator**, not one `Future` per proxy. A `Future` carries its own
+    `threading.Condition` (a lock plus a waiter deque) and measures ~1.6 KB, so
+    `submit()`-per-item allocated **639 MB of bookkeeping on a 400k list before
+    a single socket opened** — and the two-stage IP Quality funnel paid that
+    bill twice. Measured at 200k items: **358 MB → 7.8 MB, a 46× reduction.**
+  - Stage-1 records are **drained into result rows** rather than kept alongside
+    them, and the reputation-score map is released once rows are built.
+  - Worker threads get a **512 KB stack** instead of the 8 MB platform default —
+    1,200 threads reserved ~9.4 GB of address space otherwise.
+  - Progress updates **scale with list size** (~400 per run, however big).
+    A fixed "every 200" fired 2,000 times on 400k, and the live counter behind
+    it rescanned the whole result list each time — O(n²), hundreds of millions
+    of lookups, all while holding the lock every worker needed.
+  - End to end, a 400k-proxy scoring run drops from **~1.83 GB of Python heap
+    to ~429 MB (4.3× less)**, before counting the Tk saving below.
+- **Results tables are capped at 20,000 painted rows.** A `ttk.Treeview` keeps
+  every row as Tcl objects, far heavier than the Python dict behind it, and a
+  table 400,000 rows long is unreadable anyway. **Nothing is lost:** rows are
+  sorted best-first, the full set stays in memory, and *Cull dead*, the speed
+  filter, the counters and **Export CSV all operate on every result**, not just
+  the painted ones. The status line says so whenever the table is showing less
+  than the run produced.
 - **Fail-fast:** on the Proxy Tester tab, a proxy whose first request fails at
   the connection level (timeout / refused / tunnel failure) is marked dead
   immediately instead of retrying every run — so dead proxies no longer hold a
@@ -412,7 +437,10 @@ status (`200` reachable, `407` auth, `502`/`504` upstream). Pick a single site
 - Per-request timeout defaults to 15s.
 - A dead proxy or ASN shows a status in its own row and never blocks the others
   or crashes the app.
-- **Export CSV** on each tab writes the current results table to a `.csv`.
+- **Export CSV** on each tab writes the current results to a `.csv`. With rows
+  highlighted it exports just those; with nothing highlighted it exports every
+  row that passed the filters — including rows past the 20,000-row display cap,
+  so a big run never hands back a quietly truncated file.
 - **Copying:** every results table and the ASN catalog have a **right-click
   menu** with *Copy selected* / *Select all*, alongside `Ctrl+C` / `Ctrl+A`.
   The menu matters on remote desktops — a Mac keyboard driving a Windows box
