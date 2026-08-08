@@ -3111,10 +3111,18 @@ def test_asn(host, port, username, password, asn, url, runs, timeout,
 # --------------------------------------------------------------------------- #
 # Tab 2: Proxy Tester (general reachability)
 # --------------------------------------------------------------------------- #
+def _is_port_number(value):
+    """True if `value` is a bare TCP port. Used to tell field order apart."""
+    value = value.strip()
+    return value.isdigit() and 1 <= int(value) <= 65535
+
+
 def parse_proxy_line(line):
     """
     Parse 'host:port:user:pass' (or 'host:port') into a dict. Also accepts the
-    comma-delimited 'host,port,user,pass' variant that some dashboards emit.
+    comma-delimited 'host,port,user,pass' variant that some dashboards emit,
+    and the reversed 'user:pass:host:port' order that PacketStream and several
+    other providers hand out.
     Returns None if the line is not usable.
     """
     line = line.strip()
@@ -3129,9 +3137,21 @@ def parse_proxy_line(line):
     if len(parts) == 2:
         host, port = parts
         user = pw = None
-    elif len(parts) >= 4:
+    elif len(parts) >= 4 and _is_port_number(parts[1]):
+        # host:port:user:pass - the canonical order, and the one we emit.
         host, port, user = parts[0], parts[1], parts[2]
         pw = parts[3] if len(parts) == 4 else ":".join(parts[3:])  # ':' in pass
+    elif len(parts) >= 4 and _is_port_number(parts[-1]):
+        # user:pass:host:port - field 2 is not a port but the last field is, so
+        # the line is reversed. Anything between the user and the host:port
+        # tail is the password (it may itself contain ':').
+        host, port, user = parts[-2], parts[-1], parts[0]
+        pw = ":".join(parts[1:-2])
+    elif len(parts) >= 4:
+        # No field looks like a port; fall back to the canonical reading rather
+        # than rejecting the line outright.
+        host, port, user = parts[0], parts[1], parts[2]
+        pw = parts[3] if len(parts) == 4 else ":".join(parts[3:])
     else:
         return None
     host = host.strip()
